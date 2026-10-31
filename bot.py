@@ -1,41 +1,80 @@
 import os
 import re
-import asyncio
-import tempfile
 import shutil
+import tempfile
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
 )
+
 from mutagen.mp3 import MP3
 from mutagen.id3 import (
-    ID3, ID3NoHeaderError, TIT2, TPE1, TALB, TDRC, TRCK, TCON,
-    USLT, COMM, TPE2, TCOM, TPOS, TPUB, APIC
+    ID3,
+    ID3NoHeaderError,
+    TIT2,
+    TPE1,
+    TALB,
+    TDRC,
+    TRCK,
+    TCON,
+    USLT,
+    COMM,
+    TPE2,
+    TCOM,
+    TPOS,
+    TPUB,
+    APIC,
 )
+
 
 TOKEN = os.getenv("BOT_TOKEN")
 
 FIELDS = {
-    "filename": "File Name", "title": "Title", "artist": "Artists",
-    "album": "Album", "year": "Year", "track": "Track Number",
-    "genre": "Genre", "lyrics": "Lyrics", "comment": "Comment",
-    "albumartist": "Album Artist", "composer": "Composer",
-    "disc": "Disc Number", "publisher": "Publisher",
+    "filename": "File Name",
+    "title": "Title",
+    "artist": "Artists",
+    "album": "Album",
+    "year": "Year",
+    "track": "Track Number",
+    "genre": "Genre",
+    "lyrics": "Lyrics",
+    "comment": "Comment",
+    "albumartist": "Album Artist",
+    "composer": "Composer",
+    "disc": "Disc Number",
+    "publisher": "Publisher",
 }
 
 TAG_CLASSES = {
-    "title": TIT2, "artist": TPE1, "album": TALB, "year": TDRC,
-    "track": TRCK, "genre": TCON, "albumartist": TPE2,
-    "composer": TCOM, "disc": TPOS, "publisher": TPUB,
+    "title": TIT2,
+    "artist": TPE1,
+    "album": TALB,
+    "year": TDRC,
+    "track": TRCK,
+    "genre": TCON,
+    "albumartist": TPE2,
+    "composer": TCOM,
+    "disc": TPOS,
+    "publisher": TPUB,
 }
 
 FRAME_IDS = {
-    "title": "TIT2", "artist": "TPE1", "album": "TALB",
-    "year": "TDRC", "track": "TRCK", "genre": "TCON",
-    "albumartist": "TPE2", "composer": "TCOM", "disc": "TPOS",
+    "title": "TIT2",
+    "artist": "TPE1",
+    "album": "TALB",
+    "year": "TDRC",
+    "track": "TRCK",
+    "genre": "TCON",
+    "albumartist": "TPE2",
+    "composer": "TCOM",
+    "disc": "TPOS",
     "publisher": "TPUB",
 }
 
@@ -55,13 +94,21 @@ def get_tags(path):
 
     for key, frame in FRAME_IDS.items():
         values = tags.getall(frame)
-        result[key] = str(values[0].text[0]) if values and values[0].text else "—"
+        result[key] = (
+            str(values[0].text[0])
+            if values and values[0].text
+            else "—"
+        )
 
     lyrics = tags.getall("USLT")
     comments = tags.getall("COMM")
 
     result["lyrics"] = str(lyrics[0].text) if lyrics else "—"
-    result["comment"] = str(comments[0].text[0]) if comments and comments[0].text else "—"
+    result["comment"] = (
+        str(comments[0].text[0])
+        if comments and comments[0].text
+        else "—"
+    )
 
     return result
 
@@ -73,28 +120,60 @@ def get_cover(path):
     if not covers:
         return None
 
-    cover = next((item for item in covers if item.type == 3), covers[0])
+    cover = next(
+        (item for item in covers if item.type == 3),
+        covers[0],
+    )
+
     return cover.data
 
 
 def keyboard():
     buttons = [
-        [("📁 File Name", "filename"), ("🎼 Title", "title")],
-        [("👤 Artists", "artist"), ("🖼️ Picture", "picture")],
-        [("📂 Album", "album"), ("📅 Year", "year")],
-        [("💿 Track N", "track"), ("🎙️ Genre", "genre")],
-        [("✍️ Lyrics", "lyrics"), ("📝 Comment", "comment")],
-        [("👥 Album Artist", "albumartist"), ("👨‍🎤 Composer", "composer")],
-        [("💿 Disc N", "disc"), ("👤 Publisher", "publisher")],
-        [("🎤 Show Lyrics", "showlyrics"), ("❌ Remove All", "remove")],
-        [("📩 Save", "save")],
-        [("📌 Apply default tags", "defaults")],
+        [
+            InlineKeyboardButton("📁 File Name", callback_data="filename"),
+            InlineKeyboardButton("🎼 Title", callback_data="title"),
+        ],
+        [
+            InlineKeyboardButton("👤 Artists", callback_data="artist"),
+            InlineKeyboardButton("🖼️ Picture", callback_data="picture"),
+        ],
+        [
+            InlineKeyboardButton("📂 Album", callback_data="album"),
+            InlineKeyboardButton("📅 Year", callback_data="year"),
+        ],
+        [
+            InlineKeyboardButton("💿 Track N", callback_data="track"),
+            InlineKeyboardButton("🎙️ Genre", callback_data="genre"),
+        ],
+        [
+            InlineKeyboardButton("✍️ Lyrics", callback_data="lyrics"),
+            InlineKeyboardButton("📝 Comment", callback_data="comment"),
+        ],
+        [
+            InlineKeyboardButton("👥 Album Artist", callback_data="albumartist"),
+            InlineKeyboardButton("👨‍🎤 Composer", callback_data="composer"),
+        ],
+        [
+            InlineKeyboardButton("💿 Disc N", callback_data="disc"),
+            InlineKeyboardButton("👤 Publisher", callback_data="publisher"),
+        ],
+        [
+            InlineKeyboardButton("🎤 Show Lyrics", callback_data="showlyrics"),
+            InlineKeyboardButton("❌ Remove All", callback_data="remove"),
+        ],
+        [
+            InlineKeyboardButton("📩 Save", callback_data="save"),
+        ],
+        [
+            InlineKeyboardButton(
+                "📌 Apply default tags",
+                callback_data="defaults",
+            ),
+        ],
     ]
 
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(text, callback_data=data) for text, data in row]
-        for row in buttons
-    ])
+    return InlineKeyboardMarkup(buttons)
 
 
 def editor_text(path):
@@ -104,10 +183,14 @@ def editor_text(path):
 
     return (
         "🎵 **Music Tag Editor**\n\n"
-        f"Title: {tags['title']}\nArtist: {tags['artist']}\n"
-        f"Album: {tags['album']}\nYear: {tags['year']}\n"
-        f"Genre: {tags['genre']}\nComposer: {tags['composer']}\n"
-        f"Publisher: {tags['publisher']}\nDisc N: {tags['disc']}\n"
+        f"Title: {tags['title']}\n"
+        f"Artist: {tags['artist']}\n"
+        f"Album: {tags['album']}\n"
+        f"Year: {tags['year']}\n"
+        f"Genre: {tags['genre']}\n"
+        f"Composer: {tags['composer']}\n"
+        f"Publisher: {tags['publisher']}\n"
+        f"Disc N: {tags['disc']}\n"
         "----------------------\n"
         f"Bitrate: {audio.info.bitrate // 1000} kbps\n"
         f"Sample Rate: {audio.info.sample_rate} Hz\n"
@@ -123,7 +206,12 @@ async def show_editor(update, context):
         return
 
     info = editor_text(path)
-    message = update.callback_query.message if update.callback_query else update.message
+
+    if update.callback_query:
+        message = update.callback_query.message
+    else:
+        message = update.message
+
     cover_data = get_cover(path)
 
     if cover_data:
@@ -132,20 +220,24 @@ async def show_editor(update, context):
                 photo=cover_data,
                 caption=info,
                 reply_markup=keyboard(),
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
             return
-        except Exception as exc:
-            print(f"Could not display embedded cover: {exc}")
+        except Exception as error:
+            print("Cover display error:", error)
 
     await message.reply_text(
         info + "\n\n🖼️ " + (
             "کاور داخلی وجود دارد، اما تلگرام نتوانست آن را نمایش دهد."
-            if cover_data else "این فایل کاور داخلی ندارد."
+            if cover_data
+            else "این فایل کاور داخلی ندارد."
         ),
         reply_markup=keyboard(),
-        parse_mode="Markdown"
-    )async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        parse_mode="Markdown",
+    )
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "سلام! 🎵\n\n"
         "به Music Tag Editor خوش اومدی.\n"
@@ -157,7 +249,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting") == "picture":
         context.user_data["waiting"] = None
         await update.message.reply_text(
-            "درخواست تغییر کاور لغو شد؛ کاور قبلی دست‌نخورده باقی ماند."
+            "درخواست تغییر کاور لغو شد؛ کاور قبلی حفظ شد."
         )
     else:
         await update.message.reply_text(
@@ -219,7 +311,9 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "showlyrics":
         lyrics = load_tags(path).getall("USLT")
         await query.message.reply_text(
-            str(lyrics[0].text) if lyrics else "متنی برای این آهنگ ثبت نشده."
+            str(lyrics[0].text)
+            if lyrics
+            else "متنی برای این آهنگ ثبت نشده."
         )
         return
 
@@ -237,18 +331,22 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "تمام تگ‌ها، از جمله کاور، حذف شدند. ✅"
         )
+
         await show_editor(update, context)
         return
 
     if action == "save":
         output_name = context.user_data.get("filename", "music")
+
         output_name = re.sub(
-            r'[\\/:*?"<>|]', "_", output_name
+            r'[\\/:*?"<>|]',
+            "_",
+            output_name,
         ).strip() or "music"
 
         output_path = os.path.join(
             context.user_data["folder"],
-            output_name + ".mp3"
+            output_name + ".mp3",
         )
 
         shutil.copy2(path, output_path)
@@ -257,8 +355,9 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_document(
                 document=output_file,
                 filename=output_name + ".mp3",
-                caption="تگ‌های آهنگ ذخیره شدند! 🎵"
+                caption="تگ‌های آهنگ ذخیره شدند! 🎵",
             )
+
         return
 
     if action == "picture":
@@ -266,7 +365,7 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_text(
             "عکس جدید کاور رو به صورت عکس یا فایل بفرست.\n"
-            "اگر منصرف شدی /cancel رو بفرست؛ کاور فعلی حفظ می‌شه."
+            "اگر منصرف شدی /cancel رو بفرست."
         )
         return
 
@@ -277,7 +376,10 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await query.message.reply_text(
         f"مقدار جدید {FIELDS[action]} رو بفرست:"
-    )async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    )
+
+
+async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting = context.user_data.get("waiting")
     path = context.user_data.get("path")
 
@@ -287,9 +389,7 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     value = update.message.text.strip()
 
     if not value:
-        await update.message.reply_text(
-            "مقدار خالی قابل ذخیره نیست."
-        )
+        await update.message.reply_text("مقدار خالی قابل ذخیره نیست.")
         return
 
     if waiting == "filename":
@@ -338,6 +438,91 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if photo:
         telegram_file = await context.bot.get_file(photo.file_id)
         mime = "image/jpeg"
+
+    elif document and document.mime_type and document.mime_type.startswith("image/"):
+        telegram_file = await context.bot.get_file(document.file_id)
+        mime = document.mime_type
+
+    else:
+        await update.message.reply_text("لطفاً یک عکس معتبر بفرست.")
+        return
+
+    image_path = os.path.join(
+        context.user_data["folder"],
+        "new_cover",
+    )
+
+    await telegram_file.download_to_drive(image_path)
+
+    with open(image_path, "rb") as image_file:
+        image_data = image_file.read()
+
+    tags = load_tags(path)
+    tags.delall("APIC")
+
+    tags.add(
+        APIC(
+            encoding=3,
+            mime=mime,
+            type=3,
+            desc="Cover",
+            data=image_data,
+        )
+    )
+
+    tags.save(path, v2_version=3)
+
+    context.user_data["waiting"] = None
+
+    await update.message.reply_text("کاور جدید جایگزین شد! 🖼️")
+    await show_editor(update, context)
+
+
+async def error_handler(update, context):
+    print("BOT ERROR:", context.error)
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is missing!")
+
+    app = Application.builder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel))
+
+    app.add_handler(CallbackQueryHandler(edit_button))
+
+    app.add_handler(
+        MessageHandler(
+            filters.AUDIO | filters.Document.MimeType("audio/mpeg"),
+            receive_audio,
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE,
+            receive_picture,
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            receive_text,
+        )
+    )
+
+    app.add_error_handler(error_handler)
+
+    print("Music Tag Bot is running...")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()g"
 
     elif document and document.mime_type and document.mime_type.startswith("image/"):
         telegram_file = await context.bot.get_file(document.file_id)
