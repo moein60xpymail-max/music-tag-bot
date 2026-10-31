@@ -1,3 +1,4 @@
+
 import os
 import re
 import shutil
@@ -18,23 +19,12 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import (
     ID3,
     ID3NoHeaderError,
-    TIT2,
-    TPE1,
-    TALB,
-    TDRC,
-    TRCK,
-    TCON,
-    USLT,
-    COMM,
-    TPE2,
-    TCOM,
-    TPOS,
-    TPUB,
-    APIC,
+    TIT2, TPE1, TALB, TDRC, TRCK, TCON,
+    USLT, COMM, TPE2, TCOM, TPOS, TPUB, APIC,
 )
 
-
 TOKEN = os.getenv("BOT_TOKEN")
+MAX_SIZE = 20 * 1024 * 1024
 
 FIELDS = {
     "filename": "File Name",
@@ -65,19 +55,6 @@ TAG_CLASSES = {
     "publisher": TPUB,
 }
 
-FRAME_IDS = {
-    "title": "TIT2",
-    "artist": "TPE1",
-    "album": "TALB",
-    "year": "TDRC",
-    "track": "TRCK",
-    "genre": "TCON",
-    "albumartist": "TPE2",
-    "composer": "TCOM",
-    "disc": "TPOS",
-    "publisher": "TPUB",
-}
-
 
 def load_tags(path):
     try:
@@ -92,13 +69,12 @@ def get_tags(path):
     tags = load_tags(path)
     result = {}
 
-    for key, frame in FRAME_IDS.items():
-        values = tags.getall(frame)
-        result[key] = (
-            str(values[0].text[0])
-            if values and values[0].text
-            else "—"
-        )
+    for key, frame in TAG_CLASSES.items():
+        values = tags.getall(frame.__name__)
+        if values and values[0].text:
+            result[key] = str(values[0].text[0])
+        else:
+            result[key] = "—"
 
     lyrics = tags.getall("USLT")
     comments = tags.getall("COMM")
@@ -124,7 +100,6 @@ def get_cover(path):
         (item for item in covers if item.type == 3),
         covers[0],
     )
-
     return cover.data
 
 
@@ -166,10 +141,7 @@ def keyboard():
             InlineKeyboardButton("📩 Save", callback_data="save"),
         ],
         [
-            InlineKeyboardButton(
-                "📌 Apply default tags",
-                callback_data="defaults",
-            ),
+            InlineKeyboardButton("📌 Apply default tags", callback_data="defaults"),
         ],
     ]
 
@@ -207,10 +179,11 @@ async def show_editor(update, context):
 
     info = editor_text(path)
 
-    if update.callback_query:
-        message = update.callback_query.message
-    else:
-        message = update.message
+    message = (
+        update.callback_query.message
+        if update.callback_query
+        else update.message
+    )
 
     cover_data = get_cover(path)
 
@@ -227,10 +200,10 @@ async def show_editor(update, context):
             print("Cover display error:", error)
 
     await message.reply_text(
-        info + "\n\n🖼️ " + (
-            "کاور داخلی وجود دارد، اما تلگرام نتوانست آن را نمایش دهد."
+        info + "\n\n" + (
+            "🖼️ کاور داخلی وجود دارد، اما تلگرام نتوانست آن را نمایش دهد."
             if cover_data
-            else "این فایل کاور داخلی ندارد."
+            else "🖼️ این فایل کاور داخلی ندارد."
         ),
         reply_markup=keyboard(),
         parse_mode="Markdown",
@@ -246,15 +219,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("waiting") == "picture":
-        context.user_data["waiting"] = None
-        await update.message.reply_text(
-            "درخواست تغییر کاور لغو شد؛ کاور قبلی حفظ شد."
-        )
-    else:
-        await update.message.reply_text(
-            "در حال حاضر چیزی برای لغو وجود ندارد."
-        )
+    context.user_data["waiting"] = None
+    await update.message.reply_text(
+        "عملیات لغو شد. اطلاعات قبلی آهنگ حفظ شدند."
+    )
 
 
 async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,22 +238,29 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("فعلاً فقط فایل MP3 قبول می‌کنم.")
         return
 
-    if document.file_size and document.file_size > 20 * 1024 * 1024:
+    if document.file_size and document.file_size > MAX_SIZE:
         await message.reply_text("حجم فایل نباید بیشتر از 20 مگابایت باشه.")
         return
 
     old_folder = context.user_data.get("folder")
-
     if old_folder and os.path.isdir(old_folder):
         shutil.rmtree(old_folder, ignore_errors=True)
 
     folder = tempfile.mkdtemp(prefix="musicbot_")
     path = os.path.join(folder, "original.mp3")
 
-    telegram_file = await context.bot.get_file(document.file_id)
-    await telegram_file.download_to_drive(path)
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        await telegram_file.download_to_drive(path)
 
-    load_tags(path)
+        load_tags(path)
+        MP3(path)
+
+    except Exception as error:
+        shutil.rmtree(folder, ignore_errors=True)
+        print("Audio download error:", error)
+        await message.reply_text("دریافت یا خواندن فایل MP3 ناموفق بود.")
+        return
 
     context.user_data["path"] = path
     context.user_data["filename"] = Path(name).stem
@@ -311,9 +286,7 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "showlyrics":
         lyrics = load_tags(path).getall("USLT")
         await query.message.reply_text(
-            str(lyrics[0].text)
-            if lyrics
-            else "متنی برای این آهنگ ثبت نشده."
+            str(lyrics[0].text) if lyrics else "متنی برای این آهنگ ثبت نشده."
         )
         return
 
@@ -327,21 +300,16 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tags = load_tags(path)
         tags.clear()
         tags.save(path, v2_version=3)
-
         await query.message.reply_text(
             "تمام تگ‌ها، از جمله کاور، حذف شدند. ✅"
         )
-
         await show_editor(update, context)
         return
 
     if action == "save":
         output_name = context.user_data.get("filename", "music")
-
         output_name = re.sub(
-            r'[\\/:*?"<>|]',
-            "_",
-            output_name,
+            r'[\\/:*?"<>|]', "_", output_name
         ).strip() or "music"
 
         output_path = os.path.join(
@@ -357,12 +325,10 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 filename=output_name + ".mp3",
                 caption="تگ‌های آهنگ ذخیره شدند! 🎵",
             )
-
         return
 
     if action == "picture":
         context.user_data["waiting"] = "picture"
-
         await query.message.reply_text(
             "عکس جدید کاور رو به صورت عکس یا فایل بفرست.\n"
             "اگر منصرف شدی /cancel رو بفرست."
@@ -373,7 +339,6 @@ async def edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data["waiting"] = action
-
     await query.message.reply_text(
         f"مقدار جدید {FIELDS[action]} رو بفرست:"
     )
@@ -397,24 +362,21 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif waiting in TAG_CLASSES:
         tags = load_tags(path)
-        tags.delall(FRAME_IDS[waiting])
+        frame_id = TAG_CLASSES[waiting].__name__
+        tags.delall(frame_id)
         tags.add(TAG_CLASSES[waiting](encoding=3, text=value))
         tags.save(path, v2_version=3)
 
     elif waiting == "lyrics":
         tags = load_tags(path)
         tags.delall("USLT")
-        tags.add(
-            USLT(encoding=3, lang="eng", desc="", text=value)
-        )
+        tags.add(USLT(encoding=3, lang="eng", desc="", text=value))
         tags.save(path, v2_version=3)
 
     elif waiting == "comment":
         tags = load_tags(path)
         tags.delall("COMM")
-        tags.add(
-            COMM(encoding=3, lang="eng", desc="", text=value)
-        )
+        tags.add(COMM(encoding=3, lang="eng", desc="", text=value))
         tags.save(path, v2_version=3)
 
     context.user_data["waiting"] = None
@@ -428,7 +390,6 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     path = context.user_data.get("path")
-
     if not path or not os.path.exists(path):
         return
 
@@ -439,7 +400,11 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
         telegram_file = await context.bot.get_file(photo.file_id)
         mime = "image/jpeg"
 
-    elif document and document.mime_type and document.mime_type.startswith("image/"):
+    elif (
+        document
+        and document.mime_type
+        and document.mime_type.startswith("image/")
+    ):
         telegram_file = await context.bot.get_file(document.file_id)
         mime = document.mime_type
 
@@ -448,32 +413,34 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     image_path = os.path.join(
-        context.user_data["folder"],
-        "new_cover",
+        context.user_data["folder"], "new_cover"
     )
 
-    await telegram_file.download_to_drive(image_path)
+    try:
+        await telegram_file.download_to_drive(image_path)
 
-    with open(image_path, "rb") as image_file:
-        image_data = image_file.read()
+        with open(image_path, "rb") as image_file:
+            image_data = image_file.read()
 
-    tags = load_tags(path)
-    tags.delall("APIC")
-
-    tags.add(
-        APIC(
-            encoding=3,
-            mime=mime,
-            type=3,
-            desc="Cover",
-            data=image_data,
+        tags = load_tags(path)
+        tags.delall("APIC")
+        tags.add(
+            APIC(
+                encoding=3,
+                mime=mime,
+                type=3,
+                desc="Cover",
+                data=image_data,
+            )
         )
-    )
+        tags.save(path, v2_version=3)
 
-    tags.save(path, v2_version=3)
+    except Exception as error:
+        print("Picture error:", error)
+        await update.message.reply_text("تعویض کاور ناموفق بود.")
+        return
 
     context.user_data["waiting"] = None
-
     await update.message.reply_text("کاور جدید جایگزین شد! 🖼️")
     await show_editor(update, context)
 
@@ -484,7 +451,9 @@ async def error_handler(update, context):
 
 def main():
     if not TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is missing!")
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing!"
+        )
 
     app = Application.builder().token(TOKEN).build()
 
@@ -495,7 +464,7 @@ def main():
 
     app.add_handler(
         MessageHandler(
-            filters.AUDIO | filters.Document.MimeType("audio/mpeg"),
+            filters.AUDIO | filters.Document.ALL,
             receive_audio,
         )
     )
@@ -517,107 +486,8 @@ def main():
     app.add_error_handler(error_handler)
 
     print("Music Tag Bot is running...")
-
     app.run_polling()
 
 
 if __name__ == "__main__":
-    main()g"
-
-    elif document and document.mime_type and document.mime_type.startswith("image/"):
-        telegram_file = await context.bot.get_file(document.file_id)
-        mime = document.mime_type
-
-    else:
-        await update.message.reply_text(
-            "لطفاً یک عکس معتبر بفرست."
-        )
-        return
-
-    image_path = os.path.join(
-        context.user_data["folder"],
-        "new_cover"
-    )
-
-    await telegram_file.download_to_drive(image_path)
-
-    with open(image_path, "rb") as image_file:
-        image_data = image_file.read()
-
-    tags = load_tags(path)
-    tags.delall("APIC")
-
-    tags.add(
-        APIC(
-            encoding=3,
-            mime=mime,
-            type=3,
-            desc="Cover",
-            data=image_data
-        )
-    )
-
-    tags.save(path, v2_version=3)
-
-    context.user_data["waiting"] = None
-
-    await update.message.reply_text(
-        "کاور جدید جایگزین شد! 🖼️"
-    )
-
-    await show_editor(update, context)
-
-
-async def main():
-    if not TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN environment variable is missing!"
-        )
-
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("cancel", cancel))
-
-    app.add_handler(
-        CallbackQueryHandler(edit_button)
-    )
-
-    app.add_handler(
-        MessageHandler(
-            (
-                filters.AUDIO |
-                filters.Document.MimeType("audio/mpeg")
-            ) & ~filters.COMMAND,
-            receive_audio
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            (
-                filters.PHOTO |
-                filters.Document.IMAGE
-            ) & ~filters.COMMAND,
-            receive_picture
-        )
-    )
-
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            receive_text
-        )
-    )
-
-    print("Music Tag Bot is running...")
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    await asyncio.Event().wait()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    main()
