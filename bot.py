@@ -319,7 +319,7 @@ async def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(edit_button))
     app.add_handler(MessageHandler(
-        filters.Document.ALL | filters.AUDIO, receive_audio
+        filters.AUDIO | filters.Document.MimeType("audio/mpeg"), receive_audio
     ))
     app.add_handler(MessageHandler(
         filters.PHOTO | filters.Document.IMAGE, receive_picture
