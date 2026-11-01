@@ -830,6 +830,17 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("فقط فایل MP3 یا فایل متنی فهرست آرشیو قبول می‌کنم.")
         return
 
+    # In manifest-driven archive mode, the bot only names the requested track.
+    # The user forwards that track; it then enters the normal single-track editor.
+    if context.user_data.get("waiting") == "archive_track":
+        archive = context.user_data.get("archive") or {}
+        idx = context.user_data.get("archive_current")
+        queue = archive.get("queue", [])
+        if not isinstance(idx, int) or not (0 <= idx < len(queue)):
+            await message.reply_text("ترک فعال آرشیو پیدا نشد. دوباره «آهنگ بعدی» را بزن.")
+            return
+        context.user_data["waiting"] = None
+
     if document.file_size and document.file_size > MAX_SIZE:
         await message.reply_text("حجم فایل نباید بیشتر از ۲۰ مگابایت باشه.")
         return
@@ -1251,21 +1262,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("ترک در انتظار دیگری وجود ندارد.")
                 return
             item = queue[idx]
-            try:
-                folder = tempfile.mkdtemp(prefix="archive_track_")
-                dest = os.path.join(folder, "original.mp3")
-                tg_file = await context.bot.get_file(item["file_id"])
-                await tg_file.download_to_drive(dest)
-                mt_load(dest); MP3(dest)
-            except Exception as exc:
-                if 'folder' in locals(): shutil.rmtree(folder, ignore_errors=True)
-                item["status"] = "failed"
-                await query.message.reply_text(f"دریافت ترک ناموفق بود: {exc}")
-                return
-            context.user_data.update({"path":dest,"folder":folder,"filename":Path(item["name"]).stem,"archive_current":idx,"archive_folder":folder,"album_mode":False,"editing_album_track":False})
+            context.user_data.update({"archive_current":idx,"waiting":"archive_track","album_mode":False,"editing_album_track":False})
+            title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
+            artist = (item.get("artist") or "هنرمند نامشخص").strip()
             warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
-            await query.message.reply_text(f"ترک {idx+1:03d} از {len(queue)}: {item.get('title') or item.get('name','بدون نام')}\nفایل همین آهنگ را ویرایش کن.{warning}")
-            await show_editor(update, context)
+            await query.message.reply_text(
+                f"🎵 ترک {idx+1:03d} از {len(queue)}\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن."
+            )
             return
         return
 
