@@ -16,6 +16,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardRemove,
+    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -1629,9 +1630,23 @@ def main():
 
     ensure_data_dir()
 
-    app = Application.builder().token(TOKEN).build()
+    async def post_init(application):
+        # Commands shown in Telegram's built-in menu button.
+        await application.bot.set_my_commands([
+            BotCommand("start", "🏠 شروع و نمایش منوی اصلی"),
+            BotCommand("single", "🎧 فعال‌کردن حالت آهنگ تکی"),
+            BotCommand("album", "💿 شروع حالت آلبوم"),
+            BotCommand("archive", "📚 بازکردن آرشیو موسیقی"),
+            BotCommand("tag", "⚙️ تنظیم تگ‌های پیش‌فرض"),
+            BotCommand("version", "ℹ️ نمایش نسخهٔ ربات"),
+            BotCommand("cancel", "❌ لغو عملیات فعلی"),
+        ])
+
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("single", single_mode_command))
+    app.add_handler(CommandHandler("archive", archive_start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("tag", tag_command))
     app.add_handler(CommandHandler("album", album_command))
