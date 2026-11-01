@@ -38,7 +38,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.4"
+VERSION = "v3.5"
 
 FIELDS = {
     "filename": "File Name",
@@ -763,6 +763,14 @@ def archive_keyboard():
         [InlineKeyboardButton("❌ بستن آرشیو", callback_data="arch:close")],
     ])
 
+
+def archive_track_keyboard():
+    """Controls shown only under an edited track in Archive mode."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ این آهنگ تموم شد", callback_data="arch:finish_current")],
+        [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
+    ])
+
 async def archive_start(update, context):
     context.user_data["archive"] = {"phase": "menu", "sources": {"source_a": [], "source_b": []}, "queue": [], "cursor": 0}
     context.user_data["album_mode"] = False
@@ -1170,6 +1178,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "arch:list":
             await archive_show_list(query, context)
             return
+        if data == "arch:finish_current":
+            queue = a.get("queue", [])
+            idx = context.user_data.get("archive_current")
+            if not isinstance(idx, int) or not (0 <= idx < len(queue)):
+                await query.answer("ترک فعال آرشیو پیدا نشد.", show_alert=True)
+                return
+            queue[idx]["status"] = "confirmed"
+            await query.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ این آهنگ تکمیل شد", callback_data="arch:already_done")],
+                    [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
+                ])
+            )
+            await query.answer("این آهنگ تکمیل شد.")
+            return
+        if data == "arch:already_done":
+            await query.answer("این آهنگ قبلاً تأیید شده است.")
+            return
+        if data == "arch:next":
+            queue = a.get("queue", [])
+            idx = context.user_data.get("archive_current")
+            if isinstance(idx, int) and 0 <= idx < len(queue):
+                if queue[idx].get("status") != "confirmed":
+                    await query.answer("اول دکمهٔ «این آهنگ تموم شد» را بزن.", show_alert=True)
+                    return
+            data = "arch:open_next"
         if data == "arch:open_next":
             queue = a.get("queue", [])
             idx = next((i for i,x in enumerate(queue) if x.get("status")=="pending"), None)
@@ -1500,6 +1534,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     duration=duration,
                     thumbnail=make_telegram_thumbnail(cover) if cover else None,
                     caption="تگ‌های آهنگ ذخیره شدند! 🎵",
+                    reply_markup=archive_track_keyboard()
+                    if context.user_data.get("archive") and isinstance(context.user_data.get("archive_current"), int)
+                    else None,
                 )
         except Exception as e:
             print("reply_audio error, falling back to document:", e)
@@ -1508,11 +1545,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     document=f,
                     filename=filename + ".mp3",
                     caption="تگ‌های آهنگ ذخیره شدند! 🎵",
+                    reply_markup=archive_track_keyboard()
+                    if context.user_data.get("archive") and isinstance(context.user_data.get("archive_current"), int)
+                    else None,
                 )
-        archive = context.user_data.get("archive")
-        archive_idx = context.user_data.get("archive_current")
-        if archive and isinstance(archive_idx, int) and archive_idx < len(archive.get("queue", [])):
-            archive["queue"][archive_idx]["status"] = "confirmed"
+        # Archive tracks are marked complete only after the explicit button press.
+        # Single-track and album workflows remain unchanged.
         return
 
 
