@@ -10,6 +10,9 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
 )
 from telegram.ext import (
     Application,
@@ -276,6 +279,15 @@ def apply_defaults_to_file(
 
 
 # ==================== دکمه‌ها ====================
+def main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """دکمه‌های پایین صفحه که همیشه دیده می‌شوند"""
+    keyboard = [
+        [KeyboardButton("🎵 شروع"), KeyboardButton("⚙️ تنظیم تگ‌ها")],
+        [KeyboardButton("💿 حالت آلبوم"), KeyboardButton("❌ لغو / خروج از آلبوم")],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
 def main_editor_keyboard(is_album: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [
@@ -460,20 +472,40 @@ async def show_editor(
 
 # ==================== دستورات ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # مطمئن شو که از حالت آلبوم خارج شده
+    context.user_data["album_mode"] = False
+    context.user_data["editing_album_track"] = False
+
     await update.message.reply_text(
         "سلام! 🎵\n\n"
         "به **Music Tag Editor** خوش اومدی.\n\n"
         "• یک فایل MP3 بفرست تا ویرایش تگ‌ها شروع بشه.\n"
-        "• برای حالت آلبوم (چند فایل) از دستور /album استفاده کن.\n"
-        "• برای تنظیم پیش‌فرض‌ها /tag رو بزن.\n"
-        "• /cancel برای لغو عملیات جاری."
+        "• از دکمه‌های پایین صفحه هم می‌تونی استفاده کنی.",
+        reply_markup=main_reply_keyboard(),
+        parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # کامل از حالت آلبوم خارج شو
     context.user_data["waiting"] = None
     context.user_data["waiting_mode"] = None
-    await update.message.reply_text("عملیات لغو شد.")
+    context.user_data["album_mode"] = False
+    context.user_data["editing_album_track"] = False
+    context.user_data["album_tracks"] = []
+    context.user_data["main_artists"] = []
+
+    # پوشه موقت آلبوم را پاک کن
+    album_folder = context.user_data.get("album_folder")
+    if album_folder and os.path.isdir(album_folder):
+        shutil.rmtree(album_folder, ignore_errors=True)
+    context.user_data["album_folder"] = None
+
+    await update.message.reply_text(
+        "✅ از حالت آلبوم خارج شدی.\n"
+        "حالا می‌تونی آهنگ تکی بفرستی.",
+        reply_markup=main_reply_keyboard(),
+    )
 
 
 async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -503,8 +535,10 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "اول نام هنرمند(های) اصلی آلبوم را بفرست.\n"
         "اگر چند نفر هستند با کاما جدا کن.\n"
         "مثال: `Yas , Amir Tataloo`\n\n"
-        "بعد فایل‌های MP3 را یکی‌یکی بفرست و در پایان دکمه **Finish Uploading** را بزن.",
+        "بعد فایل‌های MP3 را یکی‌یکی بفرست و در پایان دکمه **Finish Uploading** را بزن.\n\n"
+        "اگر خواستی از حالت آلبوم خارج شی، دکمه «❌ لغو / خروج از آلبوم» رو بزن.",
         parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_reply_keyboard(),
     )
 
 
@@ -641,11 +675,27 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip() if update.message.text else ""
+
+    # دکمه‌های پایین صفحه
+    if text == "🎵 شروع":
+        await start(update, context)
+        return
+    if text == "⚙️ تنظیم تگ‌ها":
+        await tag_command(update, context)
+        return
+    if text == "💿 حالت آلبوم":
+        await album_command(update, context)
+        return
+    if text == "❌ لغو / خروج از آلبوم":
+        await cancel(update, context)
+        return
+
     waiting = context.user_data.get("waiting")
     if not waiting:
         return
 
-    value = update.message.text.strip()
+    value = text
     if not value:
         await update.message.reply_text("مقدار خالی قابل ذخیره نیست.")
         return
@@ -752,6 +802,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "albumartist",
                 " , ".join(main_artists) if main_artists else artist,
             )
+        # دیگر فایل جدید به آلبوم اضافه نشود
+        context.user_data["album_mode"] = False
         await show_album_overview(query, context)
         return
 
@@ -1062,7 +1114,14 @@ async def save_album_all(query, context):
                 await query.message.reply_document(
                     document=f, filename=filename + ".mp3"
                 )
-    await query.message.reply_text("✅ همه ترک‌های آلبوم ارسال شدند.")
+    # از حالت آلبوم خارج شو
+    context.user_data["album_mode"] = False
+    context.user_data["editing_album_track"] = False
+    context.user_data["album_tracks"] = []
+    await query.message.reply_text(
+        "✅ همه ترک‌های آلبوم ارسال شدند.\nاز حالت آلبوم خارج شدی.",
+        reply_markup=main_reply_keyboard(),
+    )
 
 
 async def error_handler(update, context):
