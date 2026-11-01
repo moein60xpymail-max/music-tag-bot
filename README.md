@@ -1,4 +1,4 @@
-# Music Tag Bot v3.5
+# Music Tag Bot v3.4
 
 ## Archive duplicate detection update
 - Compares Telegram audio title metadata first; falls back to filename without extension.
@@ -12,4 +12,3 @@ For MP3s sent as Telegram documents, Telegram may not expose embedded title/arti
 
 ## Deploy
 Keep Start Command: `python bot.py`. Keep `BOT_TOKEN` and `OWNER_ID` in environment variables; do not commit secrets.
-

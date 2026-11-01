@@ -38,7 +38,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.5"
+VERSION = "v3.6"
 
 FIELDS = {
     "filename": "File Name",
@@ -756,16 +756,16 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== آرشیو موسیقی (نسخه پایه قابل استفاده) ====================
 def archive_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],
-        [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
-        [InlineKeyboardButton("🔎 تحلیل و ساخت صف", callback_data="arch:analyze")],
-        [InlineKeyboardButton("📋 نمایش صف و آمار", callback_data="arch:list")],
+        [InlineKeyboardButton("🔎 بررسی آهنگ‌های منابع", callback_data="arch:review_menu")],
+        [InlineKeyboardButton("📥 ورودی بررسی منابع", callback_data="arch:input_menu")],
         [InlineKeyboardButton("❌ بستن آرشیو", callback_data="arch:close")],
     ])
 
+def archive_source_keyboard(source):
+    label = "A" if source == "source_a" else "B"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"پایان منبع {label}", callback_data=f"arch:finish_{label.lower()}")]])
 
 def archive_track_keyboard():
-    """Controls shown only under an edited track in Archive mode."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ این آهنگ تموم شد", callback_data="arch:finish_current")],
         [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
@@ -775,7 +775,7 @@ async def archive_start(update, context):
     context.user_data["archive"] = {"phase": "menu", "sources": {"source_a": [], "source_b": []}, "queue": [], "cursor": 0}
     context.user_data["album_mode"] = False
     context.user_data["waiting"] = None
-    await update.message.reply_text("📚 آرشیو موسیقی\n\nابتدا منبع A و سپس منبع B را اضافه کن. فایل‌ها فعلاً فقط به‌صورت ارجاع تلگرامی ثبت می‌شوند؛ برای باز کردن هر ترک دانلود می‌شود. هر دو منبع را می‌توانی جداگانه تکمیل کنی.", reply_markup=archive_keyboard())
+    await update.message.reply_text("📚 آرشیو موسیقی\n\nیکی از دو مرحله را انتخاب کن:", reply_markup=archive_keyboard())
 
 def archive_norm(name):
     import unicodedata
@@ -813,8 +813,21 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     name = document.file_name or "music.mp3"
+    if context.user_data.get("waiting") == "archive_manifest" and name.lower().endswith(".txt"):
+        try:
+            tg_file=await context.bot.get_file(document.file_id)
+            raw=await tg_file.download_as_bytearray()
+            payload=bytes(raw).decode("utf-8-sig").split("---DATA---",1)[-1].strip()
+            manifest=json.loads(payload)
+            if manifest.get("format")!="archive-v1" or not isinstance(manifest.get("tracks"),list) or not manifest["tracks"]: raise ValueError()
+            context.user_data["archive"]={"phase":"queue","sources":{"source_a":[],"source_b":[]},"queue":[dict(x,status="pending") for x in manifest["tracks"]],"cursor":0}
+            context.user_data["waiting"]=None
+            await message.reply_text(f"✅ فهرست دریافت شد: {len(manifest['tracks'])} آهنگ", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ شروع دریافت آهنگ‌ها",callback_data="arch:open_next")]]))
+        except Exception as exc:
+            await message.reply_text(f"خواندن فایل فهرست ناموفق بود: {exc}")
+        return
     if not name.lower().endswith(".mp3"):
-        await message.reply_text("فعلاً فقط فایل MP3 قبول می‌کنم.")
+        await message.reply_text("فقط فایل MP3 یا فایل متنی فهرست آرشیو قبول می‌کنم.")
         return
 
     if document.file_size and document.file_size > MAX_SIZE:
@@ -1007,6 +1020,20 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     waiting = context.user_data.get("waiting")
+    if waiting == "archive_manifest":
+        import json
+        try:
+            payload = text.split("---DATA---", 1)[-1].strip()
+            manifest = json.loads(payload)
+            if manifest.get("format") != "archive-v1" or not isinstance(manifest.get("tracks"), list): raise ValueError()
+            tracks = manifest["tracks"]
+            if not tracks or len(tracks) > 1000: raise ValueError()
+            context.user_data["archive"] = {"phase":"queue", "sources":{"source_a":[],"source_b":[]}, "queue":[dict(x, status="pending") for x in tracks], "cursor":0}
+            context.user_data["waiting"] = None
+            await update.message.reply_text(f"✅ فهرست دریافت شد: {len(tracks)} آهنگ\nبرای شروع، ترک اول را باز می‌کنم.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ شروع دریافت آهنگ‌ها", callback_data="arch:open_next")]]))
+        except Exception:
+            await update.message.reply_text("متن فهرست معتبر نیست. کل متن خروجی بررسی منابع را بدون تغییر ارسال کن.")
+        return
     if not waiting:
         return
 
@@ -1128,6 +1155,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not a:
             await query.message.reply_text("آرشیوی فعال نیست؛ از دکمه آرشیو موسیقی شروع کن.")
             return
+        if data == "arch:review_menu":
+            a["phase"] = "menu"
+            await query.message.reply_text("برای بررسی، منبع A را اضافه کن و سپس منبع B را. هر منبع را جداگانه پایان بده.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],[InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],[InlineKeyboardButton("🧮 تحلیل و ساخت فهرست", callback_data="arch:analyze")]]))
+            return
+        if data == "arch:input_menu":
+            context.user_data["waiting"] = "archive_manifest"
+            await query.message.reply_text("متن کامل خروجی مرحله «بررسی آهنگ‌های منابع» را ارسال کن.")
+            return
         if data == "arch:start_a":
             a["phase"] = "source_a"
             await query.message.reply_text("📥 فایل‌های MP3 منبع A را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A", callback_data="arch:finish_a")]]))
@@ -1145,35 +1180,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"منبع B ثبت شد: {len(a['sources']['source_b'])} فایل", reply_markup=archive_keyboard())
             return
         if data == "arch:analyze":
-            merged = []
-            definite_count = 0
-            review_count = 0
-            # Source A is considered first; source B is compared against A and its own entries.
-            for src in ("source_a", "source_b"):
-                for entry in sorted(a["sources"][src], key=lambda x: x["message_id"]):
-                    item = dict(entry, source=src, duplicate=False, duplicate_level="independent", status="pending")
-                    for previous_index, previous in enumerate(merged, 1):
-                        result = classify_duplicate(previous, item)
-                        if result == "definite":
-                            item["duplicate"] = True
-                            item["duplicate_level"] = "definite"
-                            item["duplicate_of"] = previous_index
-                            definite_count += 1
-                            break
-                        if result == "manual":
-                            item["duplicate"] = True
-                            item["duplicate_level"] = "review"
-                            item["duplicate_of"] = previous_index
-                            review_count += 1
-                            break
-                    merged.append(item)
-            a["queue"] = merged
-            a["phase"] = "queue"
-            await query.message.reply_text(
-                f"تحلیل چندمعیاره تمام شد. {len(merged)} ترک در صف قرار گرفت.\n"
-                f"تکراریِ قوی: {definite_count} | نیازمند بررسی دستی: {review_count}\n"
-                "هیچ فایلی خودکار حذف یا از صف خارج نشده است. عنوان، مدت زمان و در صورت وجود نام خواننده بررسی شده‌اند؛ حجم فقط نشانهٔ کمکی است.",
-                reply_markup=archive_keyboard())
+            merged=[]; definite_count=0; review_count=0
+            # Keep all A tracks in original order; B matches attach to A and do not create another queue row.
+            for entry in sorted(a["sources"]["source_a"], key=lambda x:x.get("message_id",0)):
+                merged.append(dict(entry, source="A", duplicate_level="independent", review=False, status="pending"))
+            for entry in sorted(a["sources"]["source_b"], key=lambda x:x.get("message_id",0)):
+                item=dict(entry, source="B", duplicate_level="independent", review=False, status="pending")
+                match=None; level="independent"
+                for i, previous in enumerate(merged):
+                    result=classify_duplicate(previous,item)
+                    if result=="definite": match=i; level="definite"; break
+                    if result=="manual": match=i; level="manual"
+                if match is not None and level=="definite":
+                    merged[match].setdefault("also_in_source_b", True); definite_count+=1
+                elif match is not None:
+                    item["review"]=True; item["duplicate_level"]="review"; item["possible_match"]=match+1
+                    merged.append(item); review_count+=1
+                else: merged.append(item)
+            for i,x in enumerate(merged,1): x["number"]=i
+            a["queue"]=merged; a["phase"]="queue"
+            lines=["ARCHIVE-MANIFEST v1",f"تعداد آهنگ‌ها: {len(merged)}",f"تکراری قطعی حذف‌شده: {definite_count}",f"نیازمند بررسی: {review_count}","", "فهرست آهنگ‌ها:"]
+            for x in merged:
+                mark="❗ " if x.get("review") else ""
+                artist=x.get("artist") or "هنرمند نامشخص"
+                name=x.get("title") or Path(x.get("name") or "بدون نام").stem
+                lines.append(f"{x['number']:03d}. {mark}{name} - {artist}")
+            # JSON payload after readable list lets the same text be imported without losing file references.
+            manifest={"format":"archive-v1","tracks":[{k:x.get(k) for k in ("number","name","title","artist","duration","size","file_id","file_unique_id","review","possible_match","source")} for x in merged]}
+            lines += ["", "---DATA---", json.dumps(manifest,ensure_ascii=False,separators=(",",":"))]
+            report="\n".join(lines)
+            preview="\n".join(lines[:min(len(lines), 24)])
+            await query.message.reply_text(preview + ("\n… فهرست کامل داخل فایل متنی پیوست است." if len(lines)>24 else ""))
+            report_file=BytesIO(report.encode("utf-8")); report_file.name="archive_manifest.txt"
+            await query.message.reply_document(document=report_file, filename="archive_manifest.txt", caption="این فایل متنی را برای مرحله دوم به گزینه «ورودی بررسی منابع» بده.")
+            await query.message.reply_text("فهرست کامل آماده شد.", reply_markup=archive_keyboard())
             return
         if data == "arch:list":
             await archive_show_list(query, context)
@@ -1223,7 +1263,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text(f"دریافت ترک ناموفق بود: {exc}")
                 return
             context.user_data.update({"path":dest,"folder":folder,"filename":Path(item["name"]).stem,"archive_current":idx,"archive_folder":folder,"album_mode":False,"editing_album_track":False})
-            await query.message.reply_text(f"ترک {idx+1:03d} از {len(queue)} باز شد. پس از ویرایش، Save را بزن و از منوی آرشیو ترک بعدی را باز کن.")
+            warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
+            await query.message.reply_text(f"ترک {idx+1:03d} از {len(queue)}: {item.get('title') or item.get('name','بدون نام')}\nفایل همین آهنگ را ویرایش کن.{warning}")
             await show_editor(update, context)
             return
         return
@@ -1717,7 +1758,7 @@ def main():
 
     app.add_handler(
         MessageHandler(
-            filters.AUDIO | filters.Document.FileExtension("mp3"), receive_audio
+            filters.AUDIO | filters.Document.ALL, receive_audio
         )
     )
     app.add_handler(
