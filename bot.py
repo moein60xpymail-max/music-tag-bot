@@ -18,6 +18,7 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardRemove,
     BotCommand,
+    CopyTextButton,
 )
 from telegram.ext import (
     Application,
@@ -1266,8 +1267,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
             artist = (item.get("artist") or "هنرمند نامشخص").strip()
             warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
+            progress = ((idx + 1) / len(queue) * 100) if queue else 0
+            title_button = InlineKeyboardButton(
+                text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),
+                copy_text=CopyTextButton(text=title or ""),
+            )
             await query.message.reply_text(
-                f"🎵 ترک {idx+1:03d} از {len(queue)}\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن."
+                f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
+                reply_markup=InlineKeyboardMarkup([[title_button]]),
             )
             return
         return
