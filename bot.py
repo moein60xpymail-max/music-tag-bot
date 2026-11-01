@@ -449,7 +449,8 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """دکمه‌های پایین صفحه که همیشه دیده می‌شوند"""
     keyboard = [
         [KeyboardButton("🎵 شروع"), KeyboardButton("⚙️ تنظیم تگ‌ها")],
-        [KeyboardButton("💿 حالت آلبوم"), KeyboardButton("❌ لغو / خروج از آلبوم")],
+        [KeyboardButton("💿 حالت آلبوم"), KeyboardButton("📚 آرشیو موسیقی")],
+        [KeyboardButton("❌ لغو / خروج از آلبوم")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -735,6 +736,47 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ==================== آرشیو موسیقی (نسخه پایه قابل استفاده) ====================
+def archive_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],
+        [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
+        [InlineKeyboardButton("🔎 تحلیل و ساخت صف", callback_data="arch:analyze")],
+        [InlineKeyboardButton("📋 نمایش صف و آمار", callback_data="arch:list")],
+        [InlineKeyboardButton("❌ بستن آرشیو", callback_data="arch:close")],
+    ])
+
+async def archive_start(update, context):
+    context.user_data["archive"] = {"phase": "menu", "sources": {"source_a": [], "source_b": []}, "queue": [], "cursor": 0}
+    context.user_data["album_mode"] = False
+    context.user_data["waiting"] = None
+    await update.message.reply_text("📚 آرشیو موسیقی\n\nابتدا منبع A و سپس منبع B را اضافه کن. فایل‌ها فعلاً فقط به‌صورت ارجاع تلگرامی ثبت می‌شوند؛ برای باز کردن هر ترک دانلود می‌شود. هر دو منبع را می‌توانی جداگانه تکمیل کنی.", reply_markup=archive_keyboard())
+
+def archive_norm(name):
+    import unicodedata
+    value = unicodedata.normalize("NFKC", Path(name).stem).casefold()
+    value = value.replace("ي", "ی").replace("ك", "ک")
+    value = re.sub(r"[^\w\s]", " ", value)
+    return " ".join(value.split())
+
+async def archive_show_list(query, context):
+    a = context.user_data.get("archive") or {}
+    queue = a.get("queue", [])
+    confirmed = sum(1 for x in queue if x.get("status") == "confirmed")
+    skipped = sum(1 for x in queue if x.get("status") == "skipped")
+    pending = sum(1 for x in queue if x.get("status") == "pending")
+    lines = [f"📚 صف آرشیو: {len(queue)} ترک", f"تأییدشده: {confirmed} | ردشده: {skipped} | باقی‌مانده: {pending}", ""]
+    for i, item in enumerate(queue[:40], 1):
+        mark = "✅" if item.get("status")=="confirmed" else ("⏭" if item.get("status")=="skipped" else "▫️")
+        dup = " ⚠️ مشابه" if item.get("duplicate") else ""
+        lines.append(f"{mark} {i:03d}. {item['name']}{dup}")
+    if len(queue) > 40: lines.append(f"… و {len(queue)-40} ترک دیگر")
+    rows = []
+    if queue:
+        rows.append([InlineKeyboardButton("✏️ باز کردن ترک بعدی", callback_data="arch:open_next")])
+    rows.append([InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")])
+    await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+
 # ==================== دریافت فایل و متن ====================
 async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -752,6 +794,23 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if document.file_size and document.file_size > MAX_SIZE:
         await message.reply_text("حجم فایل نباید بیشتر از ۲۰ مگابایت باشه.")
+        return
+
+    # Archive intake: keep Telegram file references; download only when a track is opened.
+    archive = context.user_data.get("archive")
+    if archive and archive.get("phase") in {"source_a", "source_b"}:
+        source = archive["phase"]
+        bucket = archive["sources"][source]
+        bucket.append({"file_id": document.file_id, "file_unique_id": document.file_unique_id,
+                       "name": name, "size": document.file_size or 0,
+                       "message_id": message.message_id})
+        await message.reply_text(
+            f"✅ {name} به منبع {'A' if source == 'source_a' else 'B'} اضافه شد.\n"
+            f"تعداد این منبع: {len(bucket)}\nفایل بعدی را بفرست یا پایان منبع را بزن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "پایان منبع A" if source == "source_a" else "پایان منبع B",
+                callback_data="arch:finish_a" if source == "source_a" else "arch:finish_b")]])
+        )
         return
 
     # حالت آلبوم
@@ -898,6 +957,9 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🎵 شروع":
         await start(update, context)
         return
+    if text == "📚 آرشیو موسیقی":
+        await archive_start(update, context)
+        return
     if text == "⚙️ تنظیم تگ‌ها":
         await tag_command(update, context)
         return
@@ -1016,6 +1078,79 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     path = context.user_data.get("path")
+
+    if data.startswith("arch:"):
+        a = context.user_data.get("archive")
+        if data == "arch:close":
+            context.user_data.pop("archive", None)
+            await query.message.edit_text("آرشیو بسته شد. فایل‌های قبلی ربات دست‌نخورده‌اند.")
+            return
+        if data == "arch:menu":
+            if a: a["phase"] = "menu"
+            await query.message.edit_text("📚 منوی آرشیو", reply_markup=archive_keyboard())
+            return
+        if not a:
+            await query.message.reply_text("آرشیوی فعال نیست؛ از دکمه آرشیو موسیقی شروع کن.")
+            return
+        if data == "arch:start_a":
+            a["phase"] = "source_a"
+            await query.message.reply_text("📥 فایل‌های MP3 منبع A را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A", callback_data="arch:finish_a")]]))
+            return
+        if data == "arch:start_b":
+            a["phase"] = "source_b"
+            await query.message.reply_text("📥 فایل‌های MP3 منبع B را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع B", callback_data="arch:finish_b")]]))
+            return
+        if data == "arch:finish_a":
+            a["phase"] = "menu"
+            await query.message.reply_text(f"منبع A ثبت شد: {len(a['sources']['source_a'])} فایل", reply_markup=archive_keyboard())
+            return
+        if data == "arch:finish_b":
+            a["phase"] = "menu"
+            await query.message.reply_text(f"منبع B ثبت شد: {len(a['sources']['source_b'])} فایل", reply_markup=archive_keyboard())
+            return
+        if data == "arch:analyze":
+            merged = []
+            seen = {}
+            for src in ("source_a", "source_b"):
+                for entry in sorted(a["sources"][src], key=lambda x: x["message_id"]):
+                    key = archive_norm(entry["name"])
+                    duplicate = bool(key and key in seen)
+                    item = dict(entry, source=src, duplicate=duplicate, status="pending")
+                    if duplicate:
+                        item["duplicate_of"] = seen[key]
+                    elif key:
+                        seen[key] = len(merged) + 1
+                    merged.append(item)
+            a["queue"] = merged
+            a["phase"] = "queue"
+            await query.message.reply_text(f"تحلیل نام فایل‌ها تمام شد. {len(merged)} ترک در صف قرار گرفت؛ موارد مشابه فقط علامت‌گذاری شده‌اند و حذف نشده‌اند.", reply_markup=archive_keyboard())
+            return
+        if data == "arch:list":
+            await archive_show_list(query, context)
+            return
+        if data == "arch:open_next":
+            queue = a.get("queue", [])
+            idx = next((i for i,x in enumerate(queue) if x.get("status")=="pending"), None)
+            if idx is None:
+                await query.message.reply_text("ترک در انتظار دیگری وجود ندارد.")
+                return
+            item = queue[idx]
+            try:
+                folder = tempfile.mkdtemp(prefix="archive_track_")
+                dest = os.path.join(folder, "original.mp3")
+                tg_file = await context.bot.get_file(item["file_id"])
+                await tg_file.download_to_drive(dest)
+                mt_load(dest); MP3(dest)
+            except Exception as exc:
+                if 'folder' in locals(): shutil.rmtree(folder, ignore_errors=True)
+                item["status"] = "failed"
+                await query.message.reply_text(f"دریافت ترک ناموفق بود: {exc}")
+                return
+            context.user_data.update({"path":dest,"folder":folder,"filename":Path(item["name"]).stem,"archive_current":idx,"archive_folder":folder,"album_mode":False,"editing_album_track":False})
+            await query.message.reply_text(f"ترک {idx+1:03d} از {len(queue)} باز شد. پس از ویرایش، Save را بزن و از منوی آرشیو ترک بعدی را باز کن.")
+            await show_editor(update, context)
+            return
+        return
 
     # ---------- تنظیمات پیش‌فرض ----------
     if data == "tag:menu" or data == "tag:close":
@@ -1332,6 +1467,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     filename=filename + ".mp3",
                     caption="تگ‌های آهنگ ذخیره شدند! 🎵",
                 )
+        archive = context.user_data.get("archive")
+        archive_idx = context.user_data.get("archive_current")
+        if archive and isinstance(archive_idx, int) and archive_idx < len(archive.get("queue", [])):
+            archive["queue"][archive_idx]["status"] = "confirmed"
         return
 
 

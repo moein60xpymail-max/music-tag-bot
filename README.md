@@ -1,21 +1,12 @@
-# Music Tag Bot v3.0
+# Music Tag Bot v3.1
 
-این بسته نسخهٔ ارتقایافتهٔ ویرایشگر MP3 شماست و مسیر اصلی اجرای آن همچنان `python bot.py` است.
+## Deploy
+- Python start command: `python bot.py`
+- Required environment variable: `BOT_TOKEN`
+- Optional: `DATA_DIR` (defaults to `data`)
+- Dependencies: `pip install -r requirements.txt`
 
-## فایل‌ها
-- `bot.py`: ربات تلگرام و قابلیت‌های ویرایش تگ/کاور/آلبوم نسخهٔ قبلی، با اصلاح ذخیرهٔ اتمیک تنظیمات و مسیر اعمال گروهی فیلد آلبوم.
-- `config.py`: تنظیمات محیطی مشترک.
-- `sessions.py`: ذخیره‌سازی مقاوم نشست‌ها با فایل پشتیبان.
-- `dupes.py`: نرمال‌سازی نام آهنگ و تشخیص محافظه‌کارانهٔ موارد تکراری.
-- `archive.py`: ژورنال append-only و محاسبهٔ Tracker آرشیو.
+## Archive (basic integrated workflow)
+Use **📚 آرشیو موسیقی**, add MP3 files to source A and source B, finish each source, analyze to build a queue, inspect the list, and open pending tracks for editing. Similar filenames are flagged, never automatically deleted. Opening a track downloads it; saving sends the edited MP3 and marks it confirmed.
 
-## استقرار
-1. از مخزن فعلی یک Backup/branch بگیر.
-2. همهٔ فایل‌های این بسته را در ریشهٔ مخزن جایگزین/اضافه کن.
-3. دستور Start را روی `python bot.py` نگه دار.
-4. متغیر `BOT_TOKEN` را در پنل میزبان تنظیم کن؛ توکن را داخل GitHub قرار نده.
-5. در صورت نیاز به محدودکردن اجرای ربات به یک حساب، متغیر `OWNER_ID` را نیز تنظیم کن. در این نسخه مقدار صفر صرفاً به معنی عدم اعمال محدودیت مالک در لایهٔ کمکی است.
-
-`DATA_DIR` اختیاری است و پیش‌فرض آن `data` است. اگر میزبان دیسک پایدار/Volume نداشته باشد، فایل‌های محلی ممکن است با جایگزینی کانتینر یا پاک‌شدن دیسک از بین بروند.
-
-محدودیت فایل MP3 در این نسخه ۲۰ مگابایت است. فایل غیر MP3 تبدیل نمی‌شود.
+Archive session state currently lives in Telegram bot process memory (`context.user_data`). It is not durable across process restarts/redeploys. Duplicate detection is filename-based, not audio-fingerprint or full metadata analysis. This is an initial integrated archive workflow, not the full persistent/recovery specification.
