@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from dupes import classify as classify_duplicate
 from typing import Dict, List, Optional, Any
 from io import BytesIO
 
@@ -37,7 +38,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.2"
+VERSION = "v3.4"
 
 FIELDS = {
     "filename": "File Name",
@@ -817,9 +818,17 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if archive and archive.get("phase") in {"source_a", "source_b"}:
         source = archive["phase"]
         bucket = archive["sources"][source]
-        bucket.append({"file_id": document.file_id, "file_unique_id": document.file_unique_id,
-                       "name": name, "size": document.file_size or 0,
-                       "message_id": message.message_id})
+        audio_meta = message.audio
+        bucket.append({
+            "file_id": document.file_id,
+            "file_unique_id": document.file_unique_id,
+            "name": name,
+            "title": (getattr(audio_meta, "title", None) or "").strip(),
+            "artist": (getattr(audio_meta, "performer", None) or "").strip(),
+            "duration": getattr(audio_meta, "duration", None),
+            "size": document.file_size or 0,
+            "message_id": message.message_id,
+        })
         await message.reply_text(
             f"✅ {name} به منبع {'A' if source == 'source_a' else 'B'} اضافه شد.\n"
             f"تعداد این منبع: {len(bucket)}\nفایل بعدی را بفرست یا پایان منبع را بزن.",
@@ -1129,20 +1138,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data == "arch:analyze":
             merged = []
-            seen = {}
+            definite_count = 0
+            review_count = 0
+            # Source A is considered first; source B is compared against A and its own entries.
             for src in ("source_a", "source_b"):
                 for entry in sorted(a["sources"][src], key=lambda x: x["message_id"]):
-                    key = archive_norm(entry["name"])
-                    duplicate = bool(key and key in seen)
-                    item = dict(entry, source=src, duplicate=duplicate, status="pending")
-                    if duplicate:
-                        item["duplicate_of"] = seen[key]
-                    elif key:
-                        seen[key] = len(merged) + 1
+                    item = dict(entry, source=src, duplicate=False, duplicate_level="independent", status="pending")
+                    for previous_index, previous in enumerate(merged, 1):
+                        result = classify_duplicate(previous, item)
+                        if result == "definite":
+                            item["duplicate"] = True
+                            item["duplicate_level"] = "definite"
+                            item["duplicate_of"] = previous_index
+                            definite_count += 1
+                            break
+                        if result == "manual":
+                            item["duplicate"] = True
+                            item["duplicate_level"] = "review"
+                            item["duplicate_of"] = previous_index
+                            review_count += 1
+                            break
                     merged.append(item)
             a["queue"] = merged
             a["phase"] = "queue"
-            await query.message.reply_text(f"تحلیل نام فایل‌ها تمام شد. {len(merged)} ترک در صف قرار گرفت؛ موارد مشابه فقط علامت‌گذاری شده‌اند و حذف نشده‌اند.", reply_markup=archive_keyboard())
+            await query.message.reply_text(
+                f"تحلیل چندمعیاره تمام شد. {len(merged)} ترک در صف قرار گرفت.\n"
+                f"تکراریِ قوی: {definite_count} | نیازمند بررسی دستی: {review_count}\n"
+                "هیچ فایلی خودکار حذف یا از صف خارج نشده است. عنوان، مدت زمان و در صورت وجود نام خواننده بررسی شده‌اند؛ حجم فقط نشانهٔ کمکی است.",
+                reply_markup=archive_keyboard())
             return
         if data == "arch:list":
             await archive_show_list(query, context)

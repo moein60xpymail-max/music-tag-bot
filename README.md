@@ -1,12 +1,14 @@
-# Music Tag Bot v3.2
+# Music Tag Bot v3.4
+
+## Archive duplicate detection update
+- Compares Telegram audio title metadata first; falls back to filename without extension.
+- Compares duration when Telegram provides it. Exact normalized title + duration difference <= 2 seconds is marked as a strong duplicate unless both artist values conflict.
+- Compares artist/performer metadata when available. Conflicting artists send the pair to manual review.
+- Similar titles are flagged for manual review only; they are never auto-merged.
+- File size is only a weak supporting signal and is never used alone to declare a duplicate.
+- No track is automatically deleted or removed from the queue.
+
+For MP3s sent as Telegram documents, Telegram may not expose embedded title/artist/duration metadata. In that case the bot falls back to the filename and marks uncertain matches for review. Audio files sent as Telegram Audio provide richer metadata.
 
 ## Deploy
-- Python start command: `python bot.py`
-- Required environment variable: `BOT_TOKEN`
-- Optional: `DATA_DIR` (defaults to `data`)
-- Dependencies: `pip install -r requirements.txt`
-
-## Archive (basic integrated workflow)
-Use **📚 آرشیو موسیقی**, add MP3 files to source A and source B, finish each source, analyze to build a queue, inspect the list, and open pending tracks for editing. Similar filenames are flagged, never automatically deleted. Opening a track downloads it; saving sends the edited MP3 and marks it confirmed.
-
-Archive session state currently lives in Telegram bot process memory (`context.user_data`). It is not durable across process restarts/redeploys. Duplicate detection is filename-based, not audio-fingerprint or full metadata analysis. This is an initial integrated archive workflow, not the full persistent/recovery specification.
+Keep Start Command: `python bot.py`. Keep `BOT_TOKEN` and `OWNER_ID` in environment variables; do not commit secrets.
