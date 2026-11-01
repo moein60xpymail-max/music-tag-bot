@@ -36,7 +36,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.0"
+VERSION = "v3.2"
 
 FIELDS = {
     "filename": "File Name",
@@ -448,9 +448,10 @@ def apply_defaults_to_file(
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """دکمه‌های پایین صفحه که همیشه دیده می‌شوند"""
     keyboard = [
-        [KeyboardButton("🎵 شروع"), KeyboardButton("⚙️ تنظیم تگ‌ها")],
-        [KeyboardButton("💿 حالت آلبوم"), KeyboardButton("📚 آرشیو موسیقی")],
-        [KeyboardButton("❌ لغو / خروج از آلبوم")],
+        [KeyboardButton("🏠 شروع")],
+        [KeyboardButton("🎧 حالت آهنگ تکی"), KeyboardButton("💿 حالت آلبوم")],
+        [KeyboardButton("📚 حالت آرشیو")],
+        [KeyboardButton("⚙️ تگ‌های پیش‌فرض")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -651,6 +652,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # مطمئن شو که از حالت آلبوم خارج شده
     context.user_data["album_mode"] = False
     context.user_data["editing_album_track"] = False
+    context.user_data["single_mode"] = False
 
     await update.message.reply_text(
         "سلام! 🎵\n\n"
@@ -659,6 +661,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• از دکمه‌های پایین صفحه هم می‌تونی استفاده کنی.",
         reply_markup=main_reply_keyboard(),
         parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def single_mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switch explicitly to single-track editing mode."""
+    context.user_data["album_mode"] = False
+    context.user_data["editing_album_track"] = False
+    context.user_data["single_mode"] = True
+    context.user_data["waiting"] = None
+    context.user_data["waiting_mode"] = None
+    await update.message.reply_text(
+        "🎧 حالت آهنگ تکی فعال شد.\n\nحالا یک فایل MP3 بفرست تا تگ‌های همان آهنگ را ویرایش کنی.",
+        reply_markup=main_reply_keyboard(),
     )
 
 
@@ -954,13 +969,16 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
 
     # دکمه‌های پایین صفحه
-    if text == "🎵 شروع":
+    if text in {"🏠 شروع", "🎵 شروع"}:
         await start(update, context)
         return
-    if text == "📚 آرشیو موسیقی":
+    if text in {"🎧 حالت آهنگ تکی", "🎵 حالت آهنگ تکی"}:
+        await single_mode_command(update, context)
+        return
+    if text in {"📚 حالت آرشیو", "📚 آرشیو موسیقی"}:
         await archive_start(update, context)
         return
-    if text == "⚙️ تنظیم تگ‌ها":
+    if text in {"⚙️ تگ‌های پیش‌فرض", "⚙️ تنظیم تگ‌ها"}:
         await tag_command(update, context)
         return
     if text == "💿 حالت آلبوم":

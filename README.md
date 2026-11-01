@@ -1,4 +1,4 @@
-# Music Tag Bot v3.1
+# Music Tag Bot v3.2
 
 ## Deploy
 - Python start command: `python bot.py`
