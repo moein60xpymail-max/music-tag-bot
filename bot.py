@@ -39,7 +39,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.6"
+VERSION = "v3.7"
 
 FIELDS = {
     "filename": "File Name",
@@ -807,7 +807,25 @@ async def archive_show_list(query, context):
 async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     document = message.document or message.audio
+
+    # In archive track mode, also accept a text reply to a previously sent
+    # audio/document message. The replied-to media is what gets edited.
+    if not document and context.user_data.get("waiting") == "archive_track":
+        replied = message.reply_to_message
+        if replied:
+            document = replied.document or replied.audio
+            if document:
+                media_message = replied
+            else:
+                media_message = message
+        else:
+            media_message = message
+    else:
+        media_message = message
+
     if not document:
+        if context.user_data.get("waiting") == "archive_track" and message.reply_to_message:
+            await message.reply_text("پیام ریپلای‌شده فایل صوتی یا MP3 ندارد. روی پیام حاوی فایل آهنگ Reply بزن.")
         return
 
     if document.mime_type and document.mime_type.startswith("image/"):

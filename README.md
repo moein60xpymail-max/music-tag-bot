@@ -13,7 +13,7 @@ For MP3s sent as Telegram documents, Telegram may not expose embedded title/arti
 ## Deploy
 Keep Start Command: `python bot.py`. Keep `BOT_TOKEN` and `OWNER_ID` in environment variables; do not commit secrets.
 
-## v3.6.2 archive request display
+## v3.7 archive request display
 - Shows archive progress percentage on each requested track.
 - Adds a Telegram copy-text button for the current track title.
 - Changes are limited to the archive track prompt.
