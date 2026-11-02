@@ -40,7 +40,15 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.0"
+VERSION = "v4.1"
+VERSION_CHANGES = [
+    "مدیریت کاور پیش‌فرض Unreleased Track",
+    "انتخاب بین جایگزینی کاور، حفظ کاور فعلی یا لغو عملیات",
+    "پشتیبانی از این قابلیت در حالت‌های Single، Album و Archive",
+    "اعمال کاور فقط روی آهنگ انتخاب‌شده؛ بدون تغییر کاور آهنگ‌های دیگر",
+    "نمایش شماره نسخه و فهرست تغییرات در بخش نسخه",
+]
+UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
 FIELDS = {
     "filename": "File Name",
@@ -460,6 +468,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("🎧 حالت آهنگ تکی"), KeyboardButton("💿 حالت آلبوم")],
         [KeyboardButton("📚 حالت آرشیو")],
         [KeyboardButton("📊 خلاصه آهنگ‌ها")],
+        [KeyboardButton("🖼️ مدیریت کاور Unreleased Track")],
         [KeyboardButton("⚙️ تگ‌های پیش‌فرض")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -723,7 +732,12 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"نسخه فعلی ربات: **{VERSION}**", parse_mode=ParseMode.MARKDOWN)
+    changes = "\n".join(f"• {item}" for item in VERSION_CHANGES)
+    await update.message.reply_text(
+        f"📦 **نسخه فعلی ربات شما: {VERSION}**\n\n"
+        f"🆕 **تغییرات این نسخه:**\n{changes}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
 
 
 async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1051,7 +1065,31 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("waiting") != "picture":
+    waiting = context.user_data.get("waiting")
+    if waiting == "unreleased_default_cover":
+        photo = update.message.photo[-1] if update.message.photo else None
+        document = update.message.document
+        if photo:
+            tg_file = await context.bot.get_file(photo.file_id)
+        elif document and document.mime_type and document.mime_type.startswith("image/"):
+            tg_file = await context.bot.get_file(document.file_id)
+        else:
+            await update.message.reply_text("لطفاً یک تصویر معتبر بفرست.")
+            return
+        try:
+            ensure_data_dir()
+            temp_path = DATA_DIR / "unreleased_track_cover.upload"
+            await tg_file.download_to_drive(str(temp_path))
+            image_data = normalize_cover(temp_path.read_bytes())
+            UNRELEASED_COVER_FILE.write_bytes(image_data)
+            temp_path.unlink(missing_ok=True)
+            context.user_data["waiting"] = None
+            await update.message.reply_text("✅ کاور پیش‌فرض Unreleased Track ذخیره شد.", reply_markup=main_reply_keyboard())
+        except Exception as exc:
+            print("Unreleased default cover error:", exc)
+            await update.message.reply_text("ذخیره کاور ناموفق بود. تصویر دیگری امتحان کن.")
+        return
+    if waiting != "picture":
         return
 
     path = context.user_data.get("path")
@@ -1112,6 +1150,18 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if text == "💿 حالت آلبوم":
         await album_command(update, context)
+        return
+    if text == "🖼️ مدیریت کاور Unreleased Track":
+        exists = UNRELEASED_COVER_FILE.exists()
+        status = "✅ کاور پیش‌فرض ثبت شده است." if exists else "❌ هنوز کاوری ثبت نشده است."
+        await update.message.reply_text(
+            f"🖼️ مدیریت کاور Unreleased Track\n\n{status}\n"
+            "برای ثبت یا جایگزینی کاور، دکمه زیر را بزن و تصویر را ارسال کن.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 ارسال / تغییر کاور پیش‌فرض", callback_data="unrel:upload")],
+                [InlineKeyboardButton("🗑 حذف کاور پیش‌فرض", callback_data="unrel:delete")],
+            ]),
+        )
         return
     if text == "📊 خلاصه آهنگ‌ها":
         context.user_data["summary_session"] = {"tracks": []}
@@ -1249,6 +1299,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     path = context.user_data.get("path")
+
+    if data == "unrel:upload":
+        context.user_data["waiting"] = "unreleased_default_cover"
+        await query.message.reply_text("تصویر کاور پیش‌فرض را به صورت عکس یا فایل تصویری ارسال کن.")
+        return
+    if data == "unrel:delete":
+        UNRELEASED_COVER_FILE.unlink(missing_ok=True)
+        await query.message.reply_text("کاور پیش‌فرض حذف شد.")
+        return
+    if data == "unrel:replace":
+        if not path or not os.path.exists(path):
+            await query.answer("فایل آهنگ در دسترس نیست.", show_alert=True)
+            return
+        if not UNRELEASED_COVER_FILE.exists():
+            await query.answer("هنوز کاور پیش‌فرضی ثبت نشده است.", show_alert=True)
+            return
+        try:
+            image_data = normalize_cover(UNRELEASED_COVER_FILE.read_bytes())
+            set_cover(path, image_data)
+            context.user_data["original_cover"] = image_data
+            update_album_track_cover(context, path, image_data)
+            set_tag(path, "album", "Unreleased Track")
+        except Exception as exc:
+            print("Unreleased cover apply error:", exc)
+            await query.message.reply_text("اعمال کاور انجام نشد؛ فایل اصلی دست‌نخورده باقی نماند؟ لطفاً دوباره امتحان کن.")
+            return
+        await query.message.reply_text("✅ تگ Unreleased Track و کاور پیش‌فرض روی همین آهنگ اعمال شد.")
+        await show_editor(update, context, is_album=context.user_data.get("editing_album_track", False))
+        return
+    if data == "unrel:keep":
+        if not path or not os.path.exists(path):
+            await query.answer("فایل آهنگ در دسترس نیست.", show_alert=True)
+            return
+        set_tag(path, "album", "Unreleased Track")
+        await query.message.reply_text("✅ تگ Unreleased Track اعمال شد؛ کاور فعلی بدون تغییر ماند.")
+        await show_editor(update, context, is_album=context.user_data.get("editing_album_track", False))
+        return
+    if data == "unrel:cancel":
+        await query.message.reply_text("عملیات Unreleased Track لغو شد؛ هیچ تغییری اعمال نشد.")
+        return
 
     if data == "summary:finish":
         session = context.user_data.get("summary_session") or {}
@@ -1568,12 +1658,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not path or not os.path.exists(path):
             await query.answer("اول یک آهنگ را باز کن.", show_alert=True)
             return
-        set_tag(path, "album", "Unreleased Track")
-        await query.answer("تگ Album به Unreleased Track تغییر کرد.")
-        await show_editor(
-            update, context,
-            is_album=context.user_data.get("editing_album_track", False),
+        has_cover = UNRELEASED_COVER_FILE.exists()
+        rows = []
+        if has_cover:
+            rows.append([InlineKeyboardButton("🖼️ جایگزینی کاور با کاور پیش‌فرض", callback_data="unrel:replace")])
+        else:
+            rows.append([InlineKeyboardButton("🖼️ کاور پیش‌فرض ثبت نشده", callback_data="unrel:no_cover")])
+        rows.extend([
+            [InlineKeyboardButton("⏭ حفظ کاور فعلی و فقط تغییر تگ", callback_data="unrel:keep")],
+            [InlineKeyboardButton("❌ لغو عملیات", callback_data="unrel:cancel")],
+        ])
+        await query.message.reply_text(
+            "🏷️ **Unreleased Track**\n\nیکی از گزینه‌ها را انتخاب کن:",
+            reply_markup=InlineKeyboardMarkup(rows), parse_mode=ParseMode.MARKDOWN,
         )
+        return
+    if data == "unrel:no_cover":
+        await query.answer("ابتدا از منوی مدیریت کاور، یک تصویر پیش‌فرض ثبت کن.", show_alert=True)
         return
 
     if data == "album:all":
