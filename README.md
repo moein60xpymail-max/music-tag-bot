@@ -1,11 +1,15 @@
-# Music Tag Bot v3.9
+# Music Tag Bot v4.0
 
-## Changes in v3.9
-- Archive report: totals for confirmed, skipped, failed, review-flagged, and remaining tracks, plus confirmed percentage.
-- Archive previous-track navigation from the request prompt and the saved-track controls. Reopening a prior track makes it editable again and does not lose the current in-progress track.
-- Album editor only: `Unreleased Track` button changes only the selected track's Album tag to `Unreleased Track`. It does not apply to all tracks.
+## تغییرات نسخه 4.0
+- دکمه `Unreleased Track` در منوی ویرایش حالت تکی، آلبوم و آرشیو در دسترس است و فقط تگ `Album` همان فایل را تغییر می‌دهد.
+- قابلیت «خلاصه آهنگ‌ها»: فایل‌های MP3 را فوروارد کنید؛ ربات تعداد آهنگ‌ها، فهرست هنرمندان و فهرست آلبوم‌ها را از تگ‌های خود فایل استخراج می‌کند.
+- در پایان، با دکمه «پایان و ساخت خلاصه» گزارش شامل تعداد تکرار هر هنرمند و آلبوم و تعداد فایل‌های بدون تگ ارائه می‌شود.
 
-## Deployment
-Keep all files inside `v36work/` together in the same folder in your repository. Keep existing environment variables, including `BOT_TOKEN`, unchanged. Start command: `python bot.py`.
+## نصب
+محتویات پوشه `v36work` را با حفظ ساختار فایل‌ها در ریشه مخزن GitHub قرار دهید و سرویس را Redeploy کنید.
 
-The package was syntax-compiled locally. Telegram/host runtime testing is still required after deployment.
+## متغیرهای محیطی
+- `BOT_TOKEN`: توکن ربات تلگرام
+- `DATA_DIR`: مسیر اختیاری داده‌ها (پیش‌فرض `data`)
+
+نیازمندی‌ها در `requirements.txt` مشخص شده‌اند. فرمان اجرا: `python bot.py`.

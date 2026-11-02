@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from collections import Counter
 from dupes import classify as classify_duplicate
 from typing import Dict, List, Optional, Any
 from io import BytesIO
@@ -39,7 +40,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.9"
+VERSION = "v4.0"
 
 FIELDS = {
     "filename": "File Name",
@@ -458,6 +459,7 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
         [KeyboardButton("🏠 شروع")],
         [KeyboardButton("🎧 حالت آهنگ تکی"), KeyboardButton("💿 حالت آلبوم")],
         [KeyboardButton("📚 حالت آرشیو")],
+        [KeyboardButton("📊 خلاصه آهنگ‌ها")],
         [KeyboardButton("⚙️ تگ‌های پیش‌فرض")],
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
@@ -506,10 +508,10 @@ def main_editor_keyboard(is_album: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📩 Save", callback_data="action:save"),
         ],
     ]
+    buttons.append(
+        [InlineKeyboardButton("🏷️ Unreleased Track", callback_data="action:unreleased")]
+    )
     if is_album:
-        buttons.append(
-            [InlineKeyboardButton("🏷️ Unreleased Track", callback_data="album:unreleased")]
-        )
         buttons.append(
             [InlineKeyboardButton("🔙 Back to Album", callback_data="album:back")]
         )
@@ -835,6 +837,45 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     document = message.document or message.audio
 
+    # Summary mode: inspect forwarded MP3 metadata without entering the editor.
+    if context.user_data.get("waiting") == "summary_tracks":
+        if not document:
+            return
+        file_name = getattr(document, "file_name", None) or "forwarded_track.mp3"
+        if not file_name.lower().endswith(".mp3"):
+            await message.reply_text("برای خلاصه‌سازی، فایل MP3 بفرست.")
+            return
+        if getattr(document, "file_size", 0) and document.file_size > MAX_SIZE:
+            await message.reply_text("حجم هر فایل نباید بیشتر از ۲۰ مگابایت باشد.")
+            return
+        temp_dir = tempfile.mkdtemp(prefix="music_summary_")
+        temp_path = os.path.join(temp_dir, "summary_track.mp3")
+        try:
+            tg_file = await context.bot.get_file(document.file_id)
+            await tg_file.download_to_drive(temp_path)
+            tags = get_tags(temp_path)
+            title = tags.get("title", "—")
+            artist = tags.get("artist", "—")
+            album = tags.get("album", "—")
+            context.user_data.setdefault("summary_session", {"tracks": []})
+            context.user_data["summary_session"].setdefault("tracks", []).append({
+                "title": title if title != "—" else Path(file_name).stem,
+                "artist": artist,
+                "album": album,
+            })
+            count = len(context.user_data["summary_session"]["tracks"])
+            await message.reply_text(
+                f"✅ آهنگ شماره {count} دریافت و بررسی شد.\n"
+                "فایل بعدی را بفرست یا برای ساخت گزارش دکمه پایان را بزن.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان و ساخت خلاصه", callback_data="summary:finish")]])
+            )
+        except Exception as exc:
+            print("summary intake error:", exc)
+            await message.reply_text("خواندن تگ‌های این فایل ناموفق بود؛ فایل MP3 دیگری بفرست.")
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        return
+
     # In archive track mode, also accept a text reply to a previously sent
     # audio/document message. The replied-to media is what gets edited.
     if not document and context.user_data.get("waiting") == "archive_track":
@@ -1072,6 +1113,16 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "💿 حالت آلبوم":
         await album_command(update, context)
         return
+    if text == "📊 خلاصه آهنگ‌ها":
+        context.user_data["summary_session"] = {"tracks": []}
+        context.user_data["waiting"] = "summary_tracks"
+        await update.message.reply_text(
+            "📊 حالت خلاصه آهنگ‌ها فعال شد.\n\n"
+            "حالا آهنگ‌ها را به صورت فایل صوتی یا MP3 برایم فوروارد کن. "
+            "بعد از ارسال همه فایل‌ها، دکمه «پایان و ساخت خلاصه» را بزن.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان و ساخت خلاصه", callback_data="summary:finish")]])
+        )
+        return
     if text == "❌ لغو / خروج از آلبوم":
         await cancel(update, context)
         return
@@ -1198,6 +1249,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     path = context.user_data.get("path")
+
+    if data == "summary:finish":
+        session = context.user_data.get("summary_session") or {}
+        tracks = session.get("tracks", [])
+        if not tracks:
+            await query.answer("هنوز هیچ آهنگی دریافت نشده است.", show_alert=True)
+            return
+        artist_counts = Counter(
+            artist.strip() for track in tracks
+            for artist in split_artists(track.get("artist", ""))
+            if artist.strip() and artist.strip() != "—"
+        )
+        album_counts = Counter(
+            track.get("album", "").strip() for track in tracks
+            if track.get("album", "").strip() and track.get("album", "").strip() != "—"
+        )
+        no_artist = sum(1 for track in tracks if not split_artists(track.get("artist", "")))
+        no_album = sum(1 for track in tracks if track.get("album", "—") in ("", "—"))
+        lines = [
+            "📊 خلاصه مجموعه آهنگ‌ها", "",
+            f"🎵 تعداد کل آهنگ‌ها: {len(tracks)}", "",
+            f"👤 هنرمندان یکتا: {len(artist_counts)}",
+        ]
+        if artist_counts:
+            lines.extend(f"• {name} ({count} آهنگ)" for name, count in sorted(artist_counts.items(), key=lambda x: x[0].casefold()))
+        else:
+            lines.append("• تگ هنرمند ثبت نشده")
+        lines.extend(["", f"💿 آلبوم‌های یکتا: {len(album_counts)}"])
+        if album_counts:
+            lines.extend(f"• {name} ({count} آهنگ)" for name, count in sorted(album_counts.items(), key=lambda x: x[0].casefold()))
+        else:
+            lines.append("• تگ آلبوم ثبت نشده")
+        lines.extend(["", f"▫️ بدون تگ هنرمند: {no_artist}", f"▫️ بدون تگ آلبوم: {no_album}"])
+        context.user_data.pop("summary_session", None)
+        context.user_data["waiting"] = None
+        await query.message.reply_text("\n".join(lines), reply_markup=main_reply_keyboard())
+        await query.answer("خلاصه آماده شد.")
+        return
 
     if data.startswith("arch:"):
         a = context.user_data.get("archive")
@@ -1475,13 +1564,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_editor(update, context, is_album=True)
         return
 
-    if data == "album:unreleased":
-        if not context.user_data.get("editing_album_track") or not path or not os.path.exists(path):
-            await query.answer("این گزینه فقط هنگام ویرایش یک ترک از آلبوم فعال است.", show_alert=True)
+    if data == "action:unreleased":
+        if not path or not os.path.exists(path):
+            await query.answer("اول یک آهنگ را باز کن.", show_alert=True)
             return
         set_tag(path, "album", "Unreleased Track")
-        await query.answer("Album این ترک به Unreleased Track تغییر کرد.")
-        await show_editor(update, context, is_album=True)
+        await query.answer("تگ Album به Unreleased Track تغییر کرد.")
+        await show_editor(
+            update, context,
+            is_album=context.user_data.get("editing_album_track", False),
+        )
         return
 
     if data == "album:all":
