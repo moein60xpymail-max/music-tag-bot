@@ -39,7 +39,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.8"
+VERSION = "v3.9"
 
 FIELDS = {
     "filename": "File Name",
@@ -508,6 +508,9 @@ def main_editor_keyboard(is_album: bool = False) -> InlineKeyboardMarkup:
     ]
     if is_album:
         buttons.append(
+            [InlineKeyboardButton("🏷️ Unreleased Track", callback_data="album:unreleased")]
+        )
+        buttons.append(
             [InlineKeyboardButton("🔙 Back to Album", callback_data="album:back")]
         )
     return InlineKeyboardMarkup(buttons)
@@ -771,8 +774,29 @@ def archive_track_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ این آهنگ تموم شد", callback_data="arch:finish_current")],
         [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
+        [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
         [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
     ])
+
+
+def archive_report_text(queue):
+    total = len(queue)
+    confirmed = sum(1 for x in queue if x.get("status") == "confirmed")
+    skipped = sum(1 for x in queue if x.get("status") == "skipped")
+    failed = sum(1 for x in queue if x.get("status") == "failed")
+    pending = sum(1 for x in queue if x.get("status") in (None, "pending", "in_progress"))
+    review = sum(1 for x in queue if x.get("review"))
+    percent = (confirmed / total * 100) if total else 0
+    return (
+        "📊 گزارش آرشیو\n\n"
+        f"🎵 تعداد کل آهنگ‌ها: {total}\n"
+        f"✅ ویرایش‌شده و تأییدشده: {confirmed}\n"
+        f"⏭ ردشده: {skipped}\n"
+        f"❌ ناموفق: {failed}\n"
+        f"❗ نیازمند بررسی: {review}\n"
+        f"▫️ باقی‌مانده: {pending}\n\n"
+        f"📈 درصد تأیید نهایی: {percent:.1f}%"
+    )
 
 async def archive_start(update, context):
     context.user_data["archive"] = {"phase": "menu", "sources": {"source_a": [], "source_b": []}, "queue": [], "cursor": 0}
@@ -792,7 +816,7 @@ async def archive_show_list(query, context):
     queue = a.get("queue", [])
     confirmed = sum(1 for x in queue if x.get("status") == "confirmed")
     skipped = sum(1 for x in queue if x.get("status") == "skipped")
-    pending = sum(1 for x in queue if x.get("status") == "pending")
+    pending = sum(1 for x in queue if x.get("status") in (None, "pending", "in_progress"))
     lines = [f"📚 صف آرشیو: {len(queue)} ترک", f"تأییدشده: {confirmed} | ردشده: {skipped} | باقی‌مانده: {pending}", ""]
     for i, item in enumerate(queue[:40], 1):
         mark = "✅" if item.get("status")=="confirmed" else ("⏭" if item.get("status")=="skipped" else "▫️")
@@ -802,6 +826,7 @@ async def archive_show_list(query, context):
     rows = []
     if queue:
         rows.append([InlineKeyboardButton("✏️ باز کردن ترک بعدی", callback_data="arch:open_next")])
+        rows.append([InlineKeyboardButton("📊 گزارش آرشیو", callback_data="arch:report")])
     rows.append([InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")])
     await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
@@ -1250,6 +1275,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "arch:list":
             await archive_show_list(query, context)
             return
+        if data == "arch:report":
+            await query.message.reply_text(
+                archive_report_text(a.get("queue", [])),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 نمایش فهرست آرشیو", callback_data="arch:list")]])
+            )
+            return
         if data == "arch:finish_current":
             queue = a.get("queue", [])
             idx = context.user_data.get("archive_current")
@@ -1261,12 +1292,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ این آهنگ تکمیل شد", callback_data="arch:already_done")],
                     [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
+                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
                 ])
             )
             await query.answer("این آهنگ تکمیل شد.")
             return
         if data == "arch:already_done":
             await query.answer("این آهنگ قبلاً تأیید شده است.")
+            return
+        if data == "arch:previous":
+            queue = a.get("queue", [])
+            idx = context.user_data.get("archive_current")
+            if not isinstance(idx, int) or idx <= 0 or idx >= len(queue):
+                await query.answer("ترک قبلی وجود ندارد.", show_alert=True)
+                return
+            prev_idx = idx - 1
+            item = queue[prev_idx]
+            # Re-open the previous item for review/editing, even if it was previously skipped or confirmed.
+            if queue[idx].get("status") == "in_progress":
+                queue[idx]["status"] = "pending"
+            item["status"] = "in_progress"
+            context.user_data.update({"archive_current": prev_idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
+            title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
+            artist = (item.get("artist") or "هنرمند نامشخص").strip()
+            warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
+            progress = ((prev_idx + 1) / len(queue) * 100) if queue else 0
+            title_button = InlineKeyboardButton(text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"), copy_text=CopyTextButton(text=title or ""))
+            await query.message.reply_text(
+                f"🎵 ترک {prev_idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
+                reply_markup=InlineKeyboardMarkup([
+                    [title_button],
+                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
+                    [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
+                ])
+            )
+            await query.answer("به آهنگ قبلی برگشتی.")
             return
         if data == "arch:skip_current":
             queue = a.get("queue", [])
@@ -1289,9 +1349,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             queue = a.get("queue", [])
             idx = next((i for i,x in enumerate(queue) if x.get("status")=="pending"), None)
             if idx is None:
-                await query.message.reply_text("ترک در انتظار دیگری وجود ندارد.")
+                await query.message.reply_text(
+                    "✅ همه ترک‌های در انتظار بررسی شدند.\n\n" + archive_report_text(queue),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📊 گزارش آرشیو", callback_data="arch:report")],
+                        [InlineKeyboardButton("📋 فهرست آرشیو", callback_data="arch:list")],
+                    ])
+                )
                 return
             item = queue[idx]
+            item["status"] = "in_progress"
             context.user_data.update({"archive_current":idx,"waiting":"archive_track","album_mode":False,"editing_album_track":False})
             title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
             artist = (item.get("artist") or "هنرمند نامشخص").strip()
@@ -1305,6 +1372,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
                 reply_markup=InlineKeyboardMarkup([
                     [title_button],
+                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
                     [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
                 ]),
             )
@@ -1404,6 +1472,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["editing_album_track"] = True
         context.user_data["original_cover"] = track.get("original_cover")
         context.user_data["original_duration"] = track.get("original_duration")
+        await show_editor(update, context, is_album=True)
+        return
+
+    if data == "album:unreleased":
+        if not context.user_data.get("editing_album_track") or not path or not os.path.exists(path):
+            await query.answer("این گزینه فقط هنگام ویرایش یک ترک از آلبوم فعال است.", show_alert=True)
+            return
+        set_tag(path, "album", "Unreleased Track")
+        await query.answer("Album این ترک به Unreleased Track تغییر کرد.")
         await show_editor(update, context, is_album=True)
         return
 
