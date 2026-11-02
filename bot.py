@@ -39,7 +39,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v3.7"
+VERSION = "v3.8"
 
 FIELDS = {
     "filename": "File Name",
@@ -437,12 +437,16 @@ def generate_filename(
 def apply_defaults_to_file(
     path: str, defaults: Dict[str, str], is_single: bool = True
 ):
+    disabled = set(defaults.get("_disabled", [])) if isinstance(defaults, dict) else set()
     for key, value in defaults.items():
+        if key.startswith("_") or key in disabled or value in (None, ""):
+            continue
         if key == "albumartist" and is_single:
             continue
         set_tag(path, key, value)
     if is_single:
-        set_tag(path, "album", defaults.get("album", "Single Track"))
+        if "album" not in disabled and defaults.get("album") not in (None, ""):
+            set_tag(path, "album", defaults.get("album", "Single Track"))
         # در حالت تک‌آهنگ، Album Artist را حذف کن
         delete_tag(path, "albumartist")
 
@@ -551,23 +555,20 @@ def tag_config_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def defaults_fields_keyboard(mode: str) -> InlineKeyboardMarkup:
-    keys = (
-        list(DEFAULT_SINGLE.keys()) if mode == "single" else list(DEFAULT_ALBUM.keys())
-    )
+def defaults_fields_keyboard(mode: str, current: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
+    keys = list(DEFAULT_SINGLE.keys()) if mode == "single" else list(DEFAULT_ALBUM.keys())
+    disabled = set((current or {}).get("_disabled", []))
     buttons = []
     row = []
-    for i, k in enumerate(keys):
-        row.append(
-            InlineKeyboardButton(
-                FIELDS.get(k, k.title()), callback_data=f"setdefault:{mode}:{k}"
-            )
-        )
+    for k in keys:
+        state = "🔴 خاموش" if k in disabled else "🟢 روشن"
+        row.append(InlineKeyboardButton(f"{FIELDS.get(k, k.title())} · {state}", callback_data=f"defaulttoggle:{mode}:{k}"))
         if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
+            buttons.append(row); row = []
+        row.append(InlineKeyboardButton(f"✏️ تغییر {FIELDS.get(k, k.title())}", callback_data=f"setdefault:{mode}:{k}"))
+        if len(row) == 2:
+            buttons.append(row); row = []
+    if row: buttons.append(row)
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="tag:menu")])
     return InlineKeyboardMarkup(buttons)
 
@@ -770,6 +771,7 @@ def archive_track_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ این آهنگ تموم شد", callback_data="arch:finish_current")],
         [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
+        [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
     ])
 
 async def archive_start(update, context):
@@ -1266,6 +1268,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "arch:already_done":
             await query.answer("این آهنگ قبلاً تأیید شده است.")
             return
+        if data == "arch:skip_current":
+            queue = a.get("queue", [])
+            idx = context.user_data.get("archive_current")
+            if not isinstance(idx, int) or not (0 <= idx < len(queue)):
+                await query.answer("ترک فعال آرشیو پیدا نشد.", show_alert=True)
+                return
+            queue[idx]["status"] = "skipped"
+            await query.answer("این ترک رد شد.")
+            data = "arch:open_next"
         if data == "arch:next":
             queue = a.get("queue", [])
             idx = context.user_data.get("archive_current")
@@ -1292,7 +1303,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             await query.message.reply_text(
                 f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
-                reply_markup=InlineKeyboardMarkup([[title_button]]),
+                reply_markup=InlineKeyboardMarkup([
+                    [title_button],
+                    [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
+                ]),
             )
             return
         return
@@ -1314,14 +1328,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_defaults = get_user_defaults(query.from_user.id)
         current = user_defaults[mode]
         text = f"⚙️ Current **{mode}** defaults:\n\n"
+        disabled = set(current.get("_disabled", []))
         for k, v in current.items():
-            text += f"• {FIELDS.get(k, k)}: `{v}`\n"
-        text += "\nSelect a field to change:"
+            if k.startswith("_"): continue
+            state = "خاموش" if k in disabled else "روشن"
+            text += f"• {FIELDS.get(k, k)}: `{v}` — {state}\n"
+        text += "\nبرای خاموش/روشن‌کردن هر فیلد، دکمه وضعیت آن را بزن؛ برای تغییر مقدار، دکمه ویرایش را انتخاب کن:"
         await query.message.edit_text(
             text,
-            reply_markup=defaults_fields_keyboard(mode),
+            reply_markup=defaults_fields_keyboard(mode, current),
             parse_mode=ParseMode.MARKDOWN,
         )
+        return
+
+    if data.startswith("defaulttoggle:"):
+        _, mode, key = data.split(":", 2)
+        all_data = load_all_defaults()
+        uid = str(query.from_user.id)
+        if uid not in all_data:
+            all_data[uid] = {"single": DEFAULT_SINGLE.copy(), "album": DEFAULT_ALBUM.copy()}
+        current = all_data[uid].setdefault(mode, (DEFAULT_SINGLE if mode == "single" else DEFAULT_ALBUM).copy())
+        disabled = set(current.get("_disabled", []))
+        if key in disabled: disabled.remove(key)
+        else: disabled.add(key)
+        current["_disabled"] = sorted(disabled)
+        save_all_defaults(all_data)
+        status = "روشن شد" if key not in disabled else "خاموش شد"
+        await query.answer(f"{FIELDS.get(key, key)} {status}")
+        lines = [f"• {FIELDS.get(k, k)}: `{v}` — {'خاموش' if k in disabled else 'روشن'}" for k, v in current.items() if not k.startswith("_")]
+        await query.message.edit_text("⚙️ تنظیم تگ‌های پیش‌فرض\n\n" + "\n".join(lines) + "\n\nبرای خاموش/روشن‌کردن هر فیلد، دکمه وضعیت آن را بزن؛ برای تغییر مقدار، دکمه ویرایش را انتخاب کن:", reply_markup=defaults_fields_keyboard(mode, current), parse_mode=ParseMode.MARKDOWN)
         return
 
     if data.startswith("setdefault:"):
