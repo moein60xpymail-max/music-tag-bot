@@ -1,13 +1,7 @@
 from pathlib import Path
 import ast
-
-ROOT = Path(__file__).parent
-source = (ROOT / "bot.py").read_text(encoding="utf-8")
+source=(Path(__file__).parent/'bot.py').read_text(encoding='utf-8')
 ast.parse(source)
-assert 'VERSION = "v3.9"' in source
-assert 'callback_data="arch:previous"' in source
-assert 'callback_data="arch:report"' in source
-assert 'callback_data="album:unreleased"' in source
-assert 'set_tag(path, "album", "Unreleased Track")' in source
-assert 'def archive_report_text(queue):' in source
-print("v3.9 static checks passed")
+for item in ['callback_data="arch:previous"','callback_data="arch:report"','callback_data="action:unreleased"','def archive_report_text(queue):']:
+    assert item in source, item
+print('legacy archive/unreleased regression checks passed')

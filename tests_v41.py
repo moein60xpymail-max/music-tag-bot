@@ -5,7 +5,7 @@ ROOT = Path(__file__).parent
 source = (ROOT / "bot.py").read_text(encoding="utf-8")
 ast.parse(source)
 checks = [
-    'VERSION = "v4.2"',
+    'VERSION = "v4.3"',
     'VERSION_CHANGES = [',
     'UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"',
     'نسخه فعلی ربات شما:',
@@ -22,4 +22,4 @@ checks = [
 for item in checks:
     assert item in source, item
 assert 'KeyboardButton("🖼️ مدیریت کاور Unreleased Track")' not in source
-print("v4.1.1 static checks passed")
+print("v4.1.1 compatibility checks passed")

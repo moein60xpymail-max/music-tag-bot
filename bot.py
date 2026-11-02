@@ -40,7 +40,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.2"
+VERSION = "v4.3"
 VERSION_CHANGES = [
     "مدیریت کاور پیش‌فرض Unreleased Track",
     "انتخاب بین جایگزینی کاور، حفظ کاور فعلی یا لغو عملیات",
@@ -49,7 +49,12 @@ VERSION_CHANGES = [
     "نمایش شماره نسخه و فهرست تغییرات در بخش نسخه",
     "انتقال مدیریت کاور Unreleased Track به منوی فرمان‌های همبرگری تلگرام",
     "مرتب‌سازی آلبوم بر اساس شماره ترک پس از پایان دریافت فایل‌ها",
-    "ویرایش گروهی فیلدهای تگ روی ترک‌های انتخاب‌شده",
+    "مرتب‌سازی و ابزارهای آلبوم در بخش Album Tools",
+    "شماره‌گذاری مجدد ترک‌ها با شماره شروع دلخواه و تأیید کاربر",
+    "تنظیم شماره دیسک برای همه ترک‌ها",
+    "جابه‌جایی دستی ترک‌ها در فهرست آلبوم",
+    "فیلتر ترک‌های دارای تگ ناقص یا شماره تکراری",
+    "کپی فیلدهای انتخابی از یک ترک به ترک‌های انتخاب‌شده",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1298,6 +1303,65 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_album_overview(update, context)
         return
 
+    if waiting == "albumtools_disc_value":
+        if not value.isdigit() or not 1 <= int(value) <= 99:
+            await update.message.reply_text("شماره دیسک باید عددی بین ۱ تا ۹۹ باشد.")
+            return
+        tracks=context.user_data.get("album_tracks", [])
+        backups=[]
+        try:
+            for item in tracks:
+                path=item["path"]; backup=path+".v43bak"; shutil.copy2(path,backup); backups.append((path,backup)); set_tag(path,"disc",str(int(value)))
+            for _,backup in backups:
+                if os.path.exists(backup): os.remove(backup)
+        except Exception as exc:
+            for path,backup in reversed(backups):
+                if os.path.exists(backup): shutil.copy2(backup,path); os.remove(backup)
+            context.user_data["waiting"]=None
+            await update.message.reply_text(f"تنظیم دیسک انجام نشد و تغییرات برگشت داده شد: {exc}")
+            return
+        context.user_data["waiting"]=None
+        await update.message.reply_text(f"✅ شماره دیسک {len(tracks)} ترک روی {value} تنظیم شد.")
+        await show_album_overview(update,context)
+        return
+
+    if waiting == "albumtools_renumber_start":
+        if not value.isdigit() or not 1 <= int(value) <= 999:
+            await update.message.reply_text("شماره شروع باید عددی بین ۱ تا ۹۹۹ باشد.")
+            return
+        context.user_data["albumtools_renumber_start"] = int(value)
+        context.user_data["waiting"] = None
+        await update.message.reply_text(
+            f"شماره‌گذاری از {int(value)} برای {len(context.user_data.get('album_tracks', []))} ترک انجام شود؟",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ تأیید شماره‌گذاری", callback_data="albumtools:renumber_confirm")], [InlineKeyboardButton("❌ لغو", callback_data="album:tools")]])
+        )
+        return
+
+    if waiting == "albumtools_copy_fields":
+        allowed = {"title", "artist", "album", "year", "genre", "albumartist", "composer", "publisher", "lyrics", "comment"}
+        keys = [x.strip().casefold() for x in value.split(",") if x.strip()]
+        aliases = {"album artist":"albumartist", "هنرمند":"artist", "ژانر":"genre", "آهنگساز":"composer", "ناشر":"publisher", "سال":"year", "عنوان":"title", "آلبوم":"album"}
+        keys = [aliases.get(x, x) for x in keys]
+        if not keys or any(k not in allowed for k in keys):
+            await update.message.reply_text("فیلدهای مجاز: title, artist, album, year, genre, albumartist, composer, publisher, lyrics, comment")
+            return
+        context.user_data["albumtools_copy_keys"] = keys
+        context.user_data["waiting"] = None
+        await update.message.reply_text("شماره ترک مبدأ را بفرست (شماره‌ای که در فهرست آلبوم نمایش داده می‌شود):")
+        context.user_data["waiting"] = "albumtools_copy_source"
+        return
+
+    if waiting == "albumtools_copy_source":
+        if not value.isdigit() or not _album_track_by_index(context.user_data.get("album_tracks", []), int(value)):
+            await update.message.reply_text("شماره ترک معتبر نیست. دوباره بفرست.")
+            return
+        context.user_data["albumtools_copy_source"] = int(value)
+        context.user_data["waiting"] = None
+        context.user_data["album_selected"] = []
+        await update.message.reply_text("حالا ترک‌های مقصد را انتخاب کن:", reply_markup=album_select_keyboard(context.user_data.get("album_tracks", []), set()))
+        context.user_data["albumtools_copy_mode"] = True
+        return
+
     # هنرمندان اصلی آلبوم
     if waiting == "album_main_artists":
         artists = [a.strip() for a in re.split(r"\s*,\s*", value) if a.strip()]
@@ -1663,6 +1727,92 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ---------- ابزارهای آلبوم v4.3 ----------
+    if data == "album:tools":
+        await query.message.reply_text("🧰 **Album Tools**\nابزارهای پیشرفته مدیریت آلبوم:", reply_markup=album_tools_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "albumtools:renumber":
+        context.user_data["waiting"] = "albumtools_renumber_start"
+        await query.message.reply_text("شماره شروع را بفرست (مثلاً 1). شماره ترک‌ها به ترتیب فعلی فهرست بازنویسی می‌شوند؛ این کار فقط پس از تأیید انجام می‌شود.")
+        return
+
+    if data == "albumtools:renumber_confirm":
+        tracks = context.user_data.get("album_tracks", [])
+        start = int(context.user_data.pop("albumtools_renumber_start", 1))
+        backups = []
+        try:
+            for pos, item in enumerate(tracks):
+                path = item["path"]
+                backup = path + ".v43bak"
+                shutil.copy2(path, backup); backups.append((path, backup))
+                set_tag(path, "track", str(start + pos))
+            for _, backup in backups:
+                if os.path.exists(backup): os.remove(backup)
+        except Exception as exc:
+            for path, backup in reversed(backups):
+                if os.path.exists(backup): shutil.copy2(backup, path); os.remove(backup)
+            await query.message.reply_text(f"شماره‌گذاری انجام نشد و تغییرات برگشت داده شد: {exc}")
+            return
+        await query.message.reply_text(f"✅ شماره {len(tracks)} ترک از {start} به‌ترتیب فعلی تنظیم شد.")
+        await show_album_overview(query, context)
+        return
+
+    if data == "albumtools:disc":
+        context.user_data["waiting"] = "albumtools_disc_value"
+        await query.message.reply_text("شماره دیسک را بفرست (مثلاً 1 یا 2):")
+        return
+
+    if data == "albumtools:reorder":
+        rows = []
+        tracks = context.user_data.get("album_tracks", [])
+        for pos, item in enumerate(tracks):
+            tags = get_tags(item["path"])
+            title = tags.get("title", "—")
+            controls = []
+            if pos > 0: controls.append(InlineKeyboardButton("⬆️", callback_data=f"albumtools:move:{item['index']}:up"))
+            if pos < len(tracks)-1: controls.append(InlineKeyboardButton("⬇️", callback_data=f"albumtools:move:{item['index']}:down"))
+            rows.append([InlineKeyboardButton(f"{pos+1}. {title}"[:48], callback_data="albumtools:noop")] + controls)
+        rows.append([InlineKeyboardButton("🔙 ابزارهای آلبوم", callback_data="album:tools")])
+        await query.message.reply_text("برای تغییر ترتیب از فلش‌ها استفاده کن:", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data.startswith("albumtools:move:"):
+        _, _, raw_idx, direction = data.split(":")
+        tracks = context.user_data.get("album_tracks", [])
+        pos = next((i for i,t in enumerate(tracks) if int(t.get("index",-1)) == int(raw_idx)), None)
+        if pos is not None:
+            target = pos - 1 if direction == "up" else pos + 1
+            if 0 <= target < len(tracks): tracks[pos], tracks[target] = tracks[target], tracks[pos]
+        # refresh the reorder controls
+        rows=[]
+        for i,item in enumerate(tracks):
+            title=get_tags(item["path"]).get("title","—"); controls=[]
+            if i>0: controls.append(InlineKeyboardButton("⬆️",callback_data=f"albumtools:move:{item['index']}:up"))
+            if i<len(tracks)-1: controls.append(InlineKeyboardButton("⬇️",callback_data=f"albumtools:move:{item['index']}:down"))
+            rows.append([InlineKeyboardButton(f"{i+1}. {title}"[:48],callback_data="albumtools:noop")]+controls)
+        rows.append([InlineKeyboardButton("🔙 ابزارهای آلبوم",callback_data="album:tools")])
+        await query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    if data == "albumtools:filters":
+        tracks=context.user_data.get("album_tracks",[])
+        missing,duplicates=_album_missing_and_duplicates(tracks)
+        lines=["🔎 **بررسی آلبوم**",f"تعداد ترک‌ها: {len(tracks)}",f"بدون شماره ترک: {len(missing)}",f"شماره تکراری: {len(duplicates)}"]
+        if missing: lines.append("\nبدون شماره: "+", ".join(str(t['index']) for t in missing))
+        if duplicates: lines.append("\nتکراری: "+", ".join(f"{a['index']} و {b['index']} (دیسک {k[0]}، ترک {k[1]})" for a,b,k in duplicates))
+        await query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ابزارهای آلبوم",callback_data="album:tools")]]), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    if data == "albumtools:copy":
+        context.user_data["waiting"]="albumtools_copy_fields"
+        await query.message.reply_text("نام فیلدهایی که می‌خواهی کپی شوند را با کاما بفرست. مثال: genre, composer, albumartist")
+        return
+
+    if data == "albumtools:noop":
+        await query.answer()
+        return
+
     # ---------- حالت آلبوم ----------
     if data == "album:finish":
         tracks = context.user_data.get("album_tracks", [])
@@ -1704,6 +1854,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         selected = context.user_data.get("album_selected", [])
         if not selected:
             await query.answer("حداقل یک ترک را انتخاب کن.", show_alert=True)
+            return
+        if context.user_data.pop("albumtools_copy_mode", False):
+            source = _album_track_by_index(context.user_data.get("album_tracks", []), context.user_data.get("albumtools_copy_source"))
+            targets = [t for t in context.user_data.get("album_tracks", []) if t.get("index") in set(selected) and t is not source]
+            keys = context.user_data.get("albumtools_copy_keys", [])
+            backups=[]
+            try:
+                src_tags=get_tags(source["path"])
+                for item in targets:
+                    path=item["path"]; backup=path+".v43bak"; shutil.copy2(path,backup); backups.append((path,backup))
+                    for key in keys:
+                        val=src_tags.get(key,"—")
+                        if val not in (None,"","—"): set_tag(path,key,val)
+            except Exception as exc:
+                for path,backup in reversed(backups):
+                    if os.path.exists(backup): shutil.copy2(backup,path); os.remove(backup)
+                await query.message.reply_text(f"کپی تگ انجام نشد و تغییرات برگشت داده شد: {exc}")
+                return
+            for _,backup in backups:
+                if os.path.exists(backup): os.remove(backup)
+            context.user_data["album_selected"]=[]
+            await query.message.reply_text(f"✅ {len(targets)} ترک با فیلدهای انتخاب‌شده به‌روزرسانی شد.")
+            await show_album_overview(query,context)
             return
         context.user_data["waiting"] = "album_selected_field"
         await query.message.reply_text(f"✅ {len(selected)} ترک انتخاب شد. نام فیلدی را که می‌خواهی تغییر کند بفرست: artist, albumartist, album, genre, composer, publisher, year")
@@ -2036,29 +2209,61 @@ def album_select_keyboard(tracks, selected):
     return InlineKeyboardMarkup(rows)
 
 
+def album_tools_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔢 شماره‌گذاری مجدد ترک‌ها", callback_data="albumtools:renumber")],
+        [InlineKeyboardButton("💿 تنظیم شماره دیسک", callback_data="albumtools:disc")],
+        [InlineKeyboardButton("↕️ جابه‌جایی دستی ترک‌ها", callback_data="albumtools:reorder")],
+        [InlineKeyboardButton("🔎 فیلتر و بررسی ترک‌ها", callback_data="albumtools:filters")],
+        [InlineKeyboardButton("📋 کپی تگ از یک ترک", callback_data="albumtools:copy")],
+        [InlineKeyboardButton("🔙 بازگشت به آلبوم", callback_data="album:back")],
+    ])
+
+
+def _album_track_by_index(tracks, idx):
+    return next((t for t in tracks if int(t.get("index", -1)) == int(idx)), None)
+
+
+def _album_missing_and_duplicates(tracks):
+    missing, seen, duplicates = [], {}, []
+    for t in tracks:
+        tags = get_tags(t["path"])
+        n, _ = _parse_track_disc(tags.get("track"))
+        d, _ = _parse_track_disc(tags.get("disc"))
+        if n is None:
+            missing.append(t)
+        else:
+            key = (d or 1, n)
+            if key in seen:
+                duplicates.append((seen[key], t, key))
+            else:
+                seen[key] = t
+    return missing, duplicates
+
+
 async def show_album_overview(query, context):
     tracks = context.user_data.get("album_tracks", [])
     main_artists = context.user_data.get("main_artists", [])
     text = "💿 **Album Tracks**\n\n"
     text += f"Main Artists: {' , '.join(main_artists) if main_artists else '—'}\n"
     text += f"Total tracks: {len(tracks)}\n\n"
-    for t in tracks:
+    for position, t in enumerate(tracks, 1):
         tags = get_tags(t["path"])
         # اسم فایل رو از روی آرتیست و عنوان بساز
         fname = generate_filename(
             tags.get("artist", ""), tags.get("title", ""), main_artists
         )
         text += (
-            f"{t['index']}. {tags.get('title', '—')} — {tags.get('artist', '—')}\n"
+            f"{position}. {tags.get('title', '—')} — {tags.get('artist', '—')}\n"
             f"   📁 {fname}\n"
         )
 
     buttons = []
-    for t in tracks:
+    for position, t in enumerate(tracks, 1):
         buttons.append(
             [
                 InlineKeyboardButton(
-                    f"✏️ Edit Track {t['index']}",
+                    f"✏️ Edit Track {position}",
                     callback_data=f"album:edit:{t['index']}",
                 )
             ]
@@ -2072,6 +2277,7 @@ async def show_album_overview(query, context):
     buttons.append(
         [InlineKeyboardButton("🎯 Select Tracks for Group Edit", callback_data="album:select_menu")]
     )
+    buttons.append([InlineKeyboardButton("🧰 Album Tools", callback_data="album:tools")])
     buttons.append(
         [InlineKeyboardButton("📊 Album Summary", callback_data="album:summary")]
     )
