@@ -40,7 +40,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.1.1"
+VERSION = "v4.2"
 VERSION_CHANGES = [
     "مدیریت کاور پیش‌فرض Unreleased Track",
     "انتخاب بین جایگزینی کاور، حفظ کاور فعلی یا لغو عملیات",
@@ -48,6 +48,8 @@ VERSION_CHANGES = [
     "اعمال کاور فقط روی آهنگ انتخاب‌شده؛ بدون تغییر کاور آهنگ‌های دیگر",
     "نمایش شماره نسخه و فهرست تغییرات در بخش نسخه",
     "انتقال مدیریت کاور Unreleased Track به منوی فرمان‌های همبرگری تلگرام",
+    "مرتب‌سازی آلبوم بر اساس شماره ترک پس از پایان دریافت فایل‌ها",
+    "ویرایش گروهی فیلدهای تگ روی ترک‌های انتخاب‌شده",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1202,6 +1204,52 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Apply-to-all album field: first receive the field name, then its value.
+    if waiting == "album_selected_field":
+        aliases = {"artist":"artist", "album artist":"albumartist", "albumartist":"albumartist", "album":"album", "genre":"genre", "composer":"composer", "publisher":"publisher", "year":"year", "هنرمند":"artist", "هنرمند آلبوم":"albumartist", "آلبوم":"album", "ژانر":"genre", "آهنگساز":"composer", "ناشر":"publisher", "سال":"year"}
+        key = aliases.get(value.casefold())
+        allowed = {"artist", "albumartist", "album", "genre", "composer", "publisher", "year"}
+        if key not in allowed:
+            await update.message.reply_text("فقط یکی از این فیلدها را بفرست: artist, albumartist, album, genre, composer, publisher, year")
+            return
+        context.user_data["album_selected_key"] = key
+        context.user_data["waiting"] = "album_selected_value"
+        await update.message.reply_text(f"مقدار جدید برای {FIELDS.get(key, key)} را بفرست:")
+        return
+
+    if waiting == "album_selected_value":
+        key = context.user_data.get("album_selected_key")
+        selected = set(context.user_data.get("album_selected", []))
+        tracks = [t for t in context.user_data.get("album_tracks", []) if t.get("index") in selected]
+        allowed = {"artist", "albumartist", "album", "genre", "composer", "publisher", "year"}
+        if key not in allowed or not tracks:
+            context.user_data["waiting"] = None
+            await update.message.reply_text("انتخاب یا فیلد معتبر نیست.")
+            return
+        backups = []
+        try:
+            for item in tracks:
+                track_path = item["path"]
+                backup_path = track_path + ".v42bak"
+                shutil.copy2(track_path, backup_path)
+                backups.append((track_path, backup_path))
+                set_tag(track_path, key, value)
+            for _, backup_path in backups:
+                if os.path.exists(backup_path): os.remove(backup_path)
+        except Exception as exc:
+            for track_path, backup_path in reversed(backups):
+                if os.path.exists(backup_path):
+                    shutil.copy2(backup_path, track_path)
+                    os.remove(backup_path)
+            context.user_data["waiting"] = None
+            await update.message.reply_text(f"ویرایش گروهی انجام نشد و تغییرات برگشت داده شد: {exc}")
+            return
+        context.user_data["waiting"] = None
+        context.user_data.pop("album_selected_key", None)
+        context.user_data["album_selected"] = []
+        await update.message.reply_text(f"✅ فیلد {FIELDS.get(key, key)} روی {len(tracks)} ترک انتخاب‌شده اعمال شد.")
+        await show_album_overview(update, context)
+        return
+
     if waiting == "album_all_field":
         aliases = {"artist":"artist", "album artist":"albumartist", "albumartist":"albumartist",
                    "album":"album", "genre":"genre", "composer":"composer",
@@ -1622,6 +1670,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("هنوز هیچ ترکی دریافت نشده.")
             return
         main_artists = context.user_data.get("main_artists", [])
+        sort_album_tracks(tracks)
         for t in tracks:
             p = t["path"]
             tags = get_tags(p)
@@ -1634,6 +1683,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # دیگر فایل جدید به آلبوم اضافه نشود
         context.user_data["album_mode"] = False
         await show_album_overview(query, context)
+        return
+
+    if data == "album:select_menu":
+        tracks = context.user_data.get("album_tracks", [])
+        context.user_data["album_selected"] = []
+        await query.message.reply_text("ترک‌هایی را که می‌خواهی ویرایش گروهی شوند انتخاب کن:", reply_markup=album_select_keyboard(tracks, set()))
+        return
+
+    if data.startswith("album:select:"):
+        idx = int(data.split(":")[2])
+        selected = set(context.user_data.get("album_selected", []))
+        if idx in selected: selected.remove(idx)
+        else: selected.add(idx)
+        context.user_data["album_selected"] = sorted(selected)
+        await query.message.edit_reply_markup(reply_markup=album_select_keyboard(context.user_data.get("album_tracks", []), selected))
+        return
+
+    if data == "album:select_done":
+        selected = context.user_data.get("album_selected", [])
+        if not selected:
+            await query.answer("حداقل یک ترک را انتخاب کن.", show_alert=True)
+            return
+        context.user_data["waiting"] = "album_selected_field"
+        await query.message.reply_text(f"✅ {len(selected)} ترک انتخاب شد. نام فیلدی را که می‌خواهی تغییر کند بفرست: artist, albumartist, album, genre, composer, publisher, year")
         return
 
     if data == "album:back":
@@ -1929,6 +2002,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+def _parse_track_disc(value):
+    """Parse ID3-style values such as 03, 3/12, or 2/3 into sortable numbers."""
+    value = str(value or "").strip()
+    m = re.match(r"^(\d+)(?:\s*/\s*(\d+))?", value)
+    return (int(m.group(1)), int(m.group(2)) if m and m.group(2) else None) if m else (None, None)
+
+
+def sort_album_tracks(tracks):
+    """Sort by disc number, then track number; unknown numbers remain at the end."""
+    def key(item):
+        tags = get_tags(item["path"])
+        track_no, _ = _parse_track_disc(tags.get("track"))
+        disc_no, _ = _parse_track_disc(tags.get("disc"))
+        return (0 if track_no is not None else 1,
+                disc_no if disc_no is not None else 1,
+                track_no if track_no is not None else 10**9,
+                item.get("index", 10**9))
+    tracks.sort(key=key)
+    return tracks
+
+
+def album_select_keyboard(tracks, selected):
+    rows = []
+    for t in tracks:
+        idx = t["index"]
+        tags = get_tags(t["path"])
+        mark = "☑️" if idx in selected else "⬜"
+        title = tags.get("title", "—")
+        rows.append([InlineKeyboardButton(f"{mark} {idx}. {title}"[:60], callback_data=f"album:select:{idx}")])
+    rows.append([InlineKeyboardButton("✅ ادامه با انتخاب‌ها", callback_data="album:select_done")])
+    rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="album:back")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def show_album_overview(query, context):
     tracks = context.user_data.get("album_tracks", [])
     main_artists = context.user_data.get("main_artists", [])
@@ -1961,6 +2068,9 @@ async def show_album_overview(query, context):
     )
     buttons.append(
         [InlineKeyboardButton("📝 Apply to All Tracks", callback_data="album:all")]
+    )
+    buttons.append(
+        [InlineKeyboardButton("🎯 Select Tracks for Group Edit", callback_data="album:select_menu")]
     )
     buttons.append(
         [InlineKeyboardButton("📊 Album Summary", callback_data="album:summary")]
