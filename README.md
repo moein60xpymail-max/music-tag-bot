@@ -1,4 +1,12 @@
-# Music Tag Bot — v4.6.1
+# Music Tag Bot — v4.7.0
+
+## v4.7.0 changes
+- Adds centralized temporary-prompt tracking for interactive text-entry flows.
+- A prompt is removed after the user's next response; invalid input replaces the old prompt with the new instruction.
+- The Album Summary screen is removed when returning to Album Tracks.
+- Summary edit screens are reused for the edit menu and removed when entering add/edit/delete input steps or confirming/canceling.
+- Field detail cards are removed when the user starts editing a field, including Year.
+- Persistent results, final summaries, and important error messages are not automatically deleted.
 
 ## v4.5.0 changes
 - Album Mode can register tracks larger than 20 MB using Telegram-provided metadata without downloading the media file.

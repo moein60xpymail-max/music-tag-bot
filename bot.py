@@ -93,9 +93,14 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.6.1"
+VERSION = "v4.7.0"
 VERSION_CHANGES = [
-    "تشخیص خودکار پایان ارسال فایل‌ها پس از ۶ ثانیه سکوت و به‌روزرسانی فوری داشبورد نهایی",
+    "حذف خودکار پیام‌های موقت پس از دریافت پاسخ کاربر",
+    "پاک‌کردن پیام درخواست قبلی هنگام نمایش مرحله بعدی یا اصلاح ورودی نامعتبر",
+    "حذف کارت اطلاعات فیلد پس از انتخاب ویرایش؛ از جمله ویرایش سال",
+    "حذف پیام خلاصه آلبوم هنگام بازگشت به فهرست ترک‌ها",
+    "پاک‌کردن صفحه‌های موقت ویرایش خلاصه هنگام ورود به مراحل افزودن، ویرایش، حذف، تأیید یا لغو",
+    "حفظ گزارش نهایی، خروجی‌ها و خطاهای مهم؛ بدون حذف خودکار پیام‌های ماندگار",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1328,6 +1333,32 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def send_temporary_prompt(message, context, text, **kwargs):
+    """Send an input prompt and remember it so it can be removed after the next reply."""
+    old_id = context.user_data.get("active_prompt_message_id")
+    old_chat = context.user_data.get("active_prompt_chat_id")
+    if old_id and old_chat:
+        try:
+            await context.bot.delete_message(chat_id=old_chat, message_id=old_id)
+        except TelegramError:
+            pass
+    sent = await message.reply_text(text, **kwargs)
+    context.user_data["active_prompt_message_id"] = sent.message_id
+    context.user_data["active_prompt_chat_id"] = sent.chat_id
+    return sent
+
+
+async def clear_active_prompt(update, context):
+    """Delete the prompt answered by the user's latest text message."""
+    message_id = context.user_data.pop("active_prompt_message_id", None)
+    chat_id = context.user_data.pop("active_prompt_chat_id", None)
+    if message_id and chat_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError:
+            pass
+
+
 async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip() if update.message.text else ""
 
@@ -1361,50 +1392,51 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel(update, context)
         return
 
+    await clear_active_prompt(update, context)
     value = text
     waiting = context.user_data.get("waiting")
     summary_draft = context.user_data.get("album_summary_draft") or {}
     entries = summary_draft.get("entries", [])
     if waiting in {"albumsummary:add_position", "albumsummary:add_title", "albumsummary:add_duration", "albumsummary:add_artist", "albumsummary:edit_position", "albumsummary:edit_title", "albumsummary:edit_duration", "albumsummary:edit_artist", "albumsummary:delete_position"}:
         if not value:
-            await update.message.reply_text("این مقدار نمی‌تواند خالی باشد. دوباره بفرست.")
+            await send_temporary_prompt(update.message, context, "این مقدار نمی‌تواند خالی باشد. دوباره بفرست.")
             return
         if waiting.endswith("position"):
             if not value.isdigit() or int(value) < 1 or int(value) > (len(entries) + (1 if waiting == "albumsummary:add_position" else 0)):
-                await update.message.reply_text("شماره معتبر نیست. دوباره شماره جایگاه را بفرست.")
+                await send_temporary_prompt(update.message, context, "شماره معتبر نیست. دوباره شماره جایگاه را بفرست.")
                 return
             pos = int(value)
             context.user_data["albumsummary_position"] = pos
             if waiting == "albumsummary:add_position":
                 context.user_data["waiting"] = "albumsummary:add_title"
-                await update.message.reply_text("نام آهنگ جدید را بفرست:")
+                await send_temporary_prompt(update.message, context, "نام آهنگ جدید را بفرست:")
             elif waiting == "albumsummary:delete_position":
                 entries.pop(pos-1)
                 context.user_data["waiting"] = None
                 await show_album_summary_draft(update.message, context)
             else:
                 context.user_data["waiting"] = "albumsummary:edit_title"
-                await update.message.reply_text(f"نام فعلی: {entries[pos-1]['title']}\nنام جدید را بفرست:")
+                await send_temporary_prompt(update.message, context, f"نام فعلی: {entries[pos-1]['title']}\nنام جدید را بفرست:")
             return
         if waiting == "albumsummary:add_title":
             context.user_data["albumsummary_new"] = {"title": value, "downloaded": False}
             context.user_data["waiting"] = "albumsummary:add_duration"
-            await update.message.reply_text("مدت‌زمان آهنگ را به شکل دقیقه:ثانیه بفرست؛ مثال 3:21")
+            await send_temporary_prompt(update.message, context, "مدت‌زمان آهنگ را به شکل دقیقه:ثانیه بفرست؛ مثال 3:21")
             return
         if waiting in {"albumsummary:add_duration", "albumsummary:edit_duration"}:
             m = re.fullmatch(r"(\d{1,3}):(\d{1,2})", value)
             if not m or int(m.group(2)) > 59:
-                await update.message.reply_text("مدت‌زمان معتبر نیست. نمونه درست: 3:21")
+                await send_temporary_prompt(update.message, context, "مدت‌زمان معتبر نیست. نمونه درست: 3:21")
                 return
             seconds = int(m.group(1))*60 + int(m.group(2))
             if waiting == "albumsummary:add_duration":
                 context.user_data["albumsummary_new"]["duration"] = seconds
                 context.user_data["waiting"] = "albumsummary:add_artist"
-                await update.message.reply_text("نام هنرمند یا هنرمندان را بفرست:")
+                await send_temporary_prompt(update.message, context, "نام هنرمند یا هنرمندان را بفرست:")
             else:
                 entries[context.user_data["albumsummary_position"]-1]["duration"] = seconds
                 context.user_data["waiting"] = "albumsummary:edit_artist"
-                await update.message.reply_text("نام هنرمندان را بفرست:")
+                await send_temporary_prompt(update.message, context, "نام هنرمندان را بفرست:")
             return
         if waiting == "albumsummary:add_artist":
             new = context.user_data.pop("albumsummary_new", {})
@@ -1418,7 +1450,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if waiting == "albumsummary:edit_title":
             entries[context.user_data["albumsummary_position"]-1]["title"] = value
             context.user_data["waiting"] = "albumsummary:edit_duration"
-            await update.message.reply_text("مدت‌زمان جدید را به شکل دقیقه:ثانیه بفرست:")
+            await send_temporary_prompt(update.message, context, "مدت‌زمان جدید را به شکل دقیقه:ثانیه بفرست:")
             return
         if waiting == "albumsummary:edit_artist":
             entries[context.user_data["albumsummary_position"]-1]["artist"] = value
@@ -1444,7 +1476,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     value = text
     if not value:
-        await update.message.reply_text("مقدار خالی قابل ذخیره نیست.")
+        await send_temporary_prompt(update.message, context, "مقدار خالی قابل ذخیره نیست.")
         return
 
     # Apply-to-all album field: first receive the field name, then its value.
@@ -1453,11 +1485,11 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key = aliases.get(value.casefold())
         allowed = {"artist", "albumartist", "album", "genre", "composer", "publisher", "year"}
         if key not in allowed:
-            await update.message.reply_text("فقط یکی از این فیلدها را بفرست: artist, albumartist, album, genre, composer, publisher, year")
+            await send_temporary_prompt(update.message, context, "فقط یکی از این فیلدها را بفرست: artist, albumartist, album, genre, composer, publisher, year")
             return
         context.user_data["album_selected_key"] = key
         context.user_data["waiting"] = "album_selected_value"
-        await update.message.reply_text(f"مقدار جدید برای {FIELDS.get(key, key)} را بفرست:")
+        await send_temporary_prompt(update.message, context, f"مقدار جدید برای {FIELDS.get(key, key)} را بفرست:")
         return
 
     if waiting == "album_selected_value":
@@ -1502,11 +1534,11 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    "آهنگساز":"composer", "ناشر":"publisher", "سال":"year"}
         key = aliases.get(value.casefold())
         if key not in {"artist", "albumartist", "album", "genre", "composer", "publisher", "year"}:
-            await update.message.reply_text("فقط یکی از این فیلدها را بفرست: artist, albumartist, album, genre, composer, publisher, year")
+            await send_temporary_prompt(update.message, context, "فقط یکی از این فیلدها را بفرست: artist, albumartist, album, genre, composer, publisher, year")
             return
         context.user_data["album_all_key"] = key
         context.user_data["waiting"] = "album_all_value"
-        await update.message.reply_text(f"مقدار جدید برای {FIELDS.get(key, key)} را بفرست:")
+        await send_temporary_prompt(update.message, context, f"مقدار جدید برای {FIELDS.get(key, key)} را بفرست:")
         return
 
     if waiting == "album_all_value":
@@ -1544,7 +1576,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if waiting == "albumtools_disc_value":
         if not value.isdigit() or not 1 <= int(value) <= 99:
-            await update.message.reply_text("شماره دیسک باید عددی بین ۱ تا ۹۹ باشد.")
+            await send_temporary_prompt(update.message, context, "شماره دیسک باید عددی بین ۱ تا ۹۹ باشد.")
             return
         tracks=context.user_data.get("album_tracks", [])
         backups=[]
@@ -1566,7 +1598,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if waiting == "albumtools_renumber_start":
         if not value.isdigit() or not 1 <= int(value) <= 999:
-            await update.message.reply_text("شماره شروع باید عددی بین ۱ تا ۹۹۹ باشد.")
+            await send_temporary_prompt(update.message, context, "شماره شروع باید عددی بین ۱ تا ۹۹۹ باشد.")
             return
         context.user_data["albumtools_renumber_start"] = int(value)
         context.user_data["waiting"] = None
@@ -1582,22 +1614,22 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         aliases = {"album artist":"albumartist", "هنرمند":"artist", "ژانر":"genre", "آهنگساز":"composer", "ناشر":"publisher", "سال":"year", "عنوان":"title", "آلبوم":"album"}
         keys = [aliases.get(x, x) for x in keys]
         if not keys or any(k not in allowed for k in keys):
-            await update.message.reply_text("فیلدهای مجاز: title, artist, album, year, genre, albumartist, composer, publisher, lyrics, comment")
+            await send_temporary_prompt(update.message, context, "فیلدهای مجاز: title, artist, album, year, genre, albumartist, composer, publisher, lyrics, comment")
             return
         context.user_data["albumtools_copy_keys"] = keys
         context.user_data["waiting"] = None
-        await update.message.reply_text("شماره ترک مبدأ را بفرست (شماره‌ای که در فهرست آلبوم نمایش داده می‌شود):")
+        await send_temporary_prompt(update.message, context, "شماره ترک مبدأ را بفرست (شماره‌ای که در فهرست آلبوم نمایش داده می‌شود):")
         context.user_data["waiting"] = "albumtools_copy_source"
         return
 
     if waiting == "albumtools_copy_source":
         if not value.isdigit() or not _album_track_by_index(context.user_data.get("album_tracks", []), int(value)):
-            await update.message.reply_text("شماره ترک معتبر نیست. دوباره بفرست.")
+            await send_temporary_prompt(update.message, context, "شماره ترک معتبر نیست. دوباره بفرست.")
             return
         context.user_data["albumtools_copy_source"] = int(value)
         context.user_data["waiting"] = None
         context.user_data["album_selected"] = []
-        await update.message.reply_text("حالا ترک‌های مقصد را انتخاب کن:", reply_markup=album_select_keyboard(context.user_data.get("album_tracks", []), set()))
+        await send_temporary_prompt(update.message, context, "حالا ترک‌های مقصد را انتخاب کن:", reply_markup=album_select_keyboard(context.user_data.get("album_tracks", []), set()))
         context.user_data["albumtools_copy_mode"] = True
         return
 
@@ -2134,6 +2166,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "album:back":
+        try:
+            await query.message.delete()
+        except TelegramError:
+            pass
         await show_album_overview(query, context)
         return
 
@@ -2177,7 +2213,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "album:all":
         context.user_data["waiting"] = "album_all_field"
-        await query.message.reply_text(
+        await send_temporary_prompt(query.message, context,
             "کدام فیلد را می‌خواهی روی **همه ترک‌ها** اعمال کنی؟\n"
             "یکی از این‌ها را بنویس: title, artist, album, year, track, genre, albumartist, composer, disc, publisher, comment"
         )
@@ -2214,23 +2250,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = data.split(":", 1)[1]
         entries = draft.get("entries", [])
         if action == "menu":
-            await show_album_summary_draft(query.message, context)
+            draft_text = build_album_summary_text(entries, context.user_data.get("main_artists", []), draft.get("album_name", ""))
+            await query.message.edit_text(draft_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ افزودن آهنگ", callback_data="albumsummary:add")],
+                [InlineKeyboardButton("✏️ ویرایش آهنگ موجود", callback_data="albumsummary:edit")],
+                [InlineKeyboardButton("🗑 حذف آهنگ", callback_data="albumsummary:delete")],
+                [InlineKeyboardButton("✅ تأیید و ثبت خلاصه", callback_data="albumsummary:confirm")],
+                [InlineKeyboardButton("↩️ لغو ویرایش", callback_data="albumsummary:cancel")],
+            ]))
         elif action == "add":
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
             context.user_data["waiting"] = "albumsummary:add_position"
-            await query.message.reply_text(f"جایگاه آهنگ جدید را مشخص کن (۱ تا {len(entries)+1}):")
+            await send_temporary_prompt(query.message, context, f"جایگاه آهنگ جدید را مشخص کن (۱ تا {len(entries)+1}):")
         elif action == "edit":
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
             if not entries:
                 await query.message.reply_text("فهرست آهنگ خالی است.")
             else:
                 context.user_data["waiting"] = "albumsummary:edit_position"
-                await query.message.reply_text(f"شماره آهنگی را که می‌خواهی ویرایش کنی بفرست (۱ تا {len(entries)}):")
+                await send_temporary_prompt(query.message, context, f"شماره آهنگی را که می‌خواهی ویرایش کنی بفرست (۱ تا {len(entries)}):")
         elif action == "delete":
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
             if not entries:
                 await query.message.reply_text("فهرست آهنگ خالی است.")
             else:
                 context.user_data["waiting"] = "albumsummary:delete_position"
-                await query.message.reply_text(f"شماره آهنگی را که می‌خواهی حذف کنی بفرست (۱ تا {len(entries)}):")
+                await send_temporary_prompt(query.message, context, f"شماره آهنگی را که می‌خواهی حذف کنی بفرست (۱ تا {len(entries)}):")
         elif action == "confirm":
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
             # Store only the edited summary text/data; never mutate MP3 tags or files.
             context.user_data["album_summary_confirmed"] = dict(draft)
             context.user_data["album_summary_draft"] = None
@@ -2238,6 +2297,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             final_text = build_album_summary_text(entries, context.user_data.get("main_artists", []), draft.get("album_name", ""))
             await query.message.reply_text("✅ خلاصه آلبوم نهایی شد:\n\n" + final_text, parse_mode=ParseMode.MARKDOWN)
         elif action == "cancel":
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
             context.user_data["album_summary_draft"] = None
             context.user_data["waiting"] = None
             await query.message.reply_text("ویرایش خلاصه لغو شد؛ اطلاعات اصلی آلبوم تغییری نکرد.")
@@ -2268,7 +2331,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("edit:"):
         field = data.split(":", 1)[1]
         context.user_data["waiting"] = field
-        await query.message.reply_text(
+        try:
+            await query.message.delete()
+        except TelegramError:
+            pass
+        await send_temporary_prompt(query.message, context,
             f"مقدار جدید **{FIELDS.get(field, field)}** را بفرست:"
         )
         return

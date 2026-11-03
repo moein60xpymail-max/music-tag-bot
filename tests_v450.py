@@ -3,8 +3,9 @@ import ast
 s=Path('bot.py').read_text(encoding='utf-8')
 ast.parse(s)
 checks=[
- 'VERSION = "v4.6.0"',
- 'ثبت اطلاعات آهنگ‌های بالای ۲۰ مگابایت بدون دانلود فایل',
+ 'VERSION = "v4.7.0"',
+ 'file_size',
+ 'downloaded',
  'async def send_album_summary(query, context):',
  'async def show_album_summary_draft(message, context):',
  'albumsummary:add_position', 'albumsummary:edit_position',
