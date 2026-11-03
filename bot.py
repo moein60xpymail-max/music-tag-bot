@@ -1,5 +1,6 @@
 import os
 import asyncio
+import time
 import re
 import json
 import shutil
@@ -92,8 +93,11 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.5.0"
+VERSION = "v4.6.0"
 VERSION_CHANGES = [
+    "داشبورد پیشرفت تک‌پیامی برای دریافت و پردازش گروهی فایل‌ها با به‌روزرسانی حداکثر هر ۳ ثانیه",
+    "نمایش تعداد موفق، دانلودنشده و ناموفق بدون ارسال پیام جداگانه برای هر آهنگ",
+    "تبدیل پیام پیشرفت به گزارش نهایی یا حذف آن در پایان عملیات",
     "ثبت اطلاعات آهنگ‌های بالای ۲۰ مگابایت بدون دانلود فایل",
     "ادامه ساخت خلاصه آلبوم در صورت ناموفق بودن دانلود یک آهنگ",
     "افزودن آهنگ به خلاصه در جایگاه دلخواه با شماره‌گذاری خودکار",
@@ -938,6 +942,76 @@ def failed_media_message(label, exc, stage):
             f"🎵 فایل: {label}\n"
             f"🔎 علت احتمالی: {explain_media_error(exc, stage)}")
 
+# ==================== داشبورد پیشرفت گروهی v4.6 ====================
+PROGRESS_UPDATE_INTERVAL = 3.0
+
+async def update_progress_dashboard(message, context, operation, *, outcome=None, track_name=None, final=False, remove=False):
+    """Maintain one progress message per intake session; never emit one message per file."""
+    state = context.user_data.get("progress_dashboard")
+    now = time.monotonic()
+    if not state or state.get("operation") != operation:
+        state = {"operation": operation, "message_id": None, "chat_id": message.chat_id,
+                 "last_update": 0.0, "received": 0, "success": 0, "skipped": 0,
+                 "failed": 0, "current": "—"}
+        context.user_data["progress_dashboard"] = state
+    if outcome:
+        state["received"] += 1
+        if outcome == "success": state["success"] += 1
+        elif outcome == "skipped": state["skipped"] += 1
+        elif outcome == "failed": state["failed"] += 1
+    if track_name:
+        state["current"] = str(track_name)[:100]
+    if remove:
+        if state.get("message_id"):
+            try:
+                await context.bot.delete_message(chat_id=state["chat_id"], message_id=state["message_id"])
+            except Exception:
+                pass
+        context.user_data.pop("progress_dashboard", None)
+        return
+    # Do not fabricate a percentage: during open-ended uploads Telegram gives no total count.
+    title = {"album": "📥 دریافت آهنگ‌های آلبوم", "summary": "📊 دریافت آهنگ‌ها برای خلاصه", "archive_a": "📥 دریافت منبع A", "archive_b": "📥 دریافت منبع B"}.get(operation, "⚙️ پردازش فایل‌ها")
+    lines = [title, "", f"📦 فایل‌های ثبت‌شده: {state['received']}",
+             f"✅ موفق: {state['success']}   |   ⏭ دانلودنشده: {state['skipped']}   |   ❌ خطا: {state['failed']}",
+             f"🎵 آخرین فایل: {state['current']}"]
+    if final:
+        lines.insert(1, "<b>عملیات پایان یافت</b>")
+    text = "\n".join(lines)
+    keyboard = None
+    if operation == "album":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish Uploading", callback_data="album:finish")]])
+    elif operation == "summary":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان و ساخت خلاصه", callback_data="summary:finish")]])
+    elif operation in {"archive_a", "archive_b"}:
+        is_a = operation == "archive_a"
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A" if is_a else "پایان منبع B", callback_data="arch:finish_a" if is_a else "arch:finish_b")]])
+    if not state.get("message_id"):
+        sent = await context.bot.send_message(chat_id=message.chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        state["message_id"] = sent.message_id
+        state["last_update"] = now
+    elif final or now - state.get("last_update", 0) >= PROGRESS_UPDATE_INTERVAL:
+        try:
+            await context.bot.edit_message_text(chat_id=state["chat_id"], message_id=state["message_id"], text=text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except BadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                raise
+        state["last_update"] = now
+
+async def finish_progress_dashboard(context, operation, *, keep=True):
+    state = context.user_data.get("progress_dashboard")
+    if not state or state.get("operation") != operation:
+        return
+    if keep:
+        class _MessageRef:
+            chat_id = state["chat_id"]
+        await update_progress_dashboard(_MessageRef(), context, operation, final=True)
+    else:
+        try:
+            await context.bot.delete_message(chat_id=state["chat_id"], message_id=state["message_id"])
+        except Exception:
+            pass
+    context.user_data.pop("progress_dashboard", None)
+
 # ==================== دریافت فایل و متن ====================
 async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -951,8 +1025,14 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not file_name.lower().endswith(".mp3"):
             await message.reply_text("برای خلاصه‌سازی، فایل MP3 بفرست.")
             return
+        context.user_data.setdefault("summary_session", {"tracks": []})
         if getattr(document, "file_size", 0) and document.file_size > MAX_SIZE:
-            await message.reply_text("حجم هر فایل نباید بیشتر از ۲۰ مگابایت باشد.")
+            context.user_data["summary_session"]["tracks"].append({
+                "title": getattr(document, "title", None) or Path(file_name).stem,
+                "artist": getattr(document, "performer", None) or "—", "album": "—",
+                "downloaded": False, "duration": getattr(document, "duration", None),
+            })
+            await update_progress_dashboard(message, context, "summary", outcome="skipped", track_name=file_name)
             return
         temp_dir = tempfile.mkdtemp(prefix="music_summary_")
         temp_path = os.path.join(temp_dir, "summary_track.mp3")
@@ -965,22 +1045,15 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = tags.get("title", "—")
             artist = tags.get("artist", "—")
             album = tags.get("album", "—")
-            context.user_data.setdefault("summary_session", {"tracks": []})
             context.user_data["summary_session"].setdefault("tracks", []).append({
                 "title": title if title != "—" else Path(file_name).stem,
-                "artist": artist,
-                "album": album,
+                "artist": artist, "album": album, "downloaded": True,
             })
-            count = len(context.user_data["summary_session"]["tracks"])
-            await message.reply_text(
-                f"✅ آهنگ شماره {count} دریافت و بررسی شد.\n"
-                "فایل بعدی را بفرست یا برای ساخت گزارش دکمه پایان را بزن.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان و ساخت خلاصه", callback_data="summary:finish")]])
-            )
+            await update_progress_dashboard(message, context, "summary", outcome="success", track_name=file_name)
         except Exception as exc:
             print("summary intake error:", repr(exc))
             label = file_name or f"آهنگ شماره {len((context.user_data.get('summary_session') or {}).get('tracks', [])) + 1}"
-            await message.reply_text(failed_media_message(label, exc, stage) + "\nفایل دیگری بفرست.")
+            await update_progress_dashboard(message, context, "summary", outcome="failed", track_name=label)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
         return
@@ -1040,9 +1113,6 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Archive intake: keep Telegram file references; download only when a track is opened.
     archive = context.user_data.get("archive")
     if archive and archive.get("phase") in {"source_a", "source_b"}:
-        if document.file_size and document.file_size > MAX_SIZE:
-            await message.reply_text("حجم فایل نباید بیشتر از ۲۰ مگابایت باشه.")
-            return
         source = archive["phase"]
         bucket = archive["sources"][source]
         audio_meta = message.audio
@@ -1056,13 +1126,9 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "size": document.file_size or 0,
             "message_id": message.message_id,
         })
-        await message.reply_text(
-            f"✅ {name} به منبع {'A' if source == 'source_a' else 'B'} اضافه شد.\n"
-            f"تعداد این منبع: {len(bucket)}\nفایل بعدی را بفرست یا پایان منبع را بزن.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                "پایان منبع A" if source == "source_a" else "پایان منبع B",
-                callback_data="arch:finish_a" if source == "source_a" else "arch:finish_b")]])
-        )
+        op = "archive_a" if source == "source_a" else "archive_b"
+        await update_progress_dashboard(message, context, op,
+            outcome="skipped" if (document.file_size or 0) > MAX_SIZE else "success", track_name=name)
         return
 
     if document.file_size and document.file_size > MAX_SIZE and not context.user_data.get("album_mode"):
@@ -1087,12 +1153,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "summary_duration": duration, "downloaded": False,
                 "file_size": document.file_size, "file_id": document.file_id,
             })
-            await message.reply_text(
-                f"ℹ️ ترک {idx} ثبت شد، اما دانلود نشد چون حجم آن بیشتر از ۲۰ مگابایت است.\n"
-                f"عنوان قابل‌دسترسی: {title}\nهنرمند قابل‌دسترسی: {artist}\n"
-                "این آهنگ در خلاصه آلبوم باقی می‌ماند و می‌توانی اطلاعاتش را در ویرایش خلاصه تکمیل کنی.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish Uploading", callback_data="album:finish")]])
-            )
+            await update_progress_dashboard(message, context, "album", outcome="skipped", track_name=name)
             return
         path = os.path.join(folder, f"track_{attempt:02d}.mp3")
         stage = "download"
@@ -1109,7 +1170,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except OSError:
                 pass
             label = name or f"فایل ارسالی شماره {attempt}"
-            await message.reply_text(failed_media_message(label, e, stage))
+            await update_progress_dashboard(message, context, "album", outcome="failed", track_name=label)
             return
 
         # کاور و زمان اصلی این ترک رو ذخیره کن
@@ -1131,20 +1192,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "original_duration": track_duration,
             }
         )
-        await message.reply_text(
-            f"✅ ترک {idx} دریافت شد: `{name}`\n"
-            "فایل بعدی را بفرست یا **Finish Uploading** را بزن.",
-            reply_markup=InlineKeyboardMarkup(
-                [
-                    [
-                        InlineKeyboardButton(
-                            "✅ Finish Uploading", callback_data="album:finish"
-                        )
-                    ]
-                ]
-            ),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await update_progress_dashboard(message, context, "album", outcome="success", track_name=name)
         return
 
     # حالت تک آهنگ
@@ -1663,8 +1711,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.extend(["", f"▫️ بدون تگ هنرمند: {no_artist}", f"▫️ بدون تگ آلبوم: {no_album}"])
         context.user_data.pop("summary_session", None)
         context.user_data["waiting"] = None
-        await query.message.reply_text("\n".join(lines), reply_markup=main_reply_keyboard())
-        await query.message.reply_text("خلاصه آماده شد.")
+        dashboard = context.user_data.get("progress_dashboard")
+        if dashboard and dashboard.get("operation") == "summary":
+            try:
+                await context.bot.edit_message_text(chat_id=dashboard["chat_id"], message_id=dashboard["message_id"], text="\n".join(lines))
+            except Exception:
+                await query.message.reply_text("\n".join(lines), reply_markup=main_reply_keyboard())
+            context.user_data.pop("progress_dashboard", None)
+        else:
+            await query.message.reply_text("\n".join(lines), reply_markup=main_reply_keyboard())
         return
 
     if data.startswith("arch:"):
@@ -1698,11 +1753,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data == "arch:finish_a":
             a["phase"] = "menu"
-            await query.message.reply_text(f"منبع A ثبت شد: {len(a['sources']['source_a'])} فایل", reply_markup=archive_keyboard())
+            await finish_progress_dashboard(context, "archive_a", keep=True)
+            await query.message.edit_reply_markup(reply_markup=archive_keyboard())
             return
         if data == "arch:finish_b":
             a["phase"] = "menu"
-            await query.message.reply_text(f"منبع B ثبت شد: {len(a['sources']['source_b'])} فایل", reply_markup=archive_keyboard())
+            await finish_progress_dashboard(context, "archive_b", keep=True)
+            await query.message.edit_reply_markup(reply_markup=archive_keyboard())
             return
         if data == "arch:analyze":
             merged=[]; definite_count=0; review_count=0
@@ -2006,6 +2063,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_tag(p, "albumartist", " , ".join(main_artists) if main_artists else artist)
         # دیگر فایل جدید به آلبوم اضافه نشود
         context.user_data["album_mode"] = False
+        await finish_progress_dashboard(context, "album", keep=False)
         await show_album_overview(query, context)
         return
 
