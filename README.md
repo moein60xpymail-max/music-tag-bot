@@ -1,4 +1,4 @@
-# Music Tag Bot — v4.6.0
+# Music Tag Bot — v4.6.1
 
 ## v4.5.0 changes
 - Album Mode can register tracks larger than 20 MB using Telegram-provided metadata without downloading the media file.
@@ -22,3 +22,10 @@
 - Summary intake treats files over 20 MB as metadata-only entries instead of rejecting them.
 - Progress is shown as counts rather than a percentage while the total number of incoming files is unknown; no misleading percentage is fabricated.
 - No persistent progress state is stored. A host restart may interrupt an active intake, as agreed.
+
+
+## v4.6.1 changes
+- Automatically marks the current intake dashboard as quiet/completed after 6 seconds without a newly processed file.
+- Every newly processed file restarts the 6-second inactivity timer.
+- The final dashboard refresh bypasses the normal 3-second throttle.
+- The 6-second quiet detection does not close Album, Summary, or Archive mode; a late file can still arrive and resume the dashboard.

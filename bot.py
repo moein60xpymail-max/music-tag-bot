@@ -93,19 +93,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.6.0"
+VERSION = "v4.6.1"
 VERSION_CHANGES = [
-    "داشبورد پیشرفت تک‌پیامی برای دریافت و پردازش گروهی فایل‌ها با به‌روزرسانی حداکثر هر ۳ ثانیه",
-    "نمایش تعداد موفق، دانلودنشده و ناموفق بدون ارسال پیام جداگانه برای هر آهنگ",
-    "تبدیل پیام پیشرفت به گزارش نهایی یا حذف آن در پایان عملیات",
-    "ثبت اطلاعات آهنگ‌های بالای ۲۰ مگابایت بدون دانلود فایل",
-    "ادامه ساخت خلاصه آلبوم در صورت ناموفق بودن دانلود یک آهنگ",
-    "افزودن آهنگ به خلاصه در جایگاه دلخواه با شماره‌گذاری خودکار",
-    "ویرایش نام، مدت‌زمان و هنرمندان هر آهنگ در خلاصه آلبوم",
-    "حذف آهنگ از خلاصه و شماره‌گذاری مجدد فهرست",
-    "محاسبه مجدد تعداد آهنگ‌ها، مدت‌زمان و هنرمندان یکتا",
-    "امکان لغو و تأیید نهایی ویرایش خلاصه آلبوم",
-    "نمایش فقط تغییرات نسخه فعلی در بخش نسخه",
+    "تشخیص خودکار پایان ارسال فایل‌ها پس از ۶ ثانیه سکوت و به‌روزرسانی فوری داشبورد نهایی",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -944,6 +934,23 @@ def failed_media_message(label, exc, stage):
 
 # ==================== داشبورد پیشرفت گروهی v4.6 ====================
 PROGRESS_UPDATE_INTERVAL = 3.0
+PROGRESS_IDLE_TIMEOUT = 6.0
+
+async def _progress_idle_finish(context, operation, state):
+    """Mark intake as quiet after six seconds without a newly received file."""
+    try:
+        await asyncio.sleep(PROGRESS_IDLE_TIMEOUT)
+        current = context.user_data.get("progress_dashboard")
+        if current is not state or current.get("operation") != operation:
+            return
+        current["idle_task"] = None
+        class _MessageRef:
+            chat_id = current["chat_id"]
+        await update_progress_dashboard(_MessageRef(), context, operation, final=True)
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        print("Progress idle-finish error:", repr(exc))
 
 async def update_progress_dashboard(message, context, operation, *, outcome=None, track_name=None, final=False, remove=False):
     """Maintain one progress message per intake session; never emit one message per file."""
@@ -952,7 +959,7 @@ async def update_progress_dashboard(message, context, operation, *, outcome=None
     if not state or state.get("operation") != operation:
         state = {"operation": operation, "message_id": None, "chat_id": message.chat_id,
                  "last_update": 0.0, "received": 0, "success": 0, "skipped": 0,
-                 "failed": 0, "current": "—"}
+                 "failed": 0, "current": "—", "idle_task": None}
         context.user_data["progress_dashboard"] = state
     if outcome:
         state["received"] += 1
@@ -996,11 +1003,23 @@ async def update_progress_dashboard(message, context, operation, *, outcome=None
             if "message is not modified" not in str(exc).lower():
                 raise
         state["last_update"] = now
+    # Every newly processed file restarts the six-second quiet-period timer.
+    # The timer only finalizes the dashboard display; it does not close the mode.
+    if outcome and not final:
+        old_task = state.get("idle_task")
+        if old_task and not old_task.done():
+            old_task.cancel()
+        state["idle_task"] = asyncio.create_task(
+            _progress_idle_finish(context, operation, state)
+        )
 
 async def finish_progress_dashboard(context, operation, *, keep=True):
     state = context.user_data.get("progress_dashboard")
     if not state or state.get("operation") != operation:
         return
+    idle_task = state.get("idle_task")
+    if idle_task and not idle_task.done():
+        idle_task.cancel()
     if keep:
         class _MessageRef:
             chat_id = state["chat_id"]
