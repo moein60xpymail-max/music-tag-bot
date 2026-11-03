@@ -1,18 +1,16 @@
-# Music Tag Bot v4.4
+# Music Tag Bot — v4.5.0
 
-## Changes in v4.4
-- Album Summary now displays Album Name below Album Artist(s). If multiple distinct album names exist in the received tracks, all are shown.
-- Failed audio intake now reports the filename (or attempt number fallback) and a categorized likely cause: Telegram/network delivery, unavailable file reference, invalid/corrupt MP3, or local storage/read failure.
-- Album intake attempt numbers advance even when a file fails, so a failure can be identified without confusing it with the count of successfully received tracks.
+## v4.5.0 changes
+- Album Mode can register tracks larger than 20 MB using Telegram-provided metadata without downloading the media file.
+- A failed/omitted download for one large album track no longer prevents the album summary from being generated.
+- Album Summary includes a text-only editor to insert, edit, or delete tracks.
+- Inserting a track at a chosen position automatically renumbers the list.
+- Track count, total duration, and unique artist count are recalculated from the edited summary.
+- Summary edits are confirmed separately and do not modify MP3 files or tags.
+- The version screen lists only the current release's changes.
 
-Run with `python bot.py`. Keep existing environment variables unchanged.
-
-
-## v4.4.1 reliability patch
-- Telegram HTTP timeouts increased for media transfer and connection pooling.
-- Transient download failures retry up to three attempts with backoff.
-- Messages rejected due to malformed Markdown/HTML are retried as plain text.
-- Callback queries are acknowledged before potentially slow processing.
-- Error logs include full traceback for diagnosis.
-
-This patch does not guarantee recovery from Telegram/host outages; outbound media sends are not blindly retried because a timeout can occur after Telegram has already accepted the upload, which could create duplicate posts.
+## Notes
+- The 20 MB download limit remains for Single and Archive workflows. The Album Mode exception is metadata-only; large media is not downloaded.
+- Telegram metadata may not include title, performer, or duration for document uploads. Missing values can be completed in Album Summary Editor.
+- Album Summary edits affect only the summary text/data, not the original MP3 tags or the files sent by Save All.
+- Existing environment variables are unchanged. Start command remains `python bot.py`.

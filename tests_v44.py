@@ -3,7 +3,7 @@ import ast
 s=(Path(__file__).parent/'bot.py').read_text(encoding='utf-8')
 ast.parse(s)
 checks=[
- 'VERSION = "v4.4.1"',
+ 'VERSION = "v4.5.0"',
  'Album Name:',
  'def explain_media_error(exc, stage):',
  'def failed_media_message(label, exc, stage):',

@@ -92,28 +92,16 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.4.1"
+VERSION = "v4.5.0"
 VERSION_CHANGES = [
-    "مدیریت کاور پیش‌فرض Unreleased Track",
-    "انتخاب بین جایگزینی کاور، حفظ کاور فعلی یا لغو عملیات",
-    "پشتیبانی از این قابلیت در حالت‌های Single، Album و Archive",
-    "اعمال کاور فقط روی آهنگ انتخاب‌شده؛ بدون تغییر کاور آهنگ‌های دیگر",
-    "نمایش شماره نسخه و فهرست تغییرات در بخش نسخه",
-    "انتقال مدیریت کاور Unreleased Track به منوی فرمان‌های همبرگری تلگرام",
-    "مرتب‌سازی آلبوم بر اساس شماره ترک پس از پایان دریافت فایل‌ها",
-    "مرتب‌سازی و ابزارهای آلبوم در بخش Album Tools",
-    "شماره‌گذاری مجدد ترک‌ها با شماره شروع دلخواه و تأیید کاربر",
-    "تنظیم شماره دیسک برای همه ترک‌ها",
-    "جابه‌جایی دستی ترک‌ها در فهرست آلبوم",
-    "فیلتر ترک‌های دارای تگ ناقص یا شماره تکراری",
-    "کپی فیلدهای انتخابی از یک ترک به ترک‌های انتخاب‌شده",
-    "نمایش نام آلبوم در ابتدای Album Summary",
-    "گزارش نام فایل و شماره تلاش هنگام شکست دریافت یا خواندن فایل",
-    "تفکیک خطاهای ارتباط با تلگرام از فایل خراب یا فرمت نامعتبر",
-    "Retry محدود برای دانلود فایل هنگام خطاهای موقت شبکه",
-    "افزایش مهلت ارتباط با تلگرام برای دانلود و ارسال فایل‌های حجیم",
-    "ارسال مجدد پیام‌های دارای خطای Markdown/HTML بدون Parse Mode",
-    "پاسخ فوری به دکمه‌های اینلاین و ثبت جزئیات خطا برای عیب‌یابی",
+    "ثبت اطلاعات آهنگ‌های بالای ۲۰ مگابایت بدون دانلود فایل",
+    "ادامه ساخت خلاصه آلبوم در صورت ناموفق بودن دانلود یک آهنگ",
+    "افزودن آهنگ به خلاصه در جایگاه دلخواه با شماره‌گذاری خودکار",
+    "ویرایش نام، مدت‌زمان و هنرمندان هر آهنگ در خلاصه آلبوم",
+    "حذف آهنگ از خلاصه و شماره‌گذاری مجدد فهرست",
+    "محاسبه مجدد تعداد آهنگ‌ها، مدت‌زمان و هنرمندان یکتا",
+    "امکان لغو و تأیید نهایی ویرایش خلاصه آلبوم",
+    "نمایش فقط تغییرات نسخه فعلی در بخش نسخه",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -839,6 +827,8 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["album_folder"] = folder
     context.user_data["album_tracks"] = []
     context.user_data["main_artists"] = []
+    context.user_data.pop("album_summary_draft", None)
+    context.user_data.pop("album_summary_confirmed", None)
     context.user_data["waiting"] = "album_main_artists"
 
     await update.message.reply_text(
@@ -1047,13 +1037,12 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data["waiting"] = None
 
-    if document.file_size and document.file_size > MAX_SIZE:
-        await message.reply_text("حجم فایل نباید بیشتر از ۲۰ مگابایت باشه.")
-        return
-
     # Archive intake: keep Telegram file references; download only when a track is opened.
     archive = context.user_data.get("archive")
     if archive and archive.get("phase") in {"source_a", "source_b"}:
+        if document.file_size and document.file_size > MAX_SIZE:
+            await message.reply_text("حجم فایل نباید بیشتر از ۲۰ مگابایت باشه.")
+            return
         source = archive["phase"]
         bucket = archive["sources"][source]
         audio_meta = message.audio
@@ -1076,12 +1065,35 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if document.file_size and document.file_size > MAX_SIZE and not context.user_data.get("album_mode"):
+        await message.reply_text("حجم فایل نباید بیشتر از ۲۰ مگابایت باشه.")
+        return
+
     # حالت آلبوم
     if context.user_data.get("album_mode"):
         folder = context.user_data["album_folder"]
         attempt = context.user_data.get("album_receive_attempt", 0) + 1
         context.user_data["album_receive_attempt"] = attempt
         idx = len(context.user_data["album_tracks"]) + 1
+        audio_meta = message.audio
+        if document.file_size and document.file_size > MAX_SIZE:
+            title = (getattr(audio_meta, "title", None) or "").strip() or Path(name).stem
+            artist = (getattr(audio_meta, "performer", None) or "").strip() or "—"
+            duration = getattr(audio_meta, "duration", None)
+            context.user_data["album_tracks"].append({
+                "path": None, "original_name": name, "index": idx,
+                "original_cover": None, "original_duration": duration,
+                "summary_title": title, "summary_artist": artist,
+                "summary_duration": duration, "downloaded": False,
+                "file_size": document.file_size, "file_id": document.file_id,
+            })
+            await message.reply_text(
+                f"ℹ️ ترک {idx} ثبت شد، اما دانلود نشد چون حجم آن بیشتر از ۲۰ مگابایت است.\n"
+                f"عنوان قابل‌دسترسی: {title}\nهنرمند قابل‌دسترسی: {artist}\n"
+                "این آهنگ در خلاصه آلبوم باقی می‌ماند و می‌توانی اطلاعاتش را در ویرایش خلاصه تکمیل کنی.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Finish Uploading", callback_data="album:finish")]])
+            )
+            return
         path = os.path.join(folder, f"track_{attempt:02d}.mp3")
         stage = "download"
         try:
@@ -1282,7 +1294,70 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel(update, context)
         return
 
+    value = text
     waiting = context.user_data.get("waiting")
+    summary_draft = context.user_data.get("album_summary_draft") or {}
+    entries = summary_draft.get("entries", [])
+    if waiting in {"albumsummary:add_position", "albumsummary:add_title", "albumsummary:add_duration", "albumsummary:add_artist", "albumsummary:edit_position", "albumsummary:edit_title", "albumsummary:edit_duration", "albumsummary:edit_artist", "albumsummary:delete_position"}:
+        if not value:
+            await update.message.reply_text("این مقدار نمی‌تواند خالی باشد. دوباره بفرست.")
+            return
+        if waiting.endswith("position"):
+            if not value.isdigit() or int(value) < 1 or int(value) > (len(entries) + (1 if waiting == "albumsummary:add_position" else 0)):
+                await update.message.reply_text("شماره معتبر نیست. دوباره شماره جایگاه را بفرست.")
+                return
+            pos = int(value)
+            context.user_data["albumsummary_position"] = pos
+            if waiting == "albumsummary:add_position":
+                context.user_data["waiting"] = "albumsummary:add_title"
+                await update.message.reply_text("نام آهنگ جدید را بفرست:")
+            elif waiting == "albumsummary:delete_position":
+                entries.pop(pos-1)
+                context.user_data["waiting"] = None
+                await show_album_summary_draft(update.message, context)
+            else:
+                context.user_data["waiting"] = "albumsummary:edit_title"
+                await update.message.reply_text(f"نام فعلی: {entries[pos-1]['title']}\nنام جدید را بفرست:")
+            return
+        if waiting == "albumsummary:add_title":
+            context.user_data["albumsummary_new"] = {"title": value, "downloaded": False}
+            context.user_data["waiting"] = "albumsummary:add_duration"
+            await update.message.reply_text("مدت‌زمان آهنگ را به شکل دقیقه:ثانیه بفرست؛ مثال 3:21")
+            return
+        if waiting in {"albumsummary:add_duration", "albumsummary:edit_duration"}:
+            m = re.fullmatch(r"(\d{1,3}):(\d{1,2})", value)
+            if not m or int(m.group(2)) > 59:
+                await update.message.reply_text("مدت‌زمان معتبر نیست. نمونه درست: 3:21")
+                return
+            seconds = int(m.group(1))*60 + int(m.group(2))
+            if waiting == "albumsummary:add_duration":
+                context.user_data["albumsummary_new"]["duration"] = seconds
+                context.user_data["waiting"] = "albumsummary:add_artist"
+                await update.message.reply_text("نام هنرمند یا هنرمندان را بفرست:")
+            else:
+                entries[context.user_data["albumsummary_position"]-1]["duration"] = seconds
+                context.user_data["waiting"] = "albumsummary:edit_artist"
+                await update.message.reply_text("نام هنرمندان را بفرست:")
+            return
+        if waiting == "albumsummary:add_artist":
+            new = context.user_data.pop("albumsummary_new", {})
+            new["artist"] = value
+            new.setdefault("duration", 0)
+            pos = context.user_data.pop("albumsummary_position")
+            entries.insert(pos-1, new)
+            context.user_data["waiting"] = None
+            await show_album_summary_draft(update.message, context)
+            return
+        if waiting == "albumsummary:edit_title":
+            entries[context.user_data["albumsummary_position"]-1]["title"] = value
+            context.user_data["waiting"] = "albumsummary:edit_duration"
+            await update.message.reply_text("مدت‌زمان جدید را به شکل دقیقه:ثانیه بفرست:")
+            return
+        if waiting == "albumsummary:edit_artist":
+            entries[context.user_data["albumsummary_position"]-1]["artist"] = value
+            context.user_data["waiting"] = None
+            await show_album_summary_draft(update.message, context)
+            return
     if waiting == "archive_manifest":
         import json
         try:
@@ -1321,7 +1396,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if waiting == "album_selected_value":
         key = context.user_data.get("album_selected_key")
         selected = set(context.user_data.get("album_selected", []))
-        tracks = [t for t in context.user_data.get("album_tracks", []) if t.get("index") in selected]
+        tracks = [t for t in context.user_data.get("album_tracks", []) if t.get("index") in selected and t.get("path") and os.path.isfile(t["path"])]
         allowed = {"artist", "albumartist", "album", "genre", "composer", "publisher", "year"}
         if key not in allowed or not tracks:
             context.user_data["waiting"] = None
@@ -1923,14 +1998,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         main_artists = context.user_data.get("main_artists", [])
         sort_album_tracks(tracks)
         for t in tracks:
-            p = t["path"]
+            p = t.get("path")
+            if not p or not os.path.isfile(p):
+                continue
             tags = get_tags(p)
             artist = tags.get("artist", "—")
-            set_tag(
-                p,
-                "albumartist",
-                " , ".join(main_artists) if main_artists else artist,
-            )
+            set_tag(p, "albumartist", " , ".join(main_artists) if main_artists else artist)
         # دیگر فایل جدید به آلبوم اضافه نشود
         context.user_data["album_mode"] = False
         await show_album_overview(query, context)
@@ -2041,7 +2114,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = query.from_user.id
         defaults = get_user_defaults(user_id)["album"]
         for t in tracks:
-            p = t["path"]
+            p = t.get("path")
+            if not p or not os.path.isfile(p):
+                continue
             apply_defaults_to_file(p, defaults, is_single=False)
             # کاور اصلی همین ترک رو برگردون
             if t.get("original_cover"):
@@ -2052,6 +2127,43 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "album:summary":
         await send_album_summary(query, context)
+        return
+
+    if data.startswith("albumsummary:"):
+        draft = context.user_data.get("album_summary_draft")
+        if not draft:
+            await query.message.reply_text("خلاصه فعالی برای ویرایش وجود ندارد. دوباره Album Summary را باز کن.")
+            return
+        action = data.split(":", 1)[1]
+        entries = draft.get("entries", [])
+        if action == "menu":
+            await show_album_summary_draft(query.message, context)
+        elif action == "add":
+            context.user_data["waiting"] = "albumsummary:add_position"
+            await query.message.reply_text(f"جایگاه آهنگ جدید را مشخص کن (۱ تا {len(entries)+1}):")
+        elif action == "edit":
+            if not entries:
+                await query.message.reply_text("فهرست آهنگ خالی است.")
+            else:
+                context.user_data["waiting"] = "albumsummary:edit_position"
+                await query.message.reply_text(f"شماره آهنگی را که می‌خواهی ویرایش کنی بفرست (۱ تا {len(entries)}):")
+        elif action == "delete":
+            if not entries:
+                await query.message.reply_text("فهرست آهنگ خالی است.")
+            else:
+                context.user_data["waiting"] = "albumsummary:delete_position"
+                await query.message.reply_text(f"شماره آهنگی را که می‌خواهی حذف کنی بفرست (۱ تا {len(entries)}):")
+        elif action == "confirm":
+            # Store only the edited summary text/data; never mutate MP3 tags or files.
+            context.user_data["album_summary_confirmed"] = dict(draft)
+            context.user_data["album_summary_draft"] = None
+            context.user_data["waiting"] = None
+            final_text = build_album_summary_text(entries, context.user_data.get("main_artists", []), draft.get("album_name", ""))
+            await query.message.reply_text("✅ خلاصه آلبوم نهایی شد:\n\n" + final_text, parse_mode=ParseMode.MARKDOWN)
+        elif action == "cancel":
+            context.user_data["album_summary_draft"] = None
+            context.user_data["waiting"] = None
+            await query.message.reply_text("ویرایش خلاصه لغو شد؛ اطلاعات اصلی آلبوم تغییری نکرد.")
         return
 
     if data == "album:save_all":
@@ -2286,6 +2398,8 @@ def _parse_track_disc(value):
 def sort_album_tracks(tracks):
     """Sort by disc number, then track number; unknown numbers remain at the end."""
     def key(item):
+        if not item.get("path") or not os.path.isfile(item.get("path", "")):
+            return (1, 1, 10**9, item.get("index", 10**9))
         tags = get_tags(item["path"])
         track_no, _ = _parse_track_disc(tags.get("track"))
         disc_no, _ = _parse_track_disc(tags.get("disc"))
@@ -2301,9 +2415,9 @@ def album_select_keyboard(tracks, selected):
     rows = []
     for t in tracks:
         idx = t["index"]
-        tags = get_tags(t["path"])
+        tags = get_tags(t["path"]) if t.get("path") and os.path.isfile(t["path"]) else {}
         mark = "☑️" if idx in selected else "⬜"
-        title = tags.get("title", "—")
+        title = tags.get("title", t.get("summary_title", "—"))
         rows.append([InlineKeyboardButton(f"{mark} {idx}. {title}"[:60], callback_data=f"album:select:{idx}")])
     rows.append([InlineKeyboardButton("✅ ادامه با انتخاب‌ها", callback_data="album:select_done")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="album:back")])
@@ -2328,6 +2442,9 @@ def _album_track_by_index(tracks, idx):
 def _album_missing_and_duplicates(tracks):
     missing, seen, duplicates = [], {}, []
     for t in tracks:
+        if not t.get("path") or not os.path.isfile(t["path"]):
+            missing.append(t)
+            continue
         tags = get_tags(t["path"])
         n, _ = _parse_track_disc(tags.get("track"))
         d, _ = _parse_track_disc(tags.get("disc"))
@@ -2349,26 +2466,20 @@ async def show_album_overview(query, context):
     text += f"Main Artists: {' , '.join(main_artists) if main_artists else '—'}\n"
     text += f"Total tracks: {len(tracks)}\n\n"
     for position, t in enumerate(tracks, 1):
-        tags = get_tags(t["path"])
-        # اسم فایل رو از روی آرتیست و عنوان بساز
-        fname = generate_filename(
-            tags.get("artist", ""), tags.get("title", ""), main_artists
-        )
-        text += (
-            f"{position}. {tags.get('title', '—')} — {tags.get('artist', '—')}\n"
-            f"   📁 {fname}\n"
-        )
+        if t.get("path") and os.path.isfile(t["path"]):
+            tags = get_tags(t["path"])
+            title, artist = tags.get("title", "—"), tags.get("artist", "—")
+            fname = generate_filename(artist, title, main_artists)
+            extra = f"   📁 {fname}\n"
+        else:
+            title, artist = t.get("summary_title") or Path(t.get("original_name", "track")).stem, t.get("summary_artist", "—")
+            extra = "   ⚠️ فقط اطلاعات تلگرام؛ فایل دانلود نشده\n"
+        text += f"{position}. {title} — {artist}\n" + extra
 
     buttons = []
     for position, t in enumerate(tracks, 1):
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    f"✏️ Edit Track {position}",
-                    callback_data=f"album:edit:{t['index']}",
-                )
-            ]
-        )
+        if t.get("path") and os.path.isfile(t["path"]):
+            buttons.append([InlineKeyboardButton(f"✏️ Edit Track {position}", callback_data=f"album:edit:{t['index']}")])
     buttons.append(
         [InlineKeyboardButton("📌 Apply Default Tags (Album)", callback_data="album:defaults")]
     )
@@ -2391,50 +2502,90 @@ async def show_album_overview(query, context):
     )
 
 
-async def send_album_summary(query, context):
-    tracks = context.user_data.get("album_tracks", [])
-    main_artists = context.user_data.get("main_artists", [])
+def build_album_summary_text(entries, main_artists, album_name):
     all_artists = set()
-    album_names = []
     total_duration = 0
     lines = []
-    for t in tracks:
-        tags = get_tags(t["path"])
-        album_name = (tags.get("album", "") or "").strip()
-        if album_name and album_name != "—" and album_name not in album_names:
-            album_names.append(album_name)
-        try:
-            audio = MP3(t["path"])
-            dur = int(audio.info.length)
-            total_duration += dur
-            dur_str = f"{dur // 60}:{dur % 60:02d}"
-        except Exception:
-            dur_str = "unavailable"
-        arts = split_artists(tags.get("artist", ""))
-        for a in arts:
-            all_artists.add(a)
-        lines.append(
-            f"{t['index']}. {tags.get('title', '—')} ({dur_str}) — {tags.get('artist', '—')}"
-        )
-
-    text = (
+    for i, item in enumerate(entries, 1):
+        title = str(item.get("title") or "—").strip()
+        artist = str(item.get("artist") or "—").strip()
+        duration = int(item.get("duration") or 0)
+        total_duration += duration
+        for artist_name in split_artists(artist):
+            if artist_name and artist_name != "—": all_artists.add(artist_name)
+        dtext = f"{duration // 60}:{duration % 60:02d}" if duration else "unavailable"
+        suffix = " ⚠️" if item.get("downloaded") is False else ""
+        lines.append(f"{i}. {title} ({dtext}) — {artist}{suffix}")
+    return (
         "📊 **Album Summary**\n\n"
-        f"Album Artist(s): {' , '.join(main_artists) if main_artists else 'unavailable'}\n"
-        f"Album Name: {' / '.join(album_names) if album_names else 'unavailable'}\n"
+        f"Album Artist(s): {', '.join(main_artists) if main_artists else 'unavailable'}\n"
+        f"Album Name: {album_name or 'unavailable'}\n"
         f"Number of main album artists: {len(main_artists)}\n"
         f"Number of unique artists across all tracks: {len(all_artists)}\n"
-        f"Total number of tracks: {len(tracks)}\n"
+        f"Total number of tracks: {len(entries)}\n"
         f"Total album duration: {total_duration // 60}:{total_duration % 60:02d}\n\n"
         "Track list:\n" + "\n".join(lines)
     )
-    await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+def album_summary_entries(context):
+    entries = []
+    for t in context.user_data.get("album_tracks", []):
+        if t.get("path") and os.path.isfile(t["path"]):
+            tags = get_tags(t["path"])
+            try: duration = int(MP3(t["path"]).info.length)
+            except Exception: duration = int(t.get("original_duration") or 0)
+            entries.append({"title": tags.get("title", "—"), "artist": tags.get("artist", "—"), "duration": duration, "downloaded": True})
+        else:
+            entries.append({"title": t.get("summary_title") or Path(t.get("original_name", "track")).stem, "artist": t.get("summary_artist", "—"), "duration": int(t.get("summary_duration") or 0), "downloaded": False})
+    return entries
+
+
+async def send_album_summary(query, context):
+    tracks = context.user_data.get("album_tracks", [])
+    if not tracks:
+        await query.message.reply_text("هنوز ترکی برای خلاصه آلبوم وجود ندارد.")
+        return
+    confirmed = context.user_data.get("album_summary_confirmed")
+    if confirmed:
+        entries = [dict(x) for x in confirmed.get("entries", [])]
+        album_name = confirmed.get("album_name", "")
+    else:
+        entries = album_summary_entries(context)
+        album_names = []
+        for t in tracks:
+            if t.get("path") and os.path.isfile(t["path"]):
+                name = (get_tags(t["path"]).get("album", "") or "").strip()
+                if name and name != "—" and name not in album_names: album_names.append(name)
+        album_name = " / ".join(album_names)
+    context.user_data["album_summary_draft"] = {"entries": entries, "album_name": album_name}
+    text = build_album_summary_text(entries, context.user_data.get("main_artists", []), " / ".join(album_names))
+    await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ ویرایش خلاصه آلبوم", callback_data="albumsummary:menu")],
+        [InlineKeyboardButton("🔙 بازگشت به آلبوم", callback_data="album:back")],
+    ]))
+
+
+async def show_album_summary_draft(message, context):
+    draft = context.user_data.get("album_summary_draft") or {}
+    entries = draft.get("entries", [])
+    text = build_album_summary_text(entries, context.user_data.get("main_artists", []), draft.get("album_name", ""))
+    await message.reply_text(text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن آهنگ", callback_data="albumsummary:add")],
+        [InlineKeyboardButton("✏️ ویرایش آهنگ موجود", callback_data="albumsummary:edit")],
+        [InlineKeyboardButton("🗑 حذف آهنگ", callback_data="albumsummary:delete")],
+        [InlineKeyboardButton("✅ تأیید و ثبت خلاصه", callback_data="albumsummary:confirm")],
+        [InlineKeyboardButton("↩️ لغو ویرایش", callback_data="albumsummary:cancel")],
+    ]))
 
 
 async def save_album_all(query, context):
     tracks = context.user_data.get("album_tracks", [])
     main_artists = context.user_data.get("main_artists", [])
     for t in tracks:
-        path = t["path"]
+        path = t.get("path")
+        if not path or not os.path.isfile(path):
+            continue
         tags = get_tags(path)
         filename = generate_filename(
             tags.get("artist", ""), tags.get("title", ""), main_artists

@@ -4,7 +4,7 @@ import ast
 ROOT = Path(__file__).parent
 source = (ROOT / "bot.py").read_text(encoding="utf-8")
 ast.parse(source)
-assert 'VERSION = "v4.3"' in source
+assert 'VERSION = "v4.5.0"' in source
 assert 'callback_data="action:unreleased"' in source
 assert 'if data == "action:unreleased":' in source
 assert 'set_tag(path, "album", "Unreleased Track")' in source
