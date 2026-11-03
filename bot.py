@@ -40,7 +40,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.3"
+VERSION = "v4.4"
 VERSION_CHANGES = [
     "مدیریت کاور پیش‌فرض Unreleased Track",
     "انتخاب بین جایگزینی کاور، حفظ کاور فعلی یا لغو عملیات",
@@ -55,6 +55,9 @@ VERSION_CHANGES = [
     "جابه‌جایی دستی ترک‌ها در فهرست آلبوم",
     "فیلتر ترک‌های دارای تگ ناقص یا شماره تکراری",
     "کپی فیلدهای انتخابی از یک ترک به ترک‌های انتخاب‌شده",
+    "نمایش نام آلبوم در ابتدای Album Summary",
+    "گزارش نام فایل و شماره تلاش هنگام شکست دریافت یا خواندن فایل",
+    "تفکیک خطاهای ارتباط با تلگرام از فایل خراب یا فرمت نامعتبر",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -866,6 +869,29 @@ async def archive_show_list(query, context):
     rows.append([InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")])
     await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
+# ==================== گزارش خطاهای دریافت فایل ====================
+def explain_media_error(exc, stage):
+    """Return a safe, user-friendly reason without exposing raw server details."""
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    if stage == "download":
+        if any(x in name or x in msg for x in ("timedout", "network", "connection", "timeout", "temporarily", "server")):
+            return "خطای ارتباط با تلگرام یا سرور هنگام دانلود؛ ممکن است اتصال قطع شده یا سرور موقتاً پاسخ نداده باشد."
+        if any(x in name or x in msg for x in ("badrequest", "file_id", "file is too big", "not found")):
+            return "تلگرام نتوانست فایل را با شناسه ارسالی تحویل دهد؛ ممکن است فایل در دسترس نباشد یا لینک دانلود معتبر نباشد."
+        return "دانلود از تلگرام کامل نشد؛ احتمال خطای موقت شبکه یا سرور وجود دارد."
+    if any(x in msg for x in ("not a mp3", "invalid frame", "header missing", "no mpeg", "file format", "unsupported")) or "mutagenerror" in name:
+        return "فایل MP3 معتبر نیست، خراب است یا ساختار صوتی آن قابل‌خواندن نیست."
+    if "permission" in name or "permission" in msg or "no space" in msg:
+        return "خطای ذخیره‌سازی روی سرور ربات (مجوز دسترسی یا فضای ذخیره‌سازی)."
+    return "فایل دانلود شد، اما هنگام بازکردن یا خواندن اطلاعات صوتی خطا رخ داد؛ ممکن است فایل خراب یا کدگذاری آن ناسازگار باشد."
+
+
+def failed_media_message(label, exc, stage):
+    return (f"❌ دریافت/خواندن فایل ناموفق بود.\n"
+            f"🎵 فایل: {label}\n"
+            f"🔎 علت احتمالی: {explain_media_error(exc, stage)}")
+
 # ==================== دریافت فایل و متن ====================
 async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -884,9 +910,11 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         temp_dir = tempfile.mkdtemp(prefix="music_summary_")
         temp_path = os.path.join(temp_dir, "summary_track.mp3")
+        stage = "download"
         try:
             tg_file = await context.bot.get_file(document.file_id)
             await tg_file.download_to_drive(temp_path)
+            stage = "read"
             tags = get_tags(temp_path)
             title = tags.get("title", "—")
             artist = tags.get("artist", "—")
@@ -904,8 +932,9 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان و ساخت خلاصه", callback_data="summary:finish")]])
             )
         except Exception as exc:
-            print("summary intake error:", exc)
-            await message.reply_text("خواندن تگ‌های این فایل ناموفق بود؛ فایل MP3 دیگری بفرست.")
+            print("summary intake error:", repr(exc))
+            label = file_name or f"آهنگ شماره {len((context.user_data.get('summary_session') or {}).get('tracks', [])) + 1}"
+            await message.reply_text(failed_media_message(label, exc, stage) + "\nفایل دیگری بفرست.")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
         return
@@ -994,16 +1023,25 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # حالت آلبوم
     if context.user_data.get("album_mode"):
         folder = context.user_data["album_folder"]
+        attempt = context.user_data.get("album_receive_attempt", 0) + 1
+        context.user_data["album_receive_attempt"] = attempt
         idx = len(context.user_data["album_tracks"]) + 1
-        path = os.path.join(folder, f"track_{idx:02d}.mp3")
+        path = os.path.join(folder, f"track_{attempt:02d}.mp3")
+        stage = "download"
         try:
             tg_file = await context.bot.get_file(document.file_id)
             await tg_file.download_to_drive(path)
+            stage = "read"
             mt_load(path)  # فقط برای اطمینان از معتبر بودن فایل
             MP3(path)
         except Exception as e:
-            print("Album download error:", e)
-            await message.reply_text("دریافت فایل ناموفق بود.")
+            print("Album download/read error:", repr(e))
+            try:
+                if os.path.exists(path): os.remove(path)
+            except OSError:
+                pass
+            label = name or f"فایل ارسالی شماره {attempt}"
+            await message.reply_text(failed_media_message(label, e, stage))
             return
 
         # کاور و زمان اصلی این ترک رو ذخیره کن
@@ -1049,15 +1087,18 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     folder = tempfile.mkdtemp(prefix="musicbot_")
     path = os.path.join(folder, "original.mp3")
 
+    stage = "download"
     try:
         tg_file = await context.bot.get_file(document.file_id)
         await tg_file.download_to_drive(path)
+        stage = "read"
         mt_load(path)
         MP3(path)
     except Exception as e:
         shutil.rmtree(folder, ignore_errors=True)
-        print("Audio download error:", e)
-        await message.reply_text("دریافت یا خواندن فایل MP3 ناموفق بود.")
+        print("Audio download/read error:", repr(e))
+        label = name or "نام فایل مشخص نیست"
+        await message.reply_text(failed_media_message(label, e, stage))
         return
 
     context.user_data["path"] = path
@@ -2294,10 +2335,14 @@ async def send_album_summary(query, context):
     tracks = context.user_data.get("album_tracks", [])
     main_artists = context.user_data.get("main_artists", [])
     all_artists = set()
+    album_names = []
     total_duration = 0
     lines = []
     for t in tracks:
         tags = get_tags(t["path"])
+        album_name = (tags.get("album", "") or "").strip()
+        if album_name and album_name != "—" and album_name not in album_names:
+            album_names.append(album_name)
         try:
             audio = MP3(t["path"])
             dur = int(audio.info.length)
@@ -2315,6 +2360,7 @@ async def send_album_summary(query, context):
     text = (
         "📊 **Album Summary**\n\n"
         f"Album Artist(s): {' , '.join(main_artists) if main_artists else 'unavailable'}\n"
+        f"Album Name: {' / '.join(album_names) if album_names else 'unavailable'}\n"
         f"Number of main album artists: {len(main_artists)}\n"
         f"Number of unique artists across all tracks: {len(all_artists)}\n"
         f"Total number of tracks: {len(tracks)}\n"

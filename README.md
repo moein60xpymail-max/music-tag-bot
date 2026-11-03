@@ -1,26 +1,8 @@
-# Music Tag Bot v4.3
+# Music Tag Bot v4.4
 
-## تغییرات نسخه 4.3
-- اضافه‌شدن بخش مستقل `Album Tools` برای ابزارهای مدیریت آلبوم.
-- شماره‌گذاری مجدد ترک‌ها از شماره شروع دلخواه، با مرحله تأیید قبل از نوشتن تگ‌ها.
-- تنظیم شماره دیسک برای تمام ترک‌های آلبوم، با پشتیبان‌گیری و بازگردانی در صورت خطا.
-- جابه‌جایی دستی ترک‌ها در ترتیب فهرست آلبوم با فلش‌های بالا و پایین.
-- بررسی ترک‌های بدون شماره و شماره‌های تکراری.
-- کپی فیلدهای انتخابی از یک ترک مبدأ به ترک‌های مقصد انتخاب‌شده.
+## Changes in v4.4
+- Album Summary now displays Album Name below Album Artist(s). If multiple distinct album names exist in the received tracks, all are shown.
+- Failed audio intake now reports the filename (or attempt number fallback) and a categorized likely cause: Telegram/network delivery, unavailable file reference, invalid/corrupt MP3, or local storage/read failure.
+- Album intake attempt numbers advance even when a file fails, so a failure can be identified without confusing it with the count of successfully received tracks.
 
-## قابلیت‌های حفظ‌شده از نسخه 4.2
-- مرتب‌سازی خودکار بر اساس شماره دیسک و شماره ترک پس از `Finish Uploading`.
-- ویرایش گروهی فیلدهای تگ برای ترک‌های انتخاب‌شده.
-
-## نسخه‌های قبلی
-- v4.1.1: مدیریت کاور Unreleased Track در منوی فرمان‌های تلگرام با `/unreleasedcover`.
-- v4.1: مدیریت کاور پیش‌فرض Unreleased Track.
-
-## نصب
-محتویات پوشه `v36work` را با حفظ ساختار فایل‌ها در ریشه مخزن GitHub قرار دهید و سرویس را Redeploy کنید.
-
-## متغیرهای محیطی
-- `BOT_TOKEN`: توکن ربات تلگرام
-- `DATA_DIR`: مسیر اختیاری داده‌ها (پیش‌فرض `data`)
-
-فرمان اجرا: `python bot.py`.
+Run with `python bot.py`. Keep existing environment variables unchanged.
