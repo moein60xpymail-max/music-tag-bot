@@ -1,4 +1,5 @@
 import os
+import asyncio
 import re
 import json
 import shutil
@@ -30,17 +31,68 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ParseMode
+from telegram.error import BadRequest, TimedOut, NetworkError, TelegramError
+from telegram.request import HTTPXRequest
 
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, ID3NoHeaderError, TPUB, APIC
 from music_tag import load_file as mt_load
+
+# ==================== پایداری ارتباط و ارسال پیام ====================
+def install_telegram_resilience():
+    """Retry malformed-entity messages as plain text instead of losing them."""
+    from telegram import Bot
+    for method_name in ("send_message", "send_photo", "send_audio", "send_document", "edit_message_text", "edit_message_caption"):
+        original = getattr(Bot, method_name)
+        async def resilient(self, *args, __original=original, __name=method_name, **kwargs):
+            try:
+                return await __original(self, *args, **kwargs)
+            except BadRequest as exc:
+                msg = str(exc).lower()
+                if "parse entities" not in msg and "can't find end of the entity" not in msg:
+                    raise
+                retry_kwargs = dict(kwargs)
+                retry_kwargs["parse_mode"] = None
+                retry_kwargs.pop("entities", None)
+                print(f"Telegram formatting fallback: {__name}: {exc}")
+                return await __original(self, *args, **retry_kwargs)
+        setattr(Bot, method_name, resilient)
+
+
+async def download_to_drive_retry(tg_file, custom_path, attempts=3):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await tg_file.download_to_drive(custom_path)
+        except (TimedOut, NetworkError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt == attempts:
+                raise
+            print(f"Telegram download retry {attempt}/{attempts-1}: {exc!r}")
+            await asyncio.sleep(attempt * 1.5)
+    raise last_error
+
+
+async def download_as_bytearray_retry(tg_file, attempts=3):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await tg_file.download_as_bytearray()
+        except (TimedOut, NetworkError, TimeoutError, OSError) as exc:
+            last_error = exc
+            if attempt == attempts:
+                raise
+            print(f"Telegram byte download retry {attempt}/{attempts-1}: {exc!r}")
+            await asyncio.sleep(attempt * 1.5)
+    raise last_error
+
 
 # ==================== تنظیمات ====================
 TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.4"
+VERSION = "v4.4.1"
 VERSION_CHANGES = [
     "مدیریت کاور پیش‌فرض Unreleased Track",
     "انتخاب بین جایگزینی کاور، حفظ کاور فعلی یا لغو عملیات",
@@ -58,6 +110,10 @@ VERSION_CHANGES = [
     "نمایش نام آلبوم در ابتدای Album Summary",
     "گزارش نام فایل و شماره تلاش هنگام شکست دریافت یا خواندن فایل",
     "تفکیک خطاهای ارتباط با تلگرام از فایل خراب یا فرمت نامعتبر",
+    "Retry محدود برای دانلود فایل هنگام خطاهای موقت شبکه",
+    "افزایش مهلت ارتباط با تلگرام برای دانلود و ارسال فایل‌های حجیم",
+    "ارسال مجدد پیام‌های دارای خطای Markdown/HTML بدون Parse Mode",
+    "پاسخ فوری به دکمه‌های اینلاین و ثبت جزئیات خطا برای عیب‌یابی",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -913,7 +969,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage = "download"
         try:
             tg_file = await context.bot.get_file(document.file_id)
-            await tg_file.download_to_drive(temp_path)
+            await download_to_drive_retry(tg_file, temp_path)
             stage = "read"
             tags = get_tags(temp_path)
             title = tags.get("title", "—")
@@ -966,7 +1022,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting") == "archive_manifest" and name.lower().endswith(".txt"):
         try:
             tg_file=await context.bot.get_file(document.file_id)
-            raw=await tg_file.download_as_bytearray()
+            raw=await download_as_bytearray_retry(tg_file)
             payload=bytes(raw).decode("utf-8-sig").split("---DATA---",1)[-1].strip()
             manifest=json.loads(payload)
             if manifest.get("format")!="archive-v1" or not isinstance(manifest.get("tracks"),list) or not manifest["tracks"]: raise ValueError()
@@ -1030,7 +1086,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stage = "download"
         try:
             tg_file = await context.bot.get_file(document.file_id)
-            await tg_file.download_to_drive(path)
+            await download_to_drive_retry(tg_file, path)
             stage = "read"
             mt_load(path)  # فقط برای اطمینان از معتبر بودن فایل
             MP3(path)
@@ -1090,7 +1146,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stage = "download"
     try:
         tg_file = await context.bot.get_file(document.file_id)
-        await tg_file.download_to_drive(path)
+        await download_to_drive_retry(tg_file, path)
         stage = "read"
         mt_load(path)
         MP3(path)
@@ -1140,7 +1196,7 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             ensure_data_dir()
             temp_path = DATA_DIR / "unreleased_track_cover.upload"
-            await tg_file.download_to_drive(str(temp_path))
+            await download_to_drive_retry(tg_file, str(temp_path))
             image_data = normalize_cover(temp_path.read_bytes())
             UNRELEASED_COVER_FILE.write_bytes(image_data)
             temp_path.unlink(missing_ok=True)
@@ -1172,7 +1228,7 @@ async def receive_picture(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     image_path = os.path.join(context.user_data["folder"], "new_cover")
     try:
-        await tg_file.download_to_drive(image_path)
+        await download_to_drive_retry(tg_file, image_path)
         with open(image_path, "rb") as f:
             image_data = f.read()
 
@@ -1450,7 +1506,11 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ==================== دکمه‌های اینلاین ====================
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    # Acknowledge before any potentially slow operation.
+    try:
+        await query.answer()
+    except TelegramError as callback_error:
+        print("Callback acknowledgement warning:", repr(callback_error))
     data = query.data
     path = context.user_data.get("path")
 
@@ -1464,10 +1524,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "unrel:replace":
         if not path or not os.path.exists(path):
-            await query.answer("فایل آهنگ در دسترس نیست.", show_alert=True)
+            await query.message.reply_text("فایل آهنگ در دسترس نیست.")
             return
         if not UNRELEASED_COVER_FILE.exists():
-            await query.answer("هنوز کاور پیش‌فرضی ثبت نشده است.", show_alert=True)
+            await query.message.reply_text("هنوز کاور پیش‌فرضی ثبت نشده است.")
             return
         try:
             image_data = normalize_cover(UNRELEASED_COVER_FILE.read_bytes())
@@ -1484,7 +1544,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if data == "unrel:keep":
         if not path or not os.path.exists(path):
-            await query.answer("فایل آهنگ در دسترس نیست.", show_alert=True)
+            await query.message.reply_text("فایل آهنگ در دسترس نیست.")
             return
         set_tag(path, "album", "Unreleased Track")
         await query.message.reply_text("✅ تگ Unreleased Track اعمال شد؛ کاور فعلی بدون تغییر ماند.")
@@ -1498,7 +1558,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = context.user_data.get("summary_session") or {}
         tracks = session.get("tracks", [])
         if not tracks:
-            await query.answer("هنوز هیچ آهنگی دریافت نشده است.", show_alert=True)
+            await query.message.reply_text("هنوز هیچ آهنگی دریافت نشده است.")
             return
         artist_counts = Counter(
             artist.strip() for track in tracks
@@ -1529,7 +1589,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("summary_session", None)
         context.user_data["waiting"] = None
         await query.message.reply_text("\n".join(lines), reply_markup=main_reply_keyboard())
-        await query.answer("خلاصه آماده شد.")
+        await query.message.reply_text("خلاصه آماده شد.")
         return
 
     if data.startswith("arch:"):
@@ -1618,7 +1678,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             queue = a.get("queue", [])
             idx = context.user_data.get("archive_current")
             if not isinstance(idx, int) or not (0 <= idx < len(queue)):
-                await query.answer("ترک فعال آرشیو پیدا نشد.", show_alert=True)
+                await query.message.reply_text("ترک فعال آرشیو پیدا نشد.")
                 return
             queue[idx]["status"] = "confirmed"
             await query.message.edit_reply_markup(
@@ -1628,16 +1688,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
                 ])
             )
-            await query.answer("این آهنگ تکمیل شد.")
+            await query.message.reply_text("این آهنگ تکمیل شد.")
             return
         if data == "arch:already_done":
-            await query.answer("این آهنگ قبلاً تأیید شده است.")
+            await query.message.reply_text("این آهنگ قبلاً تأیید شده است.")
             return
         if data == "arch:previous":
             queue = a.get("queue", [])
             idx = context.user_data.get("archive_current")
             if not isinstance(idx, int) or idx <= 0 or idx >= len(queue):
-                await query.answer("ترک قبلی وجود ندارد.", show_alert=True)
+                await query.message.reply_text("ترک قبلی وجود ندارد.")
                 return
             prev_idx = idx - 1
             item = queue[prev_idx]
@@ -1659,23 +1719,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
                 ])
             )
-            await query.answer("به آهنگ قبلی برگشتی.")
+            await query.message.reply_text("به آهنگ قبلی برگشتی.")
             return
         if data == "arch:skip_current":
             queue = a.get("queue", [])
             idx = context.user_data.get("archive_current")
             if not isinstance(idx, int) or not (0 <= idx < len(queue)):
-                await query.answer("ترک فعال آرشیو پیدا نشد.", show_alert=True)
+                await query.message.reply_text("ترک فعال آرشیو پیدا نشد.")
                 return
             queue[idx]["status"] = "skipped"
-            await query.answer("این ترک رد شد.")
+            await query.message.reply_text("این ترک رد شد.")
             data = "arch:open_next"
         if data == "arch:next":
             queue = a.get("queue", [])
             idx = context.user_data.get("archive_current")
             if isinstance(idx, int) and 0 <= idx < len(queue):
                 if queue[idx].get("status") != "confirmed":
-                    await query.answer("اول دکمهٔ «این آهنگ تموم شد» را بزن.", show_alert=True)
+                    await query.message.reply_text("اول دکمهٔ «این آهنگ تموم شد» را بزن.")
                     return
             data = "arch:open_next"
         if data == "arch:open_next":
@@ -1755,7 +1815,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current["_disabled"] = sorted(disabled)
         save_all_defaults(all_data)
         status = "روشن شد" if key not in disabled else "خاموش شد"
-        await query.answer(f"{FIELDS.get(key, key)} {status}")
+        await query.message.reply_text(f"{FIELDS.get(key, key)} {status}")
         lines = [f"• {FIELDS.get(k, k)}: `{v}` — {'خاموش' if k in disabled else 'روشن'}" for k, v in current.items() if not k.startswith("_")]
         await query.message.edit_text("⚙️ تنظیم تگ‌های پیش‌فرض\n\n" + "\n".join(lines) + "\n\nبرای خاموش/روشن‌کردن هر فیلد، دکمه وضعیت آن را بزن؛ برای تغییر مقدار، دکمه ویرایش را انتخاب کن:", reply_markup=defaults_fields_keyboard(mode, current), parse_mode=ParseMode.MARKDOWN)
         return
@@ -1851,7 +1911,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "albumtools:noop":
-        await query.answer()
+        await query.message.reply_text()
         return
 
     # ---------- حالت آلبوم ----------
@@ -1894,7 +1954,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "album:select_done":
         selected = context.user_data.get("album_selected", [])
         if not selected:
-            await query.answer("حداقل یک ترک را انتخاب کن.", show_alert=True)
+            await query.message.reply_text("حداقل یک ترک را انتخاب کن.")
             return
         if context.user_data.pop("albumtools_copy_mode", False):
             source = _album_track_by_index(context.user_data.get("album_tracks", []), context.user_data.get("albumtools_copy_source"))
@@ -1944,7 +2004,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "action:unreleased":
         if not path or not os.path.exists(path):
-            await query.answer("اول یک آهنگ را باز کن.", show_alert=True)
+            await query.message.reply_text("اول یک آهنگ را باز کن.")
             return
         has_cover = UNRELEASED_COVER_FILE.exists()
         rows = []
@@ -1962,7 +2022,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     if data == "unrel:no_cover":
-        await query.answer("ابتدا از منوی مدیریت کاور، یک تصویر پیش‌فرض ثبت کن.", show_alert=True)
+        await query.message.reply_text("ابتدا از منوی مدیریت کاور، یک تصویر پیش‌فرض ثبت کن.")
         return
 
     if data == "album:all":
@@ -2419,7 +2479,9 @@ async def save_album_all(query, context):
 
 
 async def error_handler(update, context):
-    print("BOT ERROR:", context.error)
+    import traceback
+    print("BOT ERROR:", repr(context.error))
+    traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
 
 
 def main():
@@ -2441,7 +2503,17 @@ def main():
             BotCommand("cancel", "❌ لغو عملیات فعلی"),
         ])
 
-    app = Application.builder().token(TOKEN).post_init(post_init).build()
+    request = HTTPXRequest(
+        connection_pool_size=20, connect_timeout=30, read_timeout=90,
+        write_timeout=90, pool_timeout=30,
+    )
+    updates_request = HTTPXRequest(
+        connection_pool_size=8, connect_timeout=30, read_timeout=60,
+        write_timeout=60, pool_timeout=30,
+    )
+    install_telegram_resilience()
+    app = (Application.builder().token(TOKEN).request(request)
+           .get_updates_request(updates_request).post_init(post_init).build())
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("single", single_mode_command))
