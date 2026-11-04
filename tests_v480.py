@@ -5,7 +5,7 @@ ROOT = Path(__file__).parent
 source = (ROOT / "bot.py").read_text(encoding="utf-8")
 tree = ast.parse(source)
 
-assert 'VERSION = "v4.8.0"' in source
+assert 'VERSION = "v4.8.1"' in source
 assert 'await clear_active_prompt(update, context)' in source
 assert '"comment": "comment"' in source
 assert 'callback_data="field:comment"' in source

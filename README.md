@@ -1,4 +1,10 @@
-# Music Tag Bot — v4.8.0
+# Music Tag Bot — v4.8.1
+
+## v4.8.1 changes
+- Requires every user to join the public Telegram channel `@Nistplay` before using any bot command, callback, or file-processing flow.
+- Adds a Join Channel button and a “I Joined” recheck button. Membership is checked with Telegram `getChatMember` on every incoming update; users who leave are blocked on their next interaction.
+- The bot must remain an administrator in `@Nistplay` so Telegram can reliably report other users’ membership. If Telegram cannot verify membership, access is denied temporarily rather than bypassing the gate.
+
 
 ## v4.8.0 changes
 - Adds the ID3 Comment field to the single-track editor and album-track editor.

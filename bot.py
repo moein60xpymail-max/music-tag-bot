@@ -30,6 +30,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    TypeHandler,
+    ApplicationHandlerStop,
 )
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TimedOut, NetworkError, TelegramError
@@ -93,8 +95,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.8.0"
+VERSION = "v4.8.1"
 VERSION_CHANGES = [
+    "افزودن عضویت اجباری در کانال @Nistplay برای تمام کاربران و تمام مسیرهای استفاده از ربات",
     "افزودن ویرایش Comment به حالت آهنگ تکی، آلبوم و آرشیو",
     "افزودن Comment به Apply to All، Group Edit، کپی تگ‌ها و تگ‌های پیش‌فرض",
     "نمایش Comment هر ترک در Album Summary و حفظ آن هنگام ذخیره و ارسال",
@@ -2908,6 +2911,79 @@ async def save_album_all(query, context):
     )
 
 
+# ==================== عضویت اجباری کانال ====================
+REQUIRED_CHANNEL = "@Nistplay"
+REQUIRED_CHANNEL_URL = "https://t.me/Nistplay"
+
+
+def membership_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 عضویت در کانال", url=REQUIRED_CHANNEL_URL)],
+        [InlineKeyboardButton("✅ عضو شدم", callback_data="membership:check")],
+    ])
+
+
+async def membership_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Block every user-facing update until the user joins the required channel."""
+    user = update.effective_user
+    if user is None:
+        return
+
+    query = update.callback_query
+    is_member = False
+    check_error = None
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id=REQUIRED_CHANNEL,
+            user_id=user.id,
+        )
+        status = getattr(member, "status", "")
+        is_member = status in ("member", "administrator", "creator") or (
+            status == "restricted" and bool(getattr(member, "is_member", False))
+        )
+    except TelegramError as exc:
+        check_error = exc
+        print(f"Required-channel membership check failed for {user.id}: {exc!r}")
+
+    if is_member:
+        if query and query.data == "membership:check":
+            await query.answer("عضویت شما تأیید شد ✅")
+            if query.message:
+                await query.message.reply_text(
+                    "✅ عضویت شما تأیید شد. حالا می‌تونی از ربات استفاده کنی.",
+                    reply_markup=main_reply_keyboard(),
+                )
+            raise ApplicationHandlerStop
+        return
+
+    if query:
+        await query.answer(
+            "ابتدا باید عضو کانال شوید." if not check_error
+            else "بررسی عضویت فعلاً ممکن نیست؛ کمی بعد دوباره تلاش کن.",
+            show_alert=True,
+        )
+        if query.message:
+            await query.message.reply_text(
+                "🔒 برای استفاده از ربات، ابتدا عضو کانال زیر شو و سپس «عضو شدم» را بزن.\n\n"
+                + ("⚠️ در حال حاضر بررسی عضویت با خطا مواجه شده؛ بعداً دوباره تلاش کن."
+                   if check_error else ""),
+                reply_markup=membership_keyboard(),
+            )
+    elif update.effective_message:
+        message = (
+            "🔒 برای استفاده از ربات، ابتدا عضو کانال زیر شو و سپس «عضو شدم» را بزن."
+            if not check_error else
+            "⚠️ در حال حاضر امکان بررسی عضویت وجود ندارد. کمی بعد دوباره تلاش کن."
+        )
+        await update.effective_message.reply_text(
+            message,
+            reply_markup=membership_keyboard(),
+        )
+
+    # Stop processing this update so no command, callback, or file handler can run.
+    raise ApplicationHandlerStop
+
+
 async def error_handler(update, context):
     import traceback
     print("BOT ERROR:", repr(context.error))
@@ -2944,6 +3020,8 @@ def main():
     install_telegram_resilience()
     app = (Application.builder().token(TOKEN).request(request)
            .get_updates_request(updates_request).post_init(post_init).build())
+
+    app.add_handler(TypeHandler(Update, membership_gate), group=-1)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("single", single_mode_command))

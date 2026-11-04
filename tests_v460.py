@@ -3,7 +3,7 @@ import ast
 s=Path('bot.py').read_text(encoding='utf-8')
 ast.parse(s)
 checks=[
- 'VERSION = "v4.8.0"',
+ 'VERSION = "v4.8.1"',
  'PROGRESS_UPDATE_INTERVAL = 3.0',
  'PROGRESS_IDLE_TIMEOUT = 6.0',
  'async def _progress_idle_finish(context, operation, state):',
