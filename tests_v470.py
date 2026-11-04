@@ -4,7 +4,7 @@ import ast
 ROOT = Path(__file__).parent
 source = (ROOT / "bot.py").read_text(encoding="utf-8")
 ast.parse(source)
-assert 'VERSION = "v4.8.1"' in source
+assert 'VERSION = "v4.8.2"' in source
 assert "async def send_temporary_prompt" in source
 assert "async def clear_active_prompt" in source
 assert "active_prompt_message_id" in source

@@ -1,4 +1,9 @@
-# Music Tag Bot — v4.8.1
+# Music Tag Bot — v4.8.2
+
+## v4.8.2 changes
+- Removes Comment from the single-track editor information summary and Album Summary output; the Comment field remains editable and is still saved normally.
+- Album Mode track overview now displays each track's Album tag alongside its title, artist, and generated filename.
+- Track-selection buttons also include the Album tag for easier verification.
 
 ## v4.8.1 changes
 - Requires every user to join the public Telegram channel `@Nistplay` before using any bot command, callback, or file-processing flow.

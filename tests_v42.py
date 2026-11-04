@@ -3,7 +3,7 @@ import ast
 ROOT = Path(__file__).parent
 source = (ROOT / "bot.py").read_text(encoding="utf-8")
 ast.parse(source)
-assert 'VERSION = "v4.8.1"' in source
+assert 'VERSION = "v4.8.2"' in source
 assert 'sort_album_tracks(tracks)' in source
 assert 'def sort_album_tracks(tracks):' in source
 assert 'callback_data="album:select_menu"' in source

@@ -95,7 +95,7 @@ TOKEN = os.getenv("BOT_TOKEN")
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v4.8.1"
+VERSION = "v4.8.2"
 VERSION_CHANGES = [
     "افزودن عضویت اجباری در کانال @Nistplay برای تمام کاربران و تمام مسیرهای استفاده از ربات",
     "افزودن ویرایش Comment به حالت آهنگ تکی، آلبوم و آرشیو",
@@ -691,7 +691,6 @@ def editor_text(path: str, filename: str = "—") -> str:
         f"Disc N: {tags['disc']}\n"
         f"Track N: {tags['track']}\n"
         f"Album Artist: {tags['albumartist']}\n"
-        f"Comment: {tags['comment']}\n"
         "----------------------\n"
         f"Bitrate: {bitrate} kbps\n"
         f"Sample Rate: {sample} Hz\n"
@@ -1202,6 +1201,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "path": None, "original_name": name, "index": idx,
                 "original_cover": None, "original_duration": duration,
                 "summary_title": title, "summary_artist": artist,
+                "summary_album": (getattr(audio_meta, "album", None) or "—").strip(),
                 "summary_duration": duration, "downloaded": False,
                 "file_size": document.file_size, "file_id": document.file_id,
             })
@@ -2697,7 +2697,8 @@ def album_select_keyboard(tracks, selected):
         tags = get_tags(t["path"]) if t.get("path") and os.path.isfile(t["path"]) else {}
         mark = "☑️" if idx in selected else "⬜"
         title = tags.get("title", t.get("summary_title", "—"))
-        rows.append([InlineKeyboardButton(f"{mark} {idx}. {title}"[:60], callback_data=f"album:select:{idx}")])
+        album = (tags.get("album", "—") if tags else t.get("summary_album", "—")) or "—"
+        rows.append([InlineKeyboardButton(f"{mark} {idx}. {title} · {album}"[:60], callback_data=f"album:select:{idx}")])
     rows.append([InlineKeyboardButton("✅ ادامه با انتخاب‌ها", callback_data="album:select_done")])
     rows.append([InlineKeyboardButton("🔙 بازگشت", callback_data="album:back")])
     return InlineKeyboardMarkup(rows)
@@ -2748,11 +2749,14 @@ async def show_album_overview(query, context):
         if t.get("path") and os.path.isfile(t["path"]):
             tags = get_tags(t["path"])
             title, artist = tags.get("title", "—"), tags.get("artist", "—")
+            album = (tags.get("album", "—") or "—").strip()
             fname = generate_filename(artist, title, main_artists)
-            extra = f"   📁 {fname}\n"
+            extra = f"   💿 Album: {album}\n   📁 {fname}\n"
         else:
-            title, artist = t.get("summary_title") or Path(t.get("original_name", "track")).stem, t.get("summary_artist", "—")
-            extra = "   ⚠️ فقط اطلاعات تلگرام؛ فایل دانلود نشده\n"
+            title = t.get("summary_title") or Path(t.get("original_name", "track")).stem
+            artist = t.get("summary_artist", "—")
+            album = t.get("summary_album", "—") or "—"
+            extra = f"   💿 Album: {album}\n   ⚠️ فقط اطلاعات تلگرام؛ فایل دانلود نشده\n"
         text += f"{position}. {title} — {artist}\n" + extra
 
     buttons = []
@@ -2795,9 +2799,7 @@ def build_album_summary_text(entries, main_artists, album_name):
             if artist_name and artist_name != "—": all_artists.add(artist_name)
         dtext = f"{duration // 60}:{duration % 60:02d}" if duration else "unavailable"
         suffix = " ⚠️" if item.get("downloaded") is False else ""
-        comment = str(item.get("comment") or "—").strip()
-        comment_line = f"\n   Comment: {comment}" if comment not in {"", "—"} else ""
-        lines.append(f"{i}. {title} ({dtext}) — {artist}{suffix}{comment_line}")
+        lines.append(f"{i}. {title} ({dtext}) — {artist}{suffix}")
     return (
         "📊 **Album Summary**\n\n"
         f"Album Artist(s): {', '.join(main_artists) if main_artists else 'unavailable'}\n"
@@ -2817,9 +2819,9 @@ def album_summary_entries(context):
             tags = get_tags(t["path"])
             try: duration = int(MP3(t["path"]).info.length)
             except Exception: duration = int(t.get("original_duration") or 0)
-            entries.append({"title": tags.get("title", "—"), "artist": tags.get("artist", "—"), "comment": tags.get("comment", "—"), "duration": duration, "downloaded": True})
+            entries.append({"title": tags.get("title", "—"), "artist": tags.get("artist", "—"), "duration": duration, "downloaded": True})
         else:
-            entries.append({"title": t.get("summary_title") or Path(t.get("original_name", "track")).stem, "artist": t.get("summary_artist", "—"), "comment": "—", "duration": int(t.get("summary_duration") or 0), "downloaded": False})
+            entries.append({"title": t.get("summary_title") or Path(t.get("original_name", "track")).stem, "artist": t.get("summary_artist", "—"), "duration": int(t.get("summary_duration") or 0), "downloaded": False})
     return entries
 
 
