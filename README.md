@@ -1,4 +1,14 @@
-# Music Tag Bot — v4.8.2
+# Music Tag Bot — v5.0.0 (Auto Forward Edition)
+
+## v5.0.0 changes
+- Adds Auto Forward to a destination channel for Single Track, Album, and Archive modes.
+- Destination channel is configured only by the bot owner (`OWNER_ID`) via `/setchannel` and stored in RAM only (`application.bot_data`); it does not survive a restart.
+- `/channelstatus` shows the current destination (if any).
+- Sends processed audio with `send_audio` (no original sender attribution, no original caption). Falls back to `send_document` only on clear audio-media errors; network/timeout/permission errors do not auto-fallback (avoids possible duplicates) and may be marked `unknown`.
+- Per-track status: `pending` / `sending` / `sent` / `failed` / `unknown`. Successful tracks are never re-sent. Failed tracks can be retried.
+- Album Mode: after Save All, user selects which tracks to forward; each selection is bound to the real output file path. Only `pending` and `failed` tracks are selectable.
+- Output files are kept until Auto Forward finishes; cleanup follows the existing bot lifecycle.
+- No test message is posted to the channel when configuring it.
 
 ## v4.8.2 changes
 - Removes Comment from the single-track editor information summary and Album Summary output; the Comment field remains editable and is still saved normally.
