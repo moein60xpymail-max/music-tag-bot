@@ -93,18 +93,28 @@ async def download_as_bytearray_retry(tg_file, attempts=3):
 # ==================== تنظیمات ====================
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
+def _parse_admin_ids(raw: str):
+    ids = set()
+    for part in (raw or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            pass
+    return ids
+ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v5.0.0"
+VERSION = "v5.1.0"
 VERSION_CHANGES = [
-    "افزودن قابلیت Auto Forward به کانال مقصد (Single، Album و Archive)",
-    "پیکربندی کانال مقصد فقط توسط مالک ربات و فقط در حافظه (بدون دیتابیس)",
-    "ارسال به‌صورت Telegram Audio بدون نمایش فرستنده اصلی و بدون کپشن اصلی",
-    "Fallback هوشمند به Document فقط برای خطاهای مرتبط با نوع رسانه",
-    "مدیریت وضعیت مستقل هر ترک: pending / sending / sent / failed / unknown",
-    "انتخاب دستی ترک‌های آلبوم با اتصال به فایل خروجی واقعی و جلوگیری از ارسال تکراری",
-    "امکان تلاش مجدد فقط برای ترک‌های ناموفق در Album Mode",
+    "Archive Mode: انتخاب نقطه شروع (از ابتدا یا از شماره دلخواه)",
+    "Default Tags: سه حالت Apply / Keep / Remove و گسترش فیلدها",
+    "حذف واقعی تگ در حالت Remove بدون آسیب به کاور و سایر تگ‌ها",
+    "Auto Forward محدود به مالک و ادمین‌های ADMIN_IDS",
+    "پشتیبانی از دو کانال مقصد مستقل (Main و Full Archive)",
+    "وضعیت ارسال مستقل per-channel و جلوگیری از ارسال تکراری در هر کانال",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -140,23 +150,41 @@ MT_KEYS = {
     "comment": "comment",
 }
 
+# Values used when mode is "apply". Modes stored in defaults["_modes"][field] = apply|keep|remove
 DEFAULT_SINGLE = {
-    "disc": "1",
-    "track": "0",
+    "title": "",
+    "artist": "",
+    "albumartist": "",
+    "album": "Single Track",
+    "genre": "",
     "year": "2026",
     "composer": "@nistplay",
     "publisher": "eM Nine Collection",
-    "album": "Single Track",
     "comment": "",
+    "lyrics": "",
+    "disc": "1",
+    "track": "0",
 }
 
 DEFAULT_ALBUM = {
-    "disc": "1",
+    "title": "",
+    "artist": "",
+    "albumartist": "",
+    "album": "",
+    "genre": "",
     "year": "2026",
     "composer": "@nistplay",
     "publisher": "eM Nine Collection",
     "comment": "",
+    "lyrics": "",
+    "disc": "1",
+    "track": "",
 }
+
+DEFAULT_FIELD_ORDER = [
+    "title", "artist", "albumartist", "album", "genre", "year",
+    "composer", "publisher", "comment", "lyrics", "disc", "track",
+]
 
 
 # ==================== ذخیره پیش‌فرض‌ها ====================
@@ -520,21 +548,57 @@ def generate_filename(
     return sanitize_filename(f"{artist_part} - {title}")
 
 
+def _default_mode(defaults: Dict[str, Any], key: str) -> str:
+    """Return apply|keep|remove for a field. Legacy _disabled maps to keep."""
+    if not isinstance(defaults, dict):
+        return "apply"
+    modes = defaults.get("_modes") or {}
+    if key in modes:
+        mode = str(modes[key]).lower()
+        if mode in ("apply", "keep", "remove"):
+            return mode
+    disabled = set(defaults.get("_disabled", []))
+    if key in disabled:
+        return "keep"
+    return "apply"
+
+
 def apply_defaults_to_file(
-    path: str, defaults: Dict[str, str], is_single: bool = True
+    path: str, defaults: Dict[str, Any], is_single: bool = True
 ):
-    disabled = set(defaults.get("_disabled", [])) if isinstance(defaults, dict) else set()
-    for key, value in defaults.items():
-        if key.startswith("_") or key in disabled or value in (None, ""):
+    if not isinstance(defaults, dict):
+        return
+    for key in DEFAULT_FIELD_ORDER:
+        if key not in defaults and key not in (defaults.get("_modes") or {}):
+            # still honor remove/keep if only mode is set
+            modes = defaults.get("_modes") or {}
+            if key not in modes:
+                continue
+        mode = _default_mode(defaults, key)
+        if mode == "keep":
+            continue
+        if mode == "remove":
+            try:
+                delete_tag(path, key)
+            except Exception as exc:
+                print("apply_defaults remove error", key, exc)
+            continue
+        # apply
+        value = defaults.get(key, "")
+        if value in (None, ""):
             continue
         if key == "albumartist" and is_single:
             continue
         set_tag(path, key, value)
     if is_single:
-        if "album" not in disabled and defaults.get("album") not in (None, ""):
-            set_tag(path, "album", defaults.get("album", "Single Track"))
-        # در حالت تک‌آهنگ، Album Artist را حذف کن
-        delete_tag(path, "albumartist")
+        # legacy behavior: single-track clears albumartist unless explicitly applied
+        if _default_mode(defaults, "albumartist") == "apply" and defaults.get("albumartist") not in (None, ""):
+            set_tag(path, "albumartist", defaults.get("albumartist"))
+        elif _default_mode(defaults, "albumartist") != "keep":
+            try:
+                delete_tag(path, "albumartist")
+            except Exception:
+                pass
 
 
 # ==================== دکمه‌ها ====================
@@ -646,19 +710,24 @@ def tag_config_keyboard() -> InlineKeyboardMarkup:
 
 
 def defaults_fields_keyboard(mode: str, current: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
-    keys = list(DEFAULT_SINGLE.keys()) if mode == "single" else list(DEFAULT_ALBUM.keys())
-    disabled = set((current or {}).get("_disabled", []))
+    current = current or {}
     buttons = []
-    row = []
-    for k in keys:
-        state = "🔴 خاموش" if k in disabled else "🟢 روشن"
-        row.append(InlineKeyboardButton(f"{FIELDS.get(k, k.title())} · {state}", callback_data=f"defaulttoggle:{mode}:{k}"))
-        if len(row) == 2:
-            buttons.append(row); row = []
-        row.append(InlineKeyboardButton(f"✏️ تغییر {FIELDS.get(k, k.title())}", callback_data=f"setdefault:{mode}:{k}"))
-        if len(row) == 2:
-            buttons.append(row); row = []
-    if row: buttons.append(row)
+    for k in DEFAULT_FIELD_ORDER:
+        mode_state = _default_mode(current, k)
+        if mode_state == "remove":
+            state = "🗑 Remove"
+        elif mode_state == "keep":
+            state = "⏸ Keep"
+        else:
+            val = current.get(k, "")
+            state = f"✅ Apply: {val}" if val not in (None, "") else "✅ Apply"
+            if len(state) > 28:
+                state = state[:25] + "…"
+        label = FIELDS.get(k, k.title())
+        buttons.append([
+            InlineKeyboardButton(f"{label} · {state}", callback_data=f"defaulttoggle:{mode}:{k}"),
+            InlineKeyboardButton("✏️", callback_data=f"setdefault:{mode}:{k}"),
+        ])
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="tag:menu")])
     return InlineKeyboardMarkup(buttons)
 
@@ -817,13 +886,32 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def setchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Legacy alias → channel 1."""
+    await setchannel1_command(update, context)
+
+
+async def setchannel1_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not is_owner(user.id if user else None):
         await update.message.reply_text("🔒 فقط مالک ربات می‌تواند کانال مقصد Auto Forward را تنظیم کند.")
         return
-    context.user_data["waiting"] = "set_auto_forward_channel"
+    context.user_data["waiting"] = "set_auto_forward_channel:1"
     await update.message.reply_text(
-        "📢 تنظیم کانال مقصد Auto Forward\n\n"
+        "📢 تنظیم کانال اصلی (Main Channel)\n\n"
+        "آیدی عددی یا یوزرنیم کانال را بفرست (مثلاً `@MyChannel` یا `-100xxxxxxxxxx`).\n"
+        "ربات باید ادمین کانال باشد و اجازه ارسال پیام داشته باشد.\n"
+        "هیچ پیام آزمایشی در کانال ارسال نمی‌شود."
+    )
+
+
+async def setchannel2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_owner(user.id if user else None):
+        await update.message.reply_text("🔒 فقط مالک ربات می‌تواند کانال مقصد Auto Forward را تنظیم کند.")
+        return
+    context.user_data["waiting"] = "set_auto_forward_channel:2"
+    await update.message.reply_text(
+        "📢 تنظیم کانال Full Archive\n\n"
         "آیدی عددی یا یوزرنیم کانال را بفرست (مثلاً `@MyChannel` یا `-100xxxxxxxxxx`).\n"
         "ربات باید ادمین کانال باشد و اجازه ارسال پیام داشته باشد.\n"
         "هیچ پیام آزمایشی در کانال ارسال نمی‌شود."
@@ -831,16 +919,19 @@ async def setchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def channelstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = get_af_chat_id(context)
-    title = get_af_chat_title(context)
-    if not chat_id:
-        await update.message.reply_text("کانال مقصد Auto Forward تنظیم نشده است.\nمالک ربات می‌تواند با /setchannel آن را تنظیم کند.")
-        return
-    await update.message.reply_text(
-        f"📢 کانال مقصد Auto Forward:\n• شناسه: `{chat_id}`\n• عنوان: {title or '—'}\n\n"
-        "این تنظیم فقط در حافظه است و با ریستارت ربات پاک می‌شود.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    ch1 = get_af_channel(context, "1")
+    ch2 = get_af_channel(context, "2")
+    lines = ["📢 وضعیت کانال‌های Auto Forward\n"]
+    if ch1:
+        lines.append(f"۱) Main: `{ch1['chat_id']}` — {ch1.get('title') or '—'}")
+    else:
+        lines.append("۱) Main: تنظیم نشده (/setchannel1)")
+    if ch2:
+        lines.append(f"۲) Full Archive: `{ch2['chat_id']}` — {ch2.get('title') or '—'}")
+    else:
+        lines.append("۲) Full Archive: تنظیم نشده (/setchannel2)")
+    lines.append("\nاین تنظیمات فقط در حافظه‌اند و با ریستارت پاک می‌شوند.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def tag_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1165,7 +1256,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if manifest.get("format")!="archive-v1" or not isinstance(manifest.get("tracks"),list) or not manifest["tracks"]: raise ValueError()
             context.user_data["archive"]={"phase":"queue","sources":{"source_a":[],"source_b":[]},"queue":[dict(x,status="pending") for x in manifest["tracks"]],"cursor":0}
             context.user_data["waiting"]=None
-            await message.reply_text(f"✅ فهرست دریافت شد: {len(manifest['tracks'])} آهنگ", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ شروع دریافت آهنگ‌ها",callback_data="arch:open_next")]]))
+            await message.reply_text(f"✅ فهرست دریافت شد: {len(manifest['tracks'])} آهنگ\nنقطه شروع را انتخاب کن:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ شروع از ابتدا", callback_data="arch:start_begin")],[InlineKeyboardButton("⏩ شروع از آهنگ انتخابی", callback_data="arch:start_pick")],[InlineKeyboardButton("❌ لغو", callback_data="arch:start_cancel")]]))
         except Exception as exc:
             await message.reply_text(f"خواندن فایل فهرست ناموفق بود: {exc}")
         return
@@ -1448,17 +1539,19 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     waiting = context.user_data.get("waiting")
 
     # ---------- Auto Forward: set destination channel (owner only) ----------
-    if waiting == "set_auto_forward_channel":
+    if isinstance(waiting, str) and waiting.startswith("set_auto_forward_channel"):
         user = update.effective_user
         if not is_owner(user.id if user else None):
             context.user_data["waiting"] = None
             await update.message.reply_text("🔒 فقط مالک ربات می‌تواند کانال مقصد را تنظیم کند.")
             return
+        slot = "1"
+        if ":" in waiting:
+            slot = waiting.split(":")[-1] or "1"
         raw = value.strip()
         if not raw:
             await send_temporary_prompt(update.message, context, "آیدی یا یوزرنیم کانال را بفرست.")
             return
-        # Normalize @username or numeric id
         target = raw if raw.startswith("@") or raw.lstrip("-").isdigit() else f"@{raw}"
         try:
             chat = await context.bot.get_chat(target)
@@ -1467,7 +1560,6 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ کانال پیدا نشد یا ربات به آن دسترسی ندارد.\n{e}\n\nدوباره آیدی/یوزرنیم را بفرست یا /cancel بزن."
             )
             return
-        # Verify bot is admin with post permission (no test message sent)
         try:
             me = await context.bot.get_me()
             member = await context.bot.get_chat_member(chat.id, me.id)
@@ -1490,14 +1582,65 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ بررسی دسترسی ربات به کانال ناموفق بود.\n{e}"
             )
             return
-        set_af_destination(context, chat.id, getattr(chat, "title", None) or getattr(chat, "username", "") or str(chat.id))
+        title = getattr(chat, "title", None) or getattr(chat, "username", "") or str(chat.id)
+        set_af_channel(context, slot, chat.id, title)
+        if slot == "1":
+            set_af_destination(context, chat.id, title)
         context.user_data["waiting"] = None
+        slot_name = "Main Channel" if slot == "1" else "Full Archive"
         await update.message.reply_text(
-            f"✅ کانال مقصد Auto Forward تنظیم شد.\n"
-            f"• عنوان: {get_af_chat_title(context) or '—'}\n"
+            f"✅ کانال {slot_name} تنظیم شد.\n"
+            f"• عنوان: {title}\n"
             f"• شناسه: `{chat.id}`\n\n"
             "این تنظیم فقط در حافظه است و با ریستارت ربات پاک می‌شود.",
             parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # ---------- Archive start-from number ----------
+    if waiting == "archive_start_number":
+        queue = (context.user_data.get("archive") or {}).get("queue") or []
+        if not queue:
+            context.user_data["waiting"] = None
+            await update.message.reply_text("صف آرشیو خالی است.")
+            return
+        raw = value.strip()
+        if not raw.isdigit():
+            await send_temporary_prompt(update.message, context, f"یک عدد بین ۱ تا {len(queue)} بفرست.")
+            return
+        num = int(raw)
+        if num < 1 or num > len(queue):
+            await send_temporary_prompt(update.message, context, f"شماره خارج از محدوده است. عدد بین ۱ تا {len(queue)} بفرست.")
+            return
+        # Skip tracks before selected (1-based → index num-1)
+        for i, item in enumerate(queue):
+            if i < num - 1 and item.get("status") in (None, "pending", "in_progress"):
+                item["status"] = "skipped"
+        context.user_data["waiting"] = None
+        context.user_data["archive_start_from"] = num
+        # Jump open_next logic: find first pending from selected index
+        idx = next((i for i, x in enumerate(queue) if i >= num - 1 and x.get("status") == "pending"), None)
+        if idx is None:
+            await update.message.reply_text("از این شماره به بعد ترک در انتظاری نیست.")
+            return
+        item = queue[idx]
+        item["status"] = "in_progress"
+        context.user_data.update({"archive_current": idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
+        title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
+        artist = (item.get("artist") or "هنرمند نامشخص").strip()
+        warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
+        progress = ((idx + 1) / len(queue) * 100) if queue else 0
+        title_button = InlineKeyboardButton(
+            text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),
+            copy_text=CopyTextButton(text=title or ""),
+        )
+        await update.message.reply_text(
+            f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
+            reply_markup=InlineKeyboardMarkup([
+                [title_button],
+                [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
+                [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
+            ]),
         )
         return
 
@@ -1573,7 +1716,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not tracks or len(tracks) > 1000: raise ValueError()
             context.user_data["archive"] = {"phase":"queue", "sources":{"source_a":[],"source_b":[]}, "queue":[dict(x, status="pending") for x in tracks], "cursor":0}
             context.user_data["waiting"] = None
-            await update.message.reply_text(f"✅ فهرست دریافت شد: {len(tracks)} آهنگ\nبرای شروع، ترک اول را باز می‌کنم.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ شروع دریافت آهنگ‌ها", callback_data="arch:open_next")]]))
+            await update.message.reply_text(f"✅ فهرست دریافت شد: {len(tracks)} آهنگ\nنقطه شروع را انتخاب کن:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶️ شروع از ابتدا", callback_data="arch:start_begin")],[InlineKeyboardButton("⏩ شروع از آهنگ انتخابی", callback_data="arch:start_pick")],[InlineKeyboardButton("❌ لغو", callback_data="arch:start_cancel")]]))
         except Exception:
             await update.message.reply_text("متن فهرست معتبر نیست. کل متن خروجی بررسی منابع را بدون تغییر ارسال کن.")
         return
@@ -2066,6 +2209,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await query.message.reply_text("اول دکمهٔ «این آهنگ تموم شد» را بزن.")
                     return
             data = "arch:open_next"
+        if data == "arch:start_begin":
+            # Mark nothing skipped; open first pending from start
+            context.user_data.pop("archive_start_from", None)
+            data = "arch:open_next"
+        if data == "arch:start_pick":
+            queue = a.get("queue", [])
+            if not queue:
+                await query.message.reply_text("صف آرشیو خالی است.")
+                return
+            context.user_data["waiting"] = "archive_start_number"
+            await query.message.reply_text(
+                f"شماره آهنگ شروع را بفرست (۱ تا {len(queue)}).\n"
+                "آهنگ‌های قبل از این شماره در این اجرا رد می‌شوند."
+            )
+            return
+        if data == "arch:start_cancel":
+            context.user_data["waiting"] = None
+            await query.message.reply_text("انتخاب نقطه شروع لغو شد.", reply_markup=archive_keyboard())
+            return
         if data == "arch:open_next":
             queue = a.get("queue", [])
             idx = next((i for i,x in enumerate(queue) if x.get("status")=="pending"), None)
@@ -2117,12 +2279,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_defaults = get_user_defaults(query.from_user.id)
         current = user_defaults[mode]
         text = f"⚙️ Current **{mode}** defaults:\n\n"
-        disabled = set(current.get("_disabled", []))
-        for k, v in current.items():
-            if k.startswith("_"): continue
-            state = "خاموش" if k in disabled else "روشن"
-            text += f"• {FIELDS.get(k, k)}: `{v}` — {state}\n"
-        text += "\nبرای خاموش/روشن‌کردن هر فیلد، دکمه وضعیت آن را بزن؛ برای تغییر مقدار، دکمه ویرایش را انتخاب کن:"
+        for k in DEFAULT_FIELD_ORDER:
+            mstate = _default_mode(current, k)
+            if mstate == "remove":
+                state = "🗑 Remove"
+            elif mstate == "keep":
+                state = "⏸ Keep"
+            else:
+                state = f"✅ Apply `{current.get(k, '')}`"
+            text += f"• {FIELDS.get(k, k)}: {state}\n"
+        text += "\nدکمه وضعیت را بزن تا بین Apply / Keep / Remove جابه‌جا شوی. دکمه ✏️ برای ویرایش مقدار Apply است."
         await query.message.edit_text(
             text,
             reply_markup=defaults_fields_keyboard(mode, current),
@@ -2137,15 +2303,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid not in all_data:
             all_data[uid] = {"single": DEFAULT_SINGLE.copy(), "album": DEFAULT_ALBUM.copy()}
         current = all_data[uid].setdefault(mode, (DEFAULT_SINGLE if mode == "single" else DEFAULT_ALBUM).copy())
+        modes = dict(current.get("_modes") or {})
+        # migrate legacy disabled once
         disabled = set(current.get("_disabled", []))
-        if key in disabled: disabled.remove(key)
-        else: disabled.add(key)
-        current["_disabled"] = sorted(disabled)
+        for dk in disabled:
+            modes.setdefault(dk, "keep")
+        cur = modes.get(key) or ("keep" if key in disabled else "apply")
+        nxt = {"apply": "keep", "keep": "remove", "remove": "apply"}.get(cur, "apply")
+        modes[key] = nxt
+        current["_modes"] = modes
+        current["_disabled"] = sorted([k for k, v in modes.items() if v == "keep"])
         save_all_defaults(all_data)
-        status = "روشن شد" if key not in disabled else "خاموش شد"
-        await query.message.reply_text(f"{FIELDS.get(key, key)} {status}")
-        lines = [f"• {FIELDS.get(k, k)}: `{v}` — {'خاموش' if k in disabled else 'روشن'}" for k, v in current.items() if not k.startswith("_")]
-        await query.message.edit_text("⚙️ تنظیم تگ‌های پیش‌فرض\n\n" + "\n".join(lines) + "\n\nبرای خاموش/روشن‌کردن هر فیلد، دکمه وضعیت آن را بزن؛ برای تغییر مقدار، دکمه ویرایش را انتخاب کن:", reply_markup=defaults_fields_keyboard(mode, current), parse_mode=ParseMode.MARKDOWN)
+        label = {"apply": "✅ Apply", "keep": "⏸ Keep", "remove": "🗑 Remove"}[nxt]
+        await query.message.reply_text(f"{FIELDS.get(key, key)} → {label}")
+        lines = []
+        for k in DEFAULT_FIELD_ORDER:
+            mstate = _default_mode(current, k)
+            if mstate == "remove":
+                state = "🗑 Remove"
+            elif mstate == "keep":
+                state = "⏸ Keep"
+            else:
+                state = f"✅ Apply `{current.get(k, '')}`"
+            lines.append(f"• {FIELDS.get(k, k)}: {state}")
+        await query.message.edit_text(
+            "⚙️ تنظیم تگ‌های پیش‌فرض\n\n" + "\n".join(lines) +
+            "\n\nدکمه وضعیت را بزن تا بین Apply / Keep / Remove جابه‌جا شوی. دکمه ✏️ برای ویرایش مقدار Apply است.",
+            reply_markup=defaults_fields_keyboard(mode, current),
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     if data.startswith("setdefault:"):
@@ -2524,165 +2710,209 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------- Auto Forward callbacks ----------
-    if data in ("autofw:single", "autofw:archive"):
-        chat_id = get_af_chat_id(context)
-        if not chat_id:
+    if isinstance(data, str) and data.startswith("autofw:"):
+        uid = query.from_user.id if query.from_user else None
+        if not can_auto_forward(uid):
             await query.message.reply_text(
-                "کانال مقصد تنظیم نشده است.\nمالک ربات باید با /setchannel آن را تنظیم کند."
+                "⛔ شما اجازه استفاده از قابلیت Auto Forward را ندارید. این قابلیت فقط برای مالک و ادمین‌های ربات فعال است."
             )
             return
-        info = context.user_data.get("af_last_output")
-        if not info or not info.get("output_path"):
-            await query.message.reply_text("فایل خروجی برای Auto Forward در دسترس نیست. دوباره Save کن.")
-            return
-        st = info.get("status", "pending")
-        if st == "sending":
-            await query.message.reply_text("در حال ارسال است؛ لطفاً صبر کن.")
-            return
-        if st == "sent":
-            await query.message.reply_text("این آهنگ قبلاً با موفقیت ارسال شده است.")
-            return
-        info["status"] = "sending"
-        status, detail = await send_processed_to_channel(
-            context.bot,
-            chat_id,
-            info["output_path"],
-            filename=info.get("filename") or "track.mp3",
-            title=info.get("title"),
-            performer=info.get("performer"),
-            duration=info.get("duration"),
-            cover=info.get("cover"),
-        )
-        info["status"] = status
-        if status == "sent":
-            extra = " (به‌صورت Document)" if detail == "document" else ""
-            await query.message.reply_text(f"✅ با موفقیت به کانال مقصد ارسال شد{extra}.")
-        elif status == "unknown":
-            await query.message.reply_text(
-                f"⚠️ وضعیت ارسال نامشخص است. ممکن است پیام در کانال ثبت شده باشد.\n{detail}\n"
-                "لطفاً کانال را بررسی کن. برای جلوگیری از ارسال تکراری، دوباره ارسال خودکار انجام نشد."
-            )
-        else:
-            await query.message.reply_text(f"❌ ارسال ناموفق بود.\n{detail}\nمی‌تونی دوباره دکمه Auto Forward را بزنی.")
-        return
 
-    if data.startswith("autofw:album_toggle:"):
-        try:
-            idx = int(data.split(":")[2])
-        except (IndexError, ValueError):
-            return
-        tracks = context.user_data.get("af_album_tracks") or []
-        for t in tracks:
-            if t.get("index") == idx and t.get("status") in ("pending", "failed"):
-                t["selected"] = not t.get("selected", False)
-                break
-        try:
-            await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks))
-        except TelegramError:
-            pass
-        return
-
-    if data.startswith("autofw:album_noop:"):
-        await query.answer("این ترک قابل انتخاب مجدد نیست.", show_alert=False)
-        return
-
-    if data == "autofw:album_all":
-        tracks = context.user_data.get("af_album_tracks") or []
-        for t in tracks:
-            if t.get("status") in ("pending", "failed"):
-                t["selected"] = True
-        try:
-            await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks))
-        except TelegramError:
-            pass
-        return
-
-    if data == "autofw:album_none":
-        tracks = context.user_data.get("af_album_tracks") or []
-        for t in tracks:
-            t["selected"] = False
-        try:
-            await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks))
-        except TelegramError:
-            pass
-        return
-
-    if data == "autofw:album_skip":
-        context.user_data["album_mode"] = False
-        context.user_data["album_tracks"] = []
-        context.user_data.pop("af_album_tracks", None)
-        context.user_data["af_album_busy"] = False
-        await query.message.reply_text(
-            "Auto Forward رد شد. از حالت آلبوم خارج شدی.",
-            reply_markup=main_reply_keyboard(),
-        )
-        return
-
-    if data in ("autofw:album_send", "autofw:album_retry"):
-        chat_id = get_af_chat_id(context)
-        if not chat_id:
-            await query.message.reply_text(
-                "کانال مقصد تنظیم نشده است.\nمالک ربات باید با /setchannel آن را تنظیم کند."
-            )
-            return
-        tracks = context.user_data.get("af_album_tracks") or []
-        if context.user_data.get("af_album_busy"):
-            await query.message.reply_text("در حال ارسال است؛ لطفاً صبر کن.")
-            return
-        if data == "autofw:album_retry":
-            targets = [t for t in tracks if t.get("status") == "failed"]
-            for t in targets:
-                t["selected"] = True
-        else:
-            targets = [
-                t for t in tracks
-                if t.get("selected") and t.get("status") in ("pending", "failed")
-            ]
-        if not targets:
-            await query.message.reply_text("هیچ ترک مجازی برای ارسال انتخاب نشده است.")
-            return
-        context.user_data["af_album_busy"] = True
-        sent_n = failed_n = unknown_n = 0
-        for t in targets:
-            if t.get("status") == "sent":
-                continue
-            t["status"] = "sending"
-            try:
-                await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks))
-            except TelegramError:
-                pass
+        # Single / Archive: autofw:single:1 or autofw:archive:2 (legacy autofw:single → slot 1)
+        if data.startswith("autofw:single") or data.startswith("autofw:archive"):
+            parts = data.split(":")
+            slot = parts[2] if len(parts) >= 3 else "1"
+            ch = get_af_channel(context, slot)
+            if not ch:
+                await query.message.reply_text(
+                    f"کانال مقصد {slot} تنظیم نشده است.\nمالک ربات باید با /setchannel{slot} آن را تنظیم کند."
+                )
+                return
+            info = context.user_data.get("af_last_output")
+            if not info or not info.get("output_path"):
+                await query.message.reply_text("فایل خروجی برای Auto Forward در دسترس نیست. دوباره Save کن.")
+                return
+            st = _status_for_slot(info, slot)
+            if st == "sending":
+                await query.message.reply_text("در حال ارسال است؛ لطفاً صبر کن.")
+                return
+            if st == "sent":
+                await query.message.reply_text("این آهنگ قبلاً با موفقیت به این کانال ارسال شده است.")
+                return
+            _set_status_for_slot(info, slot, "sending")
             status, detail = await send_processed_to_channel(
                 context.bot,
-                chat_id,
-                t.get("output_path"),
-                filename=t.get("filename") or "track.mp3",
-                title=t.get("title"),
-                performer=t.get("artist"),
-                duration=t.get("duration"),
-                cover=t.get("cover"),
+                ch["chat_id"],
+                info["output_path"],
+                filename=info.get("filename") or "track.mp3",
+                title=info.get("title"),
+                performer=info.get("performer"),
+                duration=info.get("duration"),
+                cover=info.get("cover"),
             )
-            t["status"] = status
-            t["selected"] = False
+            _set_status_for_slot(info, slot, status)
+            label = af_channel_label(context, slot)
             if status == "sent":
-                sent_n += 1
+                extra = " (به‌صورت Document)" if detail == "document" else ""
+                await query.message.reply_text(f"✅ با موفقیت به «{label}» ارسال شد{extra}.")
             elif status == "unknown":
-                unknown_n += 1
+                await query.message.reply_text(
+                    f"⚠️ وضعیت ارسال به «{label}» نامشخص است.\n{detail}\n"
+                    "لطفاً کانال را بررسی کن. برای جلوگیری از ارسال تکراری، دوباره ارسال خودکار انجام نشد."
+                )
             else:
-                failed_n += 1
-        context.user_data["af_album_busy"] = False
-        try:
-            await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks))
-        except TelegramError:
-            pass
-        parts = [f"✅ موفق: {sent_n}", f"❌ ناموفق: {failed_n}"]
-        if unknown_n:
-            parts.append(f"❓ نامشخص: {unknown_n}")
-        msg = "گزارش Auto Forward آلبوم:\n" + " | ".join(parts)
-        if failed_n:
-            msg += "\nترک‌های ناموفق را می‌توانی دوباره انتخاب یا از «تلاش مجدد ناموفق‌ها» استفاده کنی."
-        if unknown_n:
-            msg += "\nبرای موارد نامشخص کانال را بررسی کن؛ ارسال خودکار مجدد انجام نشد."
-        await query.message.reply_text(msg)
+                await query.message.reply_text(f"❌ ارسال به «{label}» ناموفق بود.\n{detail}\nمی‌تونی دوباره دکمه را بزنی.")
+            return
+
+        if data.startswith("autofw:album_toggle:"):
+            # autofw:album_toggle:SLOT:IDX
+            parts = data.split(":")
+            try:
+                slot = parts[2]
+                idx = int(parts[3])
+            except (IndexError, ValueError):
+                return
+            tracks = context.user_data.get("af_album_tracks") or []
+            for t in tracks:
+                if t.get("index") == idx and _status_for_slot(t, slot) in ("pending", "failed"):
+                    sel = t.setdefault("selected_slots", {})
+                    sel[str(slot)] = not sel.get(str(slot), False)
+                    break
+            try:
+                await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
+            except TelegramError:
+                pass
+            return
+
+        if data.startswith("autofw:album_noop:"):
+            await query.answer("این ترک قابل انتخاب مجدد نیست.", show_alert=False)
+            return
+
+        if data.startswith("autofw:album_all:"):
+            slot = data.split(":")[2]
+            tracks = context.user_data.get("af_album_tracks") or []
+            for t in tracks:
+                if _status_for_slot(t, slot) in ("pending", "failed"):
+                    t.setdefault("selected_slots", {})[str(slot)] = True
+            try:
+                await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
+            except TelegramError:
+                pass
+            return
+
+        if data.startswith("autofw:album_none:"):
+            slot = data.split(":")[2]
+            tracks = context.user_data.get("af_album_tracks") or []
+            for t in tracks:
+                t.setdefault("selected_slots", {})[str(slot)] = False
+            try:
+                await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
+            except TelegramError:
+                pass
+            return
+
+        if data.startswith("autofw:album_slot:"):
+            slot = data.split(":")[2]
+            if not get_af_channel(context, slot):
+                await query.message.reply_text(
+                    f"کانال {slot} تنظیم نشده. مالک ربات باید /setchannel{slot} را اجرا کند."
+                )
+                return
+            tracks = context.user_data.get("af_album_tracks") or []
+            context.user_data["af_album_slot"] = slot
+            try:
+                await query.message.edit_text(
+                    f"انتخاب ترک برای ارسال به «{af_channel_label(context, slot)}»:",
+                    reply_markup=af_album_keyboard(tracks, slot),
+                )
+            except TelegramError:
+                try:
+                    await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
+                except TelegramError:
+                    pass
+            return
+
+        if data == "autofw:album_skip":
+            context.user_data["album_mode"] = False
+            context.user_data["album_tracks"] = []
+            context.user_data.pop("af_album_tracks", None)
+            context.user_data["af_album_busy"] = False
+            await query.message.reply_text(
+                "Auto Forward رد شد. از حالت آلبوم خارج شدی.",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
+
+        if data.startswith("autofw:album_send:") or data.startswith("autofw:album_retry:"):
+            slot = data.split(":")[2]
+            ch = get_af_channel(context, slot)
+            if not ch:
+                await query.message.reply_text(
+                    f"کانال مقصد {slot} تنظیم نشده است.\nمالک ربات باید با /setchannel{slot} آن را تنظیم کند."
+                )
+                return
+            tracks = context.user_data.get("af_album_tracks") or []
+            if context.user_data.get("af_album_busy"):
+                await query.message.reply_text("در حال ارسال است؛ لطفاً صبر کن.")
+                return
+            if data.startswith("autofw:album_retry:"):
+                targets = [t for t in tracks if _status_for_slot(t, slot) == "failed"]
+                for t in targets:
+                    t.setdefault("selected_slots", {})[str(slot)] = True
+            else:
+                targets = [
+                    t for t in tracks
+                    if (t.get("selected_slots") or {}).get(str(slot))
+                    and _status_for_slot(t, slot) in ("pending", "failed")
+                ]
+            if not targets:
+                await query.message.reply_text("هیچ ترک مجازی برای ارسال انتخاب نشده است.")
+                return
+            context.user_data["af_album_busy"] = True
+            sent_n = failed_n = unknown_n = 0
+            for t in targets:
+                if _status_for_slot(t, slot) == "sent":
+                    continue
+                _set_status_for_slot(t, slot, "sending")
+                try:
+                    await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
+                except TelegramError:
+                    pass
+                status, detail = await send_processed_to_channel(
+                    context.bot,
+                    ch["chat_id"],
+                    t.get("output_path"),
+                    filename=t.get("filename") or "track.mp3",
+                    title=t.get("title"),
+                    performer=t.get("artist"),
+                    duration=t.get("duration"),
+                    cover=t.get("cover"),
+                )
+                _set_status_for_slot(t, slot, status)
+                t.setdefault("selected_slots", {})[str(slot)] = False
+                if status == "sent":
+                    sent_n += 1
+                elif status == "unknown":
+                    unknown_n += 1
+                else:
+                    failed_n += 1
+            context.user_data["af_album_busy"] = False
+            try:
+                await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
+            except TelegramError:
+                pass
+            label = af_channel_label(context, slot)
+            parts = [f"✅ موفق: {sent_n}", f"❌ ناموفق: {failed_n}"]
+            if unknown_n:
+                parts.append(f"❓ نامشخص: {unknown_n}")
+            msg = f"گزارش Auto Forward آلبوم → {label}:\n" + " | ".join(parts)
+            if failed_n:
+                msg += "\nترک‌های ناموفق را می‌توانی دوباره انتخاب یا از «تلاش مجدد ناموفق‌ها» استفاده کنی."
+            if unknown_n:
+                msg += "\nبرای موارد نامشخص کانال را بررسی کن؛ ارسال خودکار مجدد انجام نشد."
+            await query.message.reply_text(msg)
+            return
+
         return
 
     # ---------- عملیات روی فیلد ----------
@@ -2882,13 +3112,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "duration": duration,
             "cover": cover,
             "status": "pending",
+            "statuses": {"1": "pending", "2": "pending"},
         }
 
         in_archive = bool(
             context.user_data.get("archive")
             and isinstance(context.user_data.get("archive_current"), int)
         )
-        reply_kb = af_archive_keyboard() if in_archive else af_single_keyboard()
+        uid = query.from_user.id if query.from_user else None
+        reply_kb = (
+            af_archive_keyboard(context, uid)
+            if in_archive
+            else af_single_keyboard(context, uid)
+        )
 
         try:
             with open(output_path, "rb") as f:
@@ -3180,18 +3416,39 @@ async def save_album_all(query, context):
             "duration": t.get("original_duration"),
             "cover": t.get("original_cover"),
             "status": "pending",
+            "statuses": {"1": "pending", "2": "pending"},
             "selected": False,
+            "selected_slots": {"1": False, "2": False},
         })
     context.user_data["af_album_tracks"] = af_tracks
     context.user_data["af_album_busy"] = False
+    context.user_data["af_album_slot"] = "1"
     # Keep album_folder and tracks until user finishes or skips Auto Forward
     context.user_data["editing_album_track"] = False
-    if af_tracks:
+    uid = query.from_user.id if query.from_user else None
+    if af_tracks and can_auto_forward(uid):
+        slot = "1" if get_af_channel(context, "1") else ("2" if get_af_channel(context, "2") else None)
+        if slot:
+            await query.message.reply_text(
+                f"✅ همه ترک‌های آلبوم ارسال شدند ({len(af_tracks)} ترک).\n"
+                f"ترک‌های موردنظر را برای «{af_channel_label(context, slot)}» انتخاب کن:",
+                reply_markup=af_album_keyboard(af_tracks, slot),
+            )
+        else:
+            await query.message.reply_text(
+                f"✅ همه ترک‌های آلبوم ارسال شدند ({len(af_tracks)} ترک).\n"
+                "کانال مقصدی تنظیم نشده؛ مالک می‌تواند /setchannel1 و /setchannel2 را اجرا کند.",
+                reply_markup=main_reply_keyboard(),
+            )
+            context.user_data["album_mode"] = False
+            context.user_data["album_tracks"] = []
+    elif af_tracks:
         await query.message.reply_text(
-            f"✅ همه ترک‌های آلبوم ارسال شدند ({len(af_tracks)} ترک).\n"
-            "حالا می‌تونی ترک‌های موردنظر را برای Auto Forward انتخاب کنی:",
-            reply_markup=af_album_keyboard(af_tracks),
+            f"✅ همه ترک‌های آلبوم ارسال شدند ({len(af_tracks)} ترک).\nاز حالت آلبوم خارج شدی.",
+            reply_markup=main_reply_keyboard(),
         )
+        context.user_data["album_mode"] = False
+        context.user_data["album_tracks"] = []
     else:
         context.user_data["album_mode"] = False
         context.user_data["album_tracks"] = []
@@ -3206,22 +3463,55 @@ def is_owner(user_id: Optional[int]) -> bool:
     return bool(OWNER_ID and user_id and int(user_id) == int(OWNER_ID))
 
 
+def can_auto_forward(user_id: Optional[int]) -> bool:
+    """Owner always; admins listed in ADMIN_IDS; otherwise denied."""
+    if not user_id:
+        return False
+    uid = int(user_id)
+    if OWNER_ID and uid == int(OWNER_ID):
+        return True
+    return uid in ADMIN_IDS
+
+
+def _af_channels(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.application.bot_data.setdefault("auto_forward_channels", {})
+
+
+def get_af_channel(context: ContextTypes.DEFAULT_TYPE, slot: str):
+    """slot is '1' (main) or '2' (full archive). Returns dict or None."""
+    ch = _af_channels(context).get(str(slot))
+    return ch if ch and ch.get("chat_id") else None
+
+
+def set_af_channel(context: ContextTypes.DEFAULT_TYPE, slot: str, chat_id, title: str = ""):
+    channels = _af_channels(context)
+    channels[str(slot)] = {"chat_id": chat_id, "title": title or str(chat_id)}
+
+
+def af_channel_label(context: ContextTypes.DEFAULT_TYPE, slot: str) -> str:
+    ch = get_af_channel(context, slot)
+    if not ch:
+        return "Main Channel" if str(slot) == "1" else "Full Archive"
+    return ch.get("title") or ("Main Channel" if str(slot) == "1" else "Full Archive")
+
+
+# Backward-compat helpers used by older call sites
 def get_af_chat_id(context: ContextTypes.DEFAULT_TYPE):
-    return context.application.bot_data.get("auto_forward_chat_id")
+    ch = get_af_channel(context, "1")
+    return ch["chat_id"] if ch else context.application.bot_data.get("auto_forward_chat_id")
 
 
 def get_af_chat_title(context: ContextTypes.DEFAULT_TYPE) -> str:
+    ch = get_af_channel(context, "1")
+    if ch:
+        return ch.get("title") or ""
     return context.application.bot_data.get("auto_forward_chat_title") or ""
 
 
 def set_af_destination(context: ContextTypes.DEFAULT_TYPE, chat_id, title: str = ""):
+    set_af_channel(context, "1", chat_id, title)
     context.application.bot_data["auto_forward_chat_id"] = chat_id
     context.application.bot_data["auto_forward_chat_title"] = title or str(chat_id)
-
-
-def clear_af_destination(context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data.pop("auto_forward_chat_id", None)
-    context.application.bot_data.pop("auto_forward_chat_title", None)
 
 
 def _is_audio_media_error(exc: BaseException) -> bool:
@@ -3262,7 +3552,6 @@ async def send_processed_to_channel(
     except Exception:
         thumb = None
 
-    # Attempt 1: Telegram Audio (preferred)
     try:
         with open(output_path, "rb") as f:
             await bot.send_audio(
@@ -3288,7 +3577,6 @@ async def send_processed_to_channel(
         print("AF send_audio unexpected:", repr(e))
         return "failed", str(e)
 
-    # Attempt 2: Document fallback (only after clear audio-media error)
     try:
         with open(output_path, "rb") as f:
             await bot.send_document(
@@ -3306,29 +3594,76 @@ async def send_processed_to_channel(
         return "failed", str(e)
 
 
-def af_single_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Auto Forward", callback_data="autofw:single")],
-    ])
+def _status_for_slot(info: dict, slot: str) -> str:
+    statuses = info.get("statuses") or {}
+    if str(slot) in statuses:
+        return statuses[str(slot)]
+    # legacy single status
+    if str(slot) == "1" and info.get("status"):
+        return info.get("status")
+    return "pending"
 
 
-def af_archive_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 Auto Forward", callback_data="autofw:archive")],
+def _set_status_for_slot(info: dict, slot: str, status: str):
+    statuses = info.setdefault("statuses", {})
+    statuses[str(slot)] = status
+    if str(slot) == "1":
+        info["status"] = status
+
+
+def af_single_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None) -> Optional[InlineKeyboardMarkup]:
+    if user_id is not None and not can_auto_forward(user_id):
+        return None
+    rows = []
+    ch1 = get_af_channel(context, "1")
+    ch2 = get_af_channel(context, "2")
+    if ch1:
+        rows.append([InlineKeyboardButton(
+            f"🚀 AF — {af_channel_label(context, '1')[:40]}",
+            callback_data="autofw:single:1",
+        )])
+    if ch2:
+        rows.append([InlineKeyboardButton(
+            f"🚀 AF — {af_channel_label(context, '2')[:40]}",
+            callback_data="autofw:single:2",
+        )])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(rows)
+
+
+def af_archive_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    rows = []
+    if user_id is None or can_auto_forward(user_id):
+        ch1 = get_af_channel(context, "1")
+        ch2 = get_af_channel(context, "2")
+        if ch1:
+            rows.append([InlineKeyboardButton(
+                f"🚀 AF — {af_channel_label(context, '1')[:40]}",
+                callback_data="autofw:archive:1",
+            )])
+        if ch2:
+            rows.append([InlineKeyboardButton(
+                f"🚀 AF — {af_channel_label(context, '2')[:40]}",
+                callback_data="autofw:archive:2",
+            )])
+    rows.extend([
         [InlineKeyboardButton("✅ این آهنگ تموم شد", callback_data="arch:finish_current")],
         [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
         [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
         [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
     ])
+    return InlineKeyboardMarkup(rows)
 
 
-def af_album_keyboard(tracks: List[dict]) -> InlineKeyboardMarkup:
+def af_album_keyboard(tracks: List[dict], slot: str = "1") -> InlineKeyboardMarkup:
+    """Album selection keyboard for a specific destination slot."""
     rows = []
     for t in tracks:
-        st = t.get("status", "pending")
-        sel = t.get("selected", False)
+        st = _status_for_slot(t, slot)
+        sel = (t.get("selected_slots") or {}).get(str(slot), False)
         idx = t.get("index", 0)
-        title = (t.get("title") or "—")[:40]
+        title = (t.get("title") or "—")[:36]
         if st == "sent":
             prefix = "✅"
         elif st == "sending":
@@ -3339,18 +3674,21 @@ def af_album_keyboard(tracks: List[dict]) -> InlineKeyboardMarkup:
             prefix = "❓"
         else:
             prefix = "☑️" if sel else "☐"
-        # Only pending/failed are toggleable
         if st in ("pending", "failed"):
-            cb = f"autofw:album_toggle:{idx}"
+            cb = f"autofw:album_toggle:{slot}:{idx}"
         else:
-            cb = f"autofw:album_noop:{idx}"
+            cb = f"autofw:album_noop:{slot}:{idx}"
         rows.append([InlineKeyboardButton(f"{prefix} {idx+1:02d}. {title}", callback_data=cb)])
     rows.append([
-        InlineKeyboardButton("✅ انتخاب همه", callback_data="autofw:album_all"),
-        InlineKeyboardButton("⬜ لغو همه", callback_data="autofw:album_none"),
+        InlineKeyboardButton("✅ انتخاب همه", callback_data=f"autofw:album_all:{slot}"),
+        InlineKeyboardButton("⬜ لغو همه", callback_data=f"autofw:album_none:{slot}"),
     ])
-    rows.append([InlineKeyboardButton("🚀 ارسال انتخاب‌شده‌ها", callback_data="autofw:album_send")])
-    rows.append([InlineKeyboardButton("🔄 تلاش مجدد ناموفق‌ها", callback_data="autofw:album_retry")])
+    rows.append([InlineKeyboardButton("🚀 ارسال انتخاب‌شده‌ها", callback_data=f"autofw:album_send:{slot}")])
+    rows.append([InlineKeyboardButton("🔄 تلاش مجدد ناموفق‌ها", callback_data=f"autofw:album_retry:{slot}")])
+    rows.append([
+        InlineKeyboardButton("📢 کانال ۱", callback_data="autofw:album_slot:1"),
+        InlineKeyboardButton("📢 کانال ۲", callback_data="autofw:album_slot:2"),
+    ])
     rows.append([InlineKeyboardButton("⏭️ رد کردن Auto Forward", callback_data="autofw:album_skip")])
     return InlineKeyboardMarkup(rows)
 
@@ -3450,8 +3788,9 @@ def main():
             BotCommand("tag", "⚙️ تنظیم تگ‌های پیش‌فرض"),
             BotCommand("version", "ℹ️ نمایش نسخهٔ ربات"),
             BotCommand("unreleasedcover", "🖼️ مدیریت کاور Unreleased Track"),
-            BotCommand("setchannel", "📢 تنظیم کانال Auto Forward (فقط مالک)"),
-            BotCommand("channelstatus", "ℹ️ وضعیت کانال Auto Forward"),
+            BotCommand("setchannel1", "📢 تنظیم کانال اصلی AF (فقط مالک)"),
+            BotCommand("setchannel2", "📢 تنظیم کانال Full Archive AF (فقط مالک)"),
+            BotCommand("channelstatus", "ℹ️ وضعیت کانال‌های Auto Forward"),
             BotCommand("cancel", "❌ لغو عملیات فعلی"),
         ])
 
@@ -3478,6 +3817,8 @@ def main():
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("unreleasedcover", unreleased_cover_command))
     app.add_handler(CommandHandler("setchannel", setchannel_command))
+    app.add_handler(CommandHandler("setchannel1", setchannel1_command))
+    app.add_handler(CommandHandler("setchannel2", setchannel2_command))
     app.add_handler(CommandHandler("channelstatus", channelstatus_command))
 
     app.add_handler(CallbackQueryHandler(button_handler))

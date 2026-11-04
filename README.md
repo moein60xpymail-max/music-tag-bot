@@ -1,4 +1,12 @@
-# Music Tag Bot — v5.0.0 (Auto Forward Edition)
+# Music Tag Bot — v5.1.0 (Archive Resume & Default Tags Enhancement)
+
+## v5.1.0 changes
+- Archive Mode: choose start point (from beginning or from a specific track number); earlier tracks are skipped for that run while real numbering is preserved.
+- Default Tags: three modes per field — Apply / Keep / Remove; expanded fields (title, artist, albumartist, album, genre, year, composer, publisher, comment, lyrics, disc, track).
+- Remove deletes the actual tag frame (not just empty value) without touching cover art or other tags.
+- Auto Forward restricted to bot owner and `ADMIN_IDS` (comma-separated Telegram user IDs). Unauthorized users cannot send even via raw callbacks.
+- Dual destination channels: `/setchannel1` (Main), `/setchannel2` (Full Archive), independent send status per channel; `/channelstatus` shows both.
+- Channel config remains owner-only and RAM-only.
 
 ## v5.0.0 changes
 - Adds Auto Forward to a destination channel for Single Track, Album, and Archive modes.
