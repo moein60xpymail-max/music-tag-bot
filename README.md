@@ -1,4 +1,13 @@
-# Music Tag Bot — v4.7.0
+# Music Tag Bot — v4.8.0
+
+## v4.8.0 changes
+- Adds the ID3 Comment field to the single-track editor and album-track editor.
+- Adds Comment to Album Mode Apply to All, selected-track Group Edit, tag copying, and Single/Album Default Tags.
+- Existing saved defaults are migrated to include Comment without overwriting previously configured values.
+- Album Summary displays each downloaded track's Comment when present.
+- Comment remains part of normal save/send and Remove All tag handling.
+- Ports the Artist-removal action from the older v4.6.1 patch into the v4.7.0 codebase without replacing v4.7.0 prompt-management fixes.
+- Artist removal matches a complete artist name, previews affected tracks, asks for confirmation, and backs up files for rollback.
 
 ## v4.7.0 changes
 - Adds centralized temporary-prompt tracking for interactive text-entry flows.

@@ -3,7 +3,7 @@ import ast
 s=Path('bot.py').read_text(encoding='utf-8')
 ast.parse(s)
 checks=[
- 'VERSION = "v4.7.0"',
+ 'VERSION = "v4.8.0"',
  'file_size',
  'downloaded',
  'async def send_album_summary(query, context):',
