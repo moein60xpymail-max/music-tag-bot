@@ -107,11 +107,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v5.2.0"
+VERSION = "v5.2.1"
 VERSION_CHANGES = [
-    "Archive Needs Review: نمایش نام آهنگ مشابه و معیارهای دقیق تطبیق (۲ از ۴)",
-    "خلاصه مجموعه آهنگ‌ها: فهرست نام آهنگ‌های بدون تگ هنرمند و بدون تگ آلبوم",
-    "حفظ کامل منطق تشخیص Duplicate و قابلیت‌های نسخه ۵.۱.۰",
+    "اصلاح نمایش دقیق معیارهای تشابه در Needs Review (از نتیجه واقعی classify_detail)",
+    "محاسبه مجدد معیارها هنگام نمایش اگر در داده صف ذخیره نشده باشند",
+    "حفظ کامل قابلیت‌های نسخه ۵.۲.۰",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1032,11 +1032,11 @@ def track_display_name(item) -> str:
 
 
 def format_review_warning(item, queue=None) -> str:
-    """Detailed Needs Review warning with matched tracks and criteria."""
+    """Detailed Needs Review warning with matched tracks and exact criteria."""
     if not item.get("review"):
         return ""
-    matches = item.get("review_matches") or []
-    # Legacy: only possible_match index
+    matches = list(item.get("review_matches") or [])
+    # Legacy / incomplete: only possible_match index
     if not matches and item.get("possible_match") and queue:
         try:
             pm = int(item["possible_match"]) - 1
@@ -1045,10 +1045,47 @@ def format_review_warning(item, queue=None) -> str:
                 matches = [{
                     "number": other.get("number") or (pm + 1),
                     "title": track_display_name(other),
-                    "criteria": item.get("review_criteria") or [],
+                    "criteria": list(item.get("review_criteria") or []),
+                    "_queue_index": pm,
                 }]
         except (TypeError, ValueError):
             pass
+    # Enrich each match: recompute real criteria from queue pair when missing
+    if queue:
+        enriched = []
+        for m in matches:
+            crit = list(m.get("criteria") or [])
+            other = None
+            idx = m.get("_queue_index")
+            if idx is None and m.get("number") is not None:
+                try:
+                    num = int(m["number"])
+                    for i, q in enumerate(queue):
+                        if int(q.get("number") or (i + 1)) == num:
+                            idx = i
+                            break
+                except (TypeError, ValueError):
+                    idx = None
+            if idx is None and item.get("possible_match") and len(matches) == 1:
+                try:
+                    idx = int(item["possible_match"]) - 1
+                except (TypeError, ValueError):
+                    idx = None
+            if isinstance(idx, int) and 0 <= idx < len(queue):
+                other = queue[idx]
+            if other is not None:
+                # Always prefer live comparison result so criteria are never guessed
+                _level, labels = classify_detail(other, item)
+                if labels:
+                    crit = list(labels)
+                if not m.get("title"):
+                    m = dict(m, title=track_display_name(other))
+            enriched.append({
+                "number": m.get("number"),
+                "title": m.get("title") or (track_display_name(other) if other else "—"),
+                "criteria": crit,
+            })
+        matches = enriched
     current = track_display_name(item)
     if not matches:
         return (
@@ -1063,15 +1100,18 @@ def format_review_warning(item, queue=None) -> str:
     ]
     for m in matches:
         parts.append("")
-        parts.append(f"🔍 آهنگ مشابه پیدا شده: {m.get('title') or '—'}")
+        title = m.get("title") or "—"
         if m.get("number"):
-            parts[-1] = f"🔍 آهنگ مشابه پیدا شده: {m.get('title') or '—'} (شماره {m['number']})"
+            parts.append(f"🔍 آهنگ مشابه: {title} (شماره {m['number']})")
+        else:
+            parts.append(f"🔍 آهنگ مشابه: {title}")
         crit = m.get("criteria") or []
         if crit:
-            parts.append("📌 معیارهای تطبیق:")
+            parts.append("📌 دلیل تشابه:")
             for c in crit:
                 parts.append(f"• {c}")
-            parts.append(f"این دو آهنگ در {len(crit)} معیار از ۴ معیار با یکدیگر تطبیق دارند.")
+        else:
+            parts.append("📌 دلیل تشابه: جزئیات معیار در دسترس نیست.")
     return "\n" + "\n".join(parts)
 
 

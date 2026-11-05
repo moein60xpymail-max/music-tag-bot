@@ -1,4 +1,9 @@
-# Music Tag Bot — v5.2.0
+# Music Tag Bot — v5.2.1
+
+## v5.2.1 changes
+- Needs Review warnings always show the exact matched criteria from live classify_detail (Title/Artist/Duration/File Size).
+- Criteria recomputed on display when missing from stored queue data (e.g. older manifests).
+- Message label: «دلیل تشابه» with bullet list of real matches only.
 
 ## v5.2.0 changes
 - Archive Needs Review: shows matched track name(s) and the exact shared criteria (2 of 4 signals).
