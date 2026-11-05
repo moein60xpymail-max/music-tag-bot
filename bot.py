@@ -7,7 +7,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from collections import Counter
-from dupes import classify as classify_duplicate
+from dupes import classify as classify_duplicate, classify_detail
 from typing import Dict, List, Optional, Any
 from io import BytesIO
 
@@ -107,14 +107,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v5.1.0"
+VERSION = "v5.2.0"
 VERSION_CHANGES = [
-    "Archive Mode: انتخاب نقطه شروع (از ابتدا یا از شماره دلخواه)",
-    "Default Tags: سه حالت Apply / Keep / Remove و گسترش فیلدها",
-    "حذف واقعی تگ در حالت Remove بدون آسیب به کاور و سایر تگ‌ها",
-    "Auto Forward محدود به مالک و ادمین‌های ADMIN_IDS",
-    "پشتیبانی از دو کانال مقصد مستقل (Main و Full Archive)",
-    "وضعیت ارسال مستقل per-channel و جلوگیری از ارسال تکراری در هر کانال",
+    "Archive Needs Review: نمایش نام آهنگ مشابه و معیارهای دقیق تطبیق (۲ از ۴)",
+    "خلاصه مجموعه آهنگ‌ها: فهرست نام آهنگ‌های بدون تگ هنرمند و بدون تگ آلبوم",
+    "حفظ کامل منطق تشخیص Duplicate و قابلیت‌های نسخه ۵.۱.۰",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1023,6 +1020,61 @@ def archive_report_text(queue):
         f"📈 درصد تأیید نهایی: {percent:.1f}%"
     )
 
+
+def track_display_name(item) -> str:
+    """Human-readable track name for reports (title, else file stem)."""
+    title = (item.get("title") or "").strip()
+    if title and title != "—":
+        return title
+    name = item.get("name") or item.get("file_name") or item.get("original_name") or ""
+    stem = Path(str(name)).stem if name else ""
+    return stem or "بدون نام"
+
+
+def format_review_warning(item, queue=None) -> str:
+    """Detailed Needs Review warning with matched tracks and criteria."""
+    if not item.get("review"):
+        return ""
+    matches = item.get("review_matches") or []
+    # Legacy: only possible_match index
+    if not matches and item.get("possible_match") and queue:
+        try:
+            pm = int(item["possible_match"]) - 1
+            if 0 <= pm < len(queue):
+                other = queue[pm]
+                matches = [{
+                    "number": other.get("number") or (pm + 1),
+                    "title": track_display_name(other),
+                    "criteria": item.get("review_criteria") or [],
+                }]
+        except (TypeError, ValueError):
+            pass
+    current = track_display_name(item)
+    if not matches:
+        return (
+            "\n\n⚠️ این آهنگ نیازمند بررسی است.\n"
+            f"🎵 آهنگ فعلی: {current}\n"
+            "جزئیات تطبیق در دسترس نیست؛ شباهت را دستی بررسی کن."
+        )
+    parts = [
+        "",
+        "⚠️ این آهنگ نیازمند بررسی است.",
+        f"🎵 آهنگ فعلی: {current}",
+    ]
+    for m in matches:
+        parts.append("")
+        parts.append(f"🔍 آهنگ مشابه پیدا شده: {m.get('title') or '—'}")
+        if m.get("number"):
+            parts[-1] = f"🔍 آهنگ مشابه پیدا شده: {m.get('title') or '—'} (شماره {m['number']})"
+        crit = m.get("criteria") or []
+        if crit:
+            parts.append("📌 معیارهای تطبیق:")
+            for c in crit:
+                parts.append(f"• {c}")
+            parts.append(f"این دو آهنگ در {len(crit)} معیار از ۴ معیار با یکدیگر تطبیق دارند.")
+    return "\n" + "\n".join(parts)
+
+
 async def archive_start(update, context):
     context.user_data["archive"] = {"phase": "menu", "sources": {"source_a": [], "source_b": []}, "queue": [], "cursor": 0}
     context.user_data["album_mode"] = False
@@ -1628,7 +1680,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.update({"archive_current": idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
         title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
         artist = (item.get("artist") or "هنرمند نامشخص").strip()
-        warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
+        warning = format_review_warning(item, queue)
         progress = ((idx + 1) / len(queue) * 100) if queue else 0
         title_button = InlineKeyboardButton(
             text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),
@@ -2031,8 +2083,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             track.get("album", "").strip() for track in tracks
             if track.get("album", "").strip() and track.get("album", "").strip() != "—"
         )
-        no_artist = sum(1 for track in tracks if not split_artists(track.get("artist", "")))
-        no_album = sum(1 for track in tracks if track.get("album", "—") in ("", "—"))
+        missing_artist_tracks = []
+        missing_album_tracks = []
+        for track in tracks:
+            disp = track_display_name(track)
+            if not split_artists(track.get("artist", "")):
+                missing_artist_tracks.append(disp)
+            if track.get("album", "—") in ("", "—"):
+                missing_album_tracks.append(disp)
+        no_artist = len(missing_artist_tracks)
+        no_album = len(missing_album_tracks)
         lines = [
             "📊 خلاصه مجموعه آهنگ‌ها", "",
             f"🎵 تعداد کل آهنگ‌ها: {len(tracks)}", "",
@@ -2047,20 +2107,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.extend(f"• {name} ({count} آهنگ)" for name, count in sorted(album_counts.items(), key=lambda x: x[0].casefold()))
         else:
             lines.append("• تگ آلبوم ثبت نشده")
-        lines.extend(["", f"▫️ بدون تگ هنرمند: {no_artist}", f"▫️ بدون تگ آلبوم: {no_album}"])
+        lines.append("")
+        lines.append(f"▫️ بدون تگ هنرمند: {no_artist}")
+        if no_artist:
+            lines.extend(f"• {name}" for name in missing_artist_tracks)
+        lines.append(f"▫️ بدون تگ آلبوم: {no_album}")
+        if no_album:
+            lines.extend(f"• {name}" for name in missing_album_tracks)
         context.user_data.pop("summary_session", None)
         context.user_data["waiting"] = None
+        chunks = []
+        buf = []
+        size = 0
+        for line in lines:
+            add = len(line) + 1
+            if buf and size + add > 3500:
+                chunks.append(chr(10).join(buf))
+                buf = [line]
+                size = add
+            else:
+                buf.append(line)
+                size += add
+        if buf:
+            chunks.append(chr(10).join(buf))
         dashboard = context.user_data.get("progress_dashboard")
         if dashboard and dashboard.get("operation") == "summary":
             try:
-                await context.bot.edit_message_text(chat_id=dashboard["chat_id"], message_id=dashboard["message_id"], text="\n".join(lines))
+                await context.bot.edit_message_text(
+                    chat_id=dashboard["chat_id"],
+                    message_id=dashboard["message_id"],
+                    text=chunks[0],
+                )
             except Exception:
-                await query.message.reply_text("\n".join(lines), reply_markup=main_reply_keyboard())
+                await query.message.reply_text(chunks[0], reply_markup=main_reply_keyboard() if len(chunks) == 1 else None)
+            for j, extra in enumerate(chunks[1:]):
+                is_last = (j == len(chunks) - 2)
+                await query.message.reply_text(extra, reply_markup=main_reply_keyboard() if is_last else None)
             context.user_data.pop("progress_dashboard", None)
         else:
-            await query.message.reply_text("\n".join(lines), reply_markup=main_reply_keyboard())
+            for i, chunk in enumerate(chunks):
+                kb = main_reply_keyboard() if i == len(chunks) - 1 else None
+                await query.message.reply_text(chunk, reply_markup=kb)
         return
-
     if data.startswith("arch:"):
         a = context.user_data.get("archive")
         if data == "arch:close":
@@ -2107,17 +2195,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 merged.append(dict(entry, source="A", duplicate_level="independent", review=False, status="pending"))
             for entry in sorted(a["sources"]["source_b"], key=lambda x:x.get("message_id",0)):
                 item=dict(entry, source="B", duplicate_level="independent", review=False, status="pending")
-                match=None; level="independent"
+                definite_hit=None
+                manual_hits=[]
                 for i, previous in enumerate(merged):
-                    result=classify_duplicate(previous,item)
-                    if result=="definite": match=i; level="definite"; break
-                    if result=="manual": match=i; level="manual"
-                if match is not None and level=="definite":
-                    merged[match].setdefault("also_in_source_b", True); definite_count+=1
-                elif match is not None:
-                    item["review"]=True; item["duplicate_level"]="review"; item["possible_match"]=match+1
+                    result, labels = classify_detail(previous, item)
+                    if result=="definite":
+                        definite_hit=i
+                        break
+                    if result=="manual":
+                        manual_hits.append({
+                            "index": i,
+                            "number": previous.get("number") or (i + 1),
+                            "title": track_display_name(previous),
+                            "criteria": list(labels),
+                        })
+                if definite_hit is not None:
+                    merged[definite_hit].setdefault("also_in_source_b", True); definite_count+=1
+                elif manual_hits:
+                    item["review"]=True
+                    item["duplicate_level"]="review"
+                    item["possible_match"]=manual_hits[0]["index"]+1
+                    item["review_matches"]=[{
+                        "number": h.get("number"),
+                        "title": h.get("title"),
+                        "criteria": h.get("criteria") or [],
+                    } for h in manual_hits]
+                    if manual_hits[0].get("criteria"):
+                        item["review_criteria"]=list(manual_hits[0]["criteria"])
                     merged.append(item); review_count+=1
-                else: merged.append(item)
+                else:
+                    merged.append(item)
             for i,x in enumerate(merged,1): x["number"]=i
             a["queue"]=merged; a["phase"]="queue"
             lines=["ARCHIVE-MANIFEST v1",f"تعداد آهنگ‌ها: {len(merged)}",f"تکراری قطعی حذف‌شده: {definite_count}",f"نیازمند بررسی: {review_count}","", "فهرست آهنگ‌ها:"]
@@ -2126,8 +2233,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 artist=x.get("artist") or "هنرمند نامشخص"
                 name=x.get("title") or Path(x.get("name") or "بدون نام").stem
                 lines.append(f"{x['number']:03d}. {mark}{name} - {artist}")
+                if x.get("review") and x.get("review_matches"):
+                    for h in x["review_matches"]:
+                        crit=", ".join(h.get("criteria") or []) or "—"
+                        lines.append(f"    ↳ مشابه: {h.get('title') or '—'} | معیارها: {crit}")
             # JSON payload after readable list lets the same text be imported without losing file references.
-            manifest={"format":"archive-v1","tracks":[{k:x.get(k) for k in ("number","name","title","artist","duration","size","file_id","file_unique_id","review","possible_match","source")} for x in merged]}
+            manifest={"format":"archive-v1","tracks":[{k:x.get(k) for k in ("number","name","title","artist","duration","size","file_id","file_unique_id","review","possible_match","review_matches","review_criteria","source")} for x in merged]}
             lines += ["", "---DATA---", json.dumps(manifest,ensure_ascii=False,separators=(",",":"))]
             report="\n".join(lines)
             preview="\n".join(lines[:min(len(lines), 24)])
@@ -2179,7 +2290,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.update({"archive_current": prev_idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
             title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
             artist = (item.get("artist") or "هنرمند نامشخص").strip()
-            warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
+            warning = format_review_warning(item, queue)
             progress = ((prev_idx + 1) / len(queue) * 100) if queue else 0
             title_button = InlineKeyboardButton(text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"), copy_text=CopyTextButton(text=title or ""))
             await query.message.reply_text(
@@ -2245,7 +2356,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.update({"archive_current":idx,"waiting":"archive_track","album_mode":False,"editing_album_track":False})
             title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
             artist = (item.get("artist") or "هنرمند نامشخص").strip()
-            warning = "\n❗ این ترک نیازمند بررسی دستی است؛ خودت شباهت آن را بررسی کن." if item.get("review") else ""
+            warning = format_review_warning(item, queue)
             progress = ((idx + 1) / len(queue) * 100) if queue else 0
             title_button = InlineKeyboardButton(
                 text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),

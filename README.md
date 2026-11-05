@@ -1,4 +1,9 @@
-# Music Tag Bot — v5.1.0 (Archive Resume & Default Tags Enhancement)
+# Music Tag Bot — v5.2.0
+
+## v5.2.0 changes
+- Archive Needs Review: shows matched track name(s) and the exact shared criteria (2 of 4 signals).
+- Collection summary lists track names missing Artist and/or Album tags (title or filename); long reports are split across messages.
+- Duplicate classification algorithm unchanged (3+ definite, 2 manual/review, else independent).
 
 ## v5.1.0 changes
 - Archive Mode: choose start point (from beginning or from a specific track number); earlier tracks are skipped for that run while real numbering is preserved.
