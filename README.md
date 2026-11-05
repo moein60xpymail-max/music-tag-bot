@@ -1,6 +1,10 @@
-# Music Tag Bot — v6.2.0
+# Music Tag Bot — v6.2.1
 
-Built on v6.1.1.
+Built on v6.2.0.
+
+## v6.2.1 changes
+- Album Auto Forward media groups respect total payload size; on HTTP 413 groups are split and retried without duplicate sends.
+- Stronger Telegram parse-entities fallback for messages/captions (including media group related calls).
 
 ## v6.2.0 changes
 - Album Auto Forward: send selected tracks as Telegram media groups (max 10, last group >= 4 when possible).
