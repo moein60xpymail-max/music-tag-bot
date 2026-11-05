@@ -1,10 +1,16 @@
-# Music Tag Bot — v6.1.0
+# Music Tag Bot — v6.1.1
+
+Built on v6.1.0.
+
+## v6.1.1 changes
+- Fix Telegram BadRequest **Message is not modified** on menu edits (e.g. Default Tags Close).
+- Added  /  that only ignore this specific error.
+- Callback queries still answered; unrelated BadRequest errors are not swallowed.
 
 ## v6.1.0 changes
-- Default Tags **Export** (`default_tags.json`) and **Import** for the bot owner only.
+- Default Tags **Export** / **Import** (`default_tags.json`) for the bot owner only.
 - Export includes Single + Album defaults (values and Apply/Keep/Remove modes).
-- Import validates JSON, shows a summary, requires confirmation, and applies atomically (or changes nothing).
-- Unauthorized users cannot import/export.
+- Import validates JSON, shows a summary, requires confirmation, applies atomically.
 
 ## v6.0.0 changes
 - Swapped main menu buttons: Album (left) / Single Track (right) with updated emojis.

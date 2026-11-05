@@ -107,11 +107,10 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v6.1.0"
+VERSION = "v6.1.1"
 VERSION_CHANGES = [
-    "Default Tags: Export و Import فایل JSON برای مالک ربات",
-    "بازیابی تنظیمات Single و Album پس از ریستارت/دیپلوی از روی فایل خروجی",
-    "تأیید قبل از Import و رد فایل‌های نامعتبر بدون تغییر تنظیمات فعلی",
+    "رفع BadRequest: Message is not modified در ویرایش پیام‌های منو",
+    "helper امن برای edit_text/edit_reply_markup بدون سرکوب خطاهای دیگر",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -619,6 +618,39 @@ async def safe_delete_chat_message(bot, chat_id, message_id) -> None:
         pass
 
 
+def _is_message_not_modified(exc: BaseException) -> bool:
+    return "message is not modified" in str(exc).lower()
+
+
+async def safe_edit_message_text(message, text, **kwargs):
+    """Edit message text; ignore only Telegram 'Message is not modified'."""
+    if not message:
+        return None
+    try:
+        current = (getattr(message, "text", None) or getattr(message, "caption", None) or "")
+        # Skip when plain text identical and no explicit markup change forces update
+        if current == text and "reply_markup" not in kwargs and "parse_mode" not in kwargs:
+            return message
+        return await message.edit_text(text, **kwargs)
+    except BadRequest as exc:
+        if _is_message_not_modified(exc):
+            return message
+        raise
+
+
+async def safe_edit_reply_markup(message, reply_markup=None):
+    """Edit reply markup; ignore only Telegram 'Message is not modified'."""
+    if not message:
+        return None
+    try:
+        return await message.edit_reply_markup(reply_markup=reply_markup)
+    except BadRequest as exc:
+        if _is_message_not_modified(exc):
+            return message
+        raise
+
+
+
 def nav_push(context, tab: str, message_id=None, parent: str = None):
     """Track active UI tab per user for cleanup/return."""
     stack = context.user_data.setdefault("nav_stack", [])
@@ -880,10 +912,12 @@ def parse_defaults_import_payload(data) -> tuple:
     """Return (single_block, album_block) or raise ValueError."""
     if not isinstance(data, dict):
         raise ValueError("ساختار فایل معتبر نیست (object نیست).")
-    if data.get("format") not in (DEFAULTS_EXPORT_FORMAT, "music-tag-bot-defaults-v1"):
-        # allow missing format only if single/album keys look like defaults
+    fmt = data.get("format")
+    if fmt not in (None, DEFAULTS_EXPORT_FORMAT, "music-tag-bot-defaults-v1"):
         if not (isinstance(data.get("single"), dict) or isinstance(data.get("album"), dict)):
             raise ValueError("فرمت فایل Default Tags شناخته نشد.")
+    if fmt is None and not (isinstance(data.get("single"), dict) or isinstance(data.get("album"), dict)):
+        raise ValueError("فرمت فایل Default Tags شناخته نشد.")
     single = _sanitize_defaults_mode_block(data.get("single") or {})
     album = _sanitize_defaults_mode_block(data.get("album") or {})
     if not single and not album:
@@ -895,43 +929,39 @@ def apply_defaults_import(user_id: int, single: dict, album: dict) -> None:
     """Atomically replace owner's single+album defaults."""
     all_data = load_all_defaults()
     uid = str(user_id)
-    current = all_data.get(uid) or {}
-    # Start from templates then overlay imported values
     new_single = DEFAULT_SINGLE.copy()
-    new_single.update(single)
+    new_single.update({k: v for k, v in single.items() if not str(k).startswith("_")})
     if "_modes" in single:
         new_single["_modes"] = single["_modes"]
     if "_disabled" in single:
         new_single["_disabled"] = single["_disabled"]
     new_album = DEFAULT_ALBUM.copy()
-    new_album.update(album)
+    new_album.update({k: v for k, v in album.items() if not str(k).startswith("_")})
     if "_modes" in album:
         new_album["_modes"] = album["_modes"]
     if "_disabled" in album:
         new_album["_disabled"] = album["_disabled"]
-    all_data[uid] = {
-        "single": new_single,
-        "album": new_album,
-    }
+    all_data[uid] = {"single": new_single, "album": new_album}
     save_all_defaults(all_data)
 
 
 def defaults_import_summary(single: dict, album: dict) -> str:
     def lines(label, block):
         modes = block.get("_modes") or {}
+        disabled = set(block.get("_disabled") or [])
         parts = [f"**{label}**"]
         for k in DEFAULT_FIELD_ORDER:
-            if k not in block and k not in modes:
+            if k not in block and k not in modes and k not in disabled:
                 continue
-            m = modes.get(k) or ("keep" if k in set(block.get("_disabled") or []) else "apply")
+            m = modes.get(k) or ("keep" if k in disabled else "apply")
             if m == "remove":
-                parts.append(f"• {FIELDS.get(k,k)}: Remove")
+                parts.append(f"• {FIELDS.get(k, k)}: Remove")
             elif m == "keep":
-                parts.append(f"• {FIELDS.get(k,k)}: Keep")
+                parts.append(f"• {FIELDS.get(k, k)}: Keep")
             else:
-                parts.append(f"• {FIELDS.get(k,k)}: Apply `{block.get(k, '')}`")
-        return (chr(10).join(parts) if len(parts) > 1 else f"**{label}**: (خالی)")
-    return lines("Single", single) + chr(10)+chr(10) + lines("Album", album)
+                parts.append(f"• {FIELDS.get(k, k)}: Apply `{block.get(k, '')}`")
+        return chr(10).join(parts) if len(parts) > 1 else f"**{label}**: (خالی)"
+    return lines("Single", single) + chr(10) + chr(10) + lines("Album", album)
 
 
 def defaults_fields_keyboard(mode: str, current: Optional[Dict[str, Any]] = None) -> InlineKeyboardMarkup:
@@ -1372,7 +1402,7 @@ async def archive_show_list(query, context):
         rows.append([InlineKeyboardButton("✏️ باز کردن ترک بعدی", callback_data="arch:open_next")])
         rows.append([InlineKeyboardButton("📊 گزارش آرشیو", callback_data="arch:report")])
     rows.append([InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")])
-    await query.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
+    await safe_edit_message_text(query.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
 # ==================== گزارش خطاهای دریافت فایل ====================
 def explain_media_error(exc, stage):
@@ -2485,11 +2515,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         a = context.user_data.get("archive")
         if data == "arch:close":
             context.user_data.pop("archive", None)
-            await query.message.edit_text("آرشیو بسته شد. فایل‌های قبلی ربات دست‌نخورده‌اند.")
+            await safe_edit_message_text(query.message, "آرشیو بسته شد. فایل‌های قبلی ربات دست‌نخورده‌اند.")
             return
         if data == "arch:menu":
             if a: a["phase"] = "menu"
-            await query.message.edit_text("📚 منوی آرشیو", reply_markup=archive_keyboard())
+            await safe_edit_message_text(query.message, "📚 منوی آرشیو", reply_markup=archive_keyboard())
             return
         if not a:
             await query.message.reply_text("آرشیوی فعال نیست؛ از دکمه آرشیو موسیقی شروع کن.")
@@ -2513,12 +2543,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "arch:finish_a":
             a["phase"] = "menu"
             await finish_progress_dashboard(context, "archive_a", keep=True)
-            await query.message.edit_reply_markup(reply_markup=archive_keyboard())
+            await safe_edit_reply_markup(query.message, reply_markup=archive_keyboard())
             return
         if data == "arch:finish_b":
             a["phase"] = "menu"
             await finish_progress_dashboard(context, "archive_b", keep=True)
-            await query.message.edit_reply_markup(reply_markup=archive_keyboard())
+            await safe_edit_reply_markup(query.message, reply_markup=archive_keyboard())
             return
         if data == "arch:analyze":
             merged=[]; definite_count=0; review_count=0
@@ -2765,9 +2795,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "tag:menu" or data == "tag:close":
         if data == "tag:close":
-            await query.message.edit_text("بسته شد.")
+            await safe_edit_message_text(query.message, "بسته شد.")
         else:
-            await query.message.edit_text(
+            await safe_edit_message_text(
+                query.message,
                 "⚙️ **Tag Defaults Configuration**",
                 reply_markup=tag_config_keyboard(),
                 parse_mode=ParseMode.MARKDOWN,
@@ -2789,7 +2820,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 state = f"✅ Apply `{current.get(k, '')}`"
             text += f"• {FIELDS.get(k, k)}: {state}\n"
         text += "\nدکمه وضعیت را بزن تا بین Apply / Keep / Remove جابه‌جا شوی. دکمه ✏️ برای ویرایش مقدار Apply است."
-        await query.message.edit_text(
+        await safe_edit_message_text(
+            query.message,
             text,
             reply_markup=defaults_fields_keyboard(mode, current),
             parse_mode=ParseMode.MARKDOWN,
@@ -2826,7 +2858,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 state = f"✅ Apply `{current.get(k, '')}`"
             lines.append(f"• {FIELDS.get(k, k)}: {state}")
-        await query.message.edit_text(
+        await safe_edit_message_text(
+            query.message,
             "⚙️ تنظیم تگ‌های پیش‌فرض\n\n" + "\n".join(lines) +
             "\n\nدکمه وضعیت را بزن تا بین Apply / Keep / Remove جابه‌جا شوی. دکمه ✏️ برای ویرایش مقدار Apply است.",
             reply_markup=defaults_fields_keyboard(mode, current),
@@ -3064,7 +3097,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             page = 0
         tracks = context.user_data.get("album_tracks", [])
         try:
-            await query.message.edit_reply_markup(reply_markup=album_track_pick_keyboard(tracks, page=page))
+            await safe_edit_reply_markup(query.message, reply_markup=album_track_pick_keyboard(tracks, page=page))
         except TelegramError:
             await query.message.chat.send_message(
                 "✏️ یک ترک را برای ویرایش انتخاب کن:",
@@ -3112,7 +3145,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if idx in selected: selected.remove(idx)
         else: selected.add(idx)
         context.user_data["album_selected"] = sorted(selected)
-        await query.message.edit_reply_markup(reply_markup=album_select_keyboard(context.user_data.get("album_tracks", []), selected))
+        await safe_edit_reply_markup(query.message, reply_markup=album_select_keyboard(context.user_data.get("album_tracks", []), selected))
         return
 
     if data == "album:select_done":
@@ -3241,7 +3274,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entries = draft.get("entries", [])
         if action == "menu":
             draft_text = build_album_summary_text(entries, context.user_data.get("main_artists", []), draft.get("album_name", ""))
-            await query.message.edit_text(draft_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([
+            await safe_edit_message_text(query.message, draft_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ افزودن آهنگ", callback_data="albumsummary:add")],
                 [InlineKeyboardButton("✏️ ویرایش آهنگ موجود", callback_data="albumsummary:edit")],
                 [InlineKeyboardButton("🗑 حذف آهنگ", callback_data="albumsummary:delete")],
@@ -3412,7 +3445,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tracks = context.user_data.get("af_album_tracks") or []
             context.user_data["af_album_slot"] = slot
             try:
-                await query.message.edit_text(
+                await safe_edit_message_text(query.message, 
                     f"انتخاب ترک برای ارسال به «{af_channel_label(context, slot)}»:",
                     reply_markup=af_album_keyboard(tracks, slot),
                 )
