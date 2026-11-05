@@ -107,11 +107,16 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v5.2.1"
+VERSION = "v6.0.0"
 VERSION_CHANGES = [
-    "اصلاح نمایش دقیق معیارهای تشابه در Needs Review (از نتیجه واقعی classify_detail)",
-    "محاسبه مجدد معیارها هنگام نمایش اگر در داده صف ذخیره نشده باشند",
-    "حفظ کامل قابلیت‌های نسخه ۵.۲.۰",
+    "UX: جابه‌جایی دکمه‌های Single/Album و یکسان‌سازی منوها",
+    "ویرایشگر مستقیم تگ با Copy / Remove / Cancel بدون منوی واسطه",
+    "پاک‌سازی منوی ویرایش پس از انتخاب گزینه و بازگشت خودکار",
+    "پیام وضعیت ۳ثانیه‌ای برای Apply Default Tags و Save",
+    "Album Mode: دکمه لغو واقعی + دریافت نام آلبوم قبل از فایل‌ها",
+    "منوی آلبوم فشرده با Edit Selected Track و صفحه‌بندی",
+    "سیستم ناوبری تب سراسری (حذف منوی قبلی / بازگردانی والد)",
+    "انتخاب فیلد با دکمه‌های Inline به‌جای تایپ دستی",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -599,11 +604,146 @@ def apply_defaults_to_file(
 
 
 # ==================== دکمه‌ها ====================
+
+# ==================== Navigation / Tab lifecycle ====================
+async def safe_delete_message(message) -> None:
+    if not message:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def safe_delete_chat_message(bot, chat_id, message_id) -> None:
+    if not chat_id or not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+def nav_push(context, tab: str, message_id=None, parent: str = None):
+    """Track active UI tab per user for cleanup/return."""
+    stack = context.user_data.setdefault("nav_stack", [])
+    if parent is None and stack:
+        parent = stack[-1].get("tab")
+    entry = {"tab": tab, "message_id": message_id, "parent": parent}
+    stack.append(entry)
+    context.user_data["nav_active"] = entry
+    return entry
+
+
+def nav_set_message(context, message_id):
+    active = context.user_data.get("nav_active")
+    if active is not None:
+        active["message_id"] = message_id
+
+
+def nav_pop(context):
+    stack = context.user_data.get("nav_stack") or []
+    if not stack:
+        context.user_data.pop("nav_active", None)
+        return None
+    stack.pop()
+    context.user_data["nav_active"] = stack[-1] if stack else None
+    return context.user_data.get("nav_active")
+
+
+async def nav_close_active(context, bot, chat_id):
+    active = context.user_data.get("nav_active")
+    if active and active.get("message_id"):
+        await safe_delete_chat_message(bot, chat_id, active["message_id"])
+
+
+def direct_field_keyboard(field: str) -> InlineKeyboardMarkup:
+    """Copy / Remove / Cancel under direct field edit prompt."""
+    rows = [
+        [
+            InlineKeyboardButton("📋 Copy", callback_data=f"copy:{field}"),
+            InlineKeyboardButton("🗑 Remove", callback_data=f"delete:{field}"),
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="action:cancel_field")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def picture_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="action:cancel_field")]])
+
+
+def lyrics_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="action:cancel_field")]])
+
+
+def field_pick_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    """Inline field picker for Apply-to-All / Group Edit style flows."""
+    mapping = [
+        ("🎵 Title", "title"),
+        ("👤 Artist", "artist"),
+        ("💿 Album", "album"),
+        ("📅 Year", "year"),
+        ("🔢 Track", "track"),
+        ("🎼 Genre", "genre"),
+        ("👥 Album Artist", "albumartist"),
+        ("✍️ Composer", "composer"),
+        ("💿 Disc", "disc"),
+        ("🏢 Publisher", "publisher"),
+        ("💬 Comment", "comment"),
+    ]
+    rows = []
+    row = []
+    for label, key in mapping:
+        row.append(InlineKeyboardButton(label, callback_data=f"{prefix}:{key}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data=f"{prefix}:cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def album_exit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو / خروج از آلبوم", callback_data="album:exit")]])
+
+
+def album_track_pick_keyboard(tracks, page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
+    total = len(tracks)
+    start = page * per_page
+    end = min(start + per_page, total)
+    rows = []
+    for i in range(start, end):
+        t = tracks[i]
+        idx = t.get("index", i)
+        title = "—"
+        p = t.get("path")
+        if p and os.path.isfile(p):
+            try:
+                title = get_tags(p).get("title") or Path(t.get("original_name", "track")).stem
+            except Exception:
+                title = Path(t.get("original_name", "track")).stem
+        else:
+            title = Path(t.get("original_name", f"track{i+1}")).stem
+        label = f"Track {i+1}: {str(title)[:28]}"
+        rows.append([InlineKeyboardButton(label, callback_data=f"album:edit:{idx}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"album:pickpage:{page-1}"))
+    if end < total:
+        nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"album:pickpage:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("⬅️ Back to Album Menu", callback_data="album:pick_back")])
+    return InlineKeyboardMarkup(rows)
+
+
 def main_reply_keyboard() -> ReplyKeyboardMarkup:
     """دکمه‌های پایین صفحه که همیشه دیده می‌شوند"""
     keyboard = [
         [KeyboardButton("🏠 شروع")],
-        [KeyboardButton("🎧 حالت آهنگ تکی"), KeyboardButton("💿 حالت آلبوم")],
+        [KeyboardButton("💿 حالت آلبوم"), KeyboardButton("🎵 حالت تکی آهنگ")],
         [KeyboardButton("📚 حالت آرشیو")],
         [KeyboardButton("📊 خلاصه آهنگ‌ها")],
         [KeyboardButton("⚙️ تگ‌های پیش‌فرض")],
@@ -968,16 +1108,15 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("album_summary_confirmed", None)
     context.user_data["waiting"] = "album_main_artists"
 
-    await update.message.reply_text(
+    sent = await update.message.reply_text(
         "💿 **Album Mode**\n\n"
         "اول نام هنرمند(های) اصلی آلبوم را بفرست.\n"
         "اگر چند نفر هستند با کاما جدا کن.\n"
-        "مثال: `Yas , Amir Tataloo`\n\n"
-        "بعد فایل‌های MP3 را یکی‌یکی بفرست و در پایان دکمه **Finish Uploading** را بزن.\n\n"
-        "اگر خواستی از حالت آلبوم خارج شی، دکمه «❌ لغو / خروج از آلبوم» رو بزن.",
+        "مثال: `Yas , Amir Tataloo`",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=main_reply_keyboard(),
+        reply_markup=album_exit_keyboard(),
     )
+    nav_push(context, "album_setup", sent.message_id, parent="main")
 
 
 # ==================== آرشیو موسیقی (نسخه پایه قابل استفاده) ====================
@@ -1394,6 +1533,12 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # حالت آلبوم
     if context.user_data.get("album_mode"):
+        if context.user_data.get("waiting") in ("album_main_artists", "album_name") or not context.user_data.get("album_name"):
+            await message.reply_text(
+                "اول نام هنرمندان و نام آلبوم را کامل کن؛ سپس فایل بفرست.",
+                reply_markup=album_exit_keyboard(),
+            )
+            return
         folder = context.user_data["album_folder"]
         attempt = context.user_data.get("album_receive_attempt", 0) + 1
         context.user_data["album_receive_attempt"] = attempt
@@ -1600,7 +1745,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in {"🏠 شروع", "🎵 شروع"}:
         await start(update, context)
         return
-    if text in {"🎧 حالت آهنگ تکی", "🎵 حالت آهنگ تکی"}:
+    if text in {"🎧 حالت آهنگ تکی", "🎵 حالت آهنگ تکی", "🎵 حالت تکی آهنگ"}:
         await single_mode_command(update, context)
         return
     if text in {"📚 حالت آرشیو", "📚 آرشیو موسیقی"}:
@@ -2016,12 +2161,29 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # هنرمندان اصلی آلبوم
     if waiting == "album_main_artists":
         artists = [a.strip() for a in re.split(r"\s*,\s*", value) if a.strip()]
+        if not artists:
+            await send_temporary_prompt(update.message, context, "حداقل یک نام هنرمند بفرست.")
+            return
         context.user_data["main_artists"] = artists
+        context.user_data["waiting"] = "album_name"
+        await update.message.reply_text(
+            f"✅ هنرمندان اصلی آلبوم: {' , '.join(artists)}\n\n💿 حالا نام آلبوم را وارد کن:",
+            reply_markup=album_exit_keyboard(),
+        )
+        return
+
+    if waiting == "album_name":
+        album_name = value.strip()
+        if not album_name:
+            await send_temporary_prompt(update.message, context, "نام آلبوم نمی‌تواند خالی باشد. دوباره بفرست.")
+            return
+        context.user_data["album_name"] = album_name
         context.user_data["waiting"] = None
         await update.message.reply_text(
-            f"✅ هنرمندان اصلی آلبوم: {' , '.join(artists)}\n\n"
-            "حالا فایل‌های MP3 آلبوم را یکی‌یکی بفرست.\n"
-            "وقتی تمام شد دکمه **Finish Uploading** را بزن."
+            f"✅ نام آلبوم: {album_name}\n\n"
+            "🎵 حالا فایل‌های MP3 آلبوم را یکی‌یکی بفرست.\n"
+            "وقتی تمام شد دکمه **Finish Uploading** را بزن.",
+            reply_markup=album_exit_keyboard(),
         )
         return
 
@@ -2648,6 +2810,86 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ---------- حالت آلبوم ----------
+
+
+    if data.startswith("afield:"):
+        key = data.split(":", 1)[1]
+        if key == "cancel":
+            await safe_delete_message(query.message)
+            await show_album_overview(query, context)
+            return
+        context.user_data["waiting"] = "album_all_value"
+        context.user_data["album_all_field"] = key
+        await safe_delete_message(query.message)
+        await send_temporary_prompt(
+            query.message, context,
+            f"مقدار جدید برای **{FIELDS.get(key, key)}** را بفرست (اعمال روی همه ترک‌ها):",
+        )
+        return
+
+    if data.startswith("gfield:"):
+        key = data.split(":", 1)[1]
+        if key == "cancel":
+            await safe_delete_message(query.message)
+            await show_album_overview(query, context)
+            return
+        context.user_data["waiting"] = "album_selected_field"
+        context.user_data["album_selected_key"] = key
+        await safe_delete_message(query.message)
+        await send_temporary_prompt(
+            query.message, context,
+            f"مقدار جدید برای **{FIELDS.get(key, key)}** را بفرست (اعمال روی ترک‌های انتخاب‌شده):",
+        )
+        return
+
+    if data == "album:exit":
+        # Cancel album mode session
+        album_folder = context.user_data.get("album_folder")
+        if album_folder and os.path.isdir(album_folder):
+            shutil.rmtree(album_folder, ignore_errors=True)
+        for k in ("album_mode", "editing_album_track", "album_tracks", "main_artists", "album_name",
+                  "album_folder", "album_summary_draft", "album_summary_confirmed", "waiting",
+                  "af_album_tracks", "album_selected"):
+            context.user_data.pop(k, None)
+        context.user_data["album_mode"] = False
+        context.user_data["waiting"] = None
+        await safe_delete_message(query.message)
+        await query.message.chat.send_message(
+            "✅ از حالت آلبوم خارج شدی.",
+            reply_markup=main_reply_keyboard(),
+        )
+        return
+
+    if data == "album:pick_tracks":
+        tracks = context.user_data.get("album_tracks", [])
+        await safe_delete_message(query.message)
+        sent = await query.message.chat.send_message(
+            "✏️ یک ترک را برای ویرایش انتخاب کن:",
+            reply_markup=album_track_pick_keyboard(tracks, page=0),
+        )
+        nav_push(context, "album_pick", sent.message_id, parent="album_menu")
+        return
+
+    if data.startswith("album:pickpage:"):
+        try:
+            page = int(data.split(":")[2])
+        except Exception:
+            page = 0
+        tracks = context.user_data.get("album_tracks", [])
+        try:
+            await query.message.edit_reply_markup(reply_markup=album_track_pick_keyboard(tracks, page=page))
+        except TelegramError:
+            await query.message.chat.send_message(
+                "✏️ یک ترک را برای ویرایش انتخاب کن:",
+                reply_markup=album_track_pick_keyboard(tracks, page=page),
+            )
+        return
+
+    if data == "album:pick_back":
+        await safe_delete_message(query.message)
+        await show_album_overview(query, context)
+        return
+
     if data == "album:finish":
         tracks = context.user_data.get("album_tracks", [])
         if not tracks:
@@ -2662,6 +2904,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tags = get_tags(p)
             artist = tags.get("artist", "—")
             set_tag(p, "albumartist", " , ".join(main_artists) if main_artists else artist)
+            album_name = context.user_data.get("album_name")
+            if album_name:
+                set_tag(p, "album", album_name)
         # دیگر فایل جدید به آلبوم اضافه نشود
         context.user_data["album_mode"] = False
         await finish_progress_dashboard(context, "album", keep=False)
@@ -2712,7 +2957,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_album_overview(query,context)
             return
         context.user_data["waiting"] = "album_selected_field"
-        await query.message.reply_text(f"✅ {len(selected)} ترک انتخاب شد. نام فیلدی را که می‌خواهی تغییر کند بفرست: artist, albumartist, album, genre, composer, publisher, year, comment")
+        await safe_delete_message(query.message)
+        sent = await query.message.chat.send_message(
+            f"✅ {len(selected)} ترک انتخاب شد. فیلد موردنظر را انتخاب کن:",
+            reply_markup=field_pick_keyboard("gfield"),
+        )
+        nav_push(context, "group_field", sent.message_id, parent="album_menu")
+        return
         return
 
     if data == "album:back":
@@ -2739,6 +2990,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "action:unreleased":
+        await safe_delete_message(query.message)
         if not path or not os.path.exists(path):
             await query.message.reply_text("اول یک آهنگ را باز کن.")
             return
@@ -2762,12 +3014,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "album:all":
-        context.user_data["waiting"] = "album_all_field"
-        await send_temporary_prompt(query.message, context,
-            "کدام فیلد را می‌خواهی روی **همه ترک‌ها** اعمال کنی؟\n"
-            "یکی از این‌ها را بنویس: title, artist, album, year, track, genre, albumartist, composer, disc, publisher, comment"
+        await safe_delete_message(query.message)
+        sent = await query.message.chat.send_message(
+            "کدام فیلد را می‌خواهی روی **همه ترک‌ها** اعمال کنی؟",
+            reply_markup=field_pick_keyboard("afield"),
+            parse_mode=ParseMode.MARKDOWN,
         )
-        return
+        nav_push(context, "album_all_field", sent.message_id, parent="album_menu")
 
     if data == "album:defaults":
         tracks = context.user_data.get("album_tracks", [])
@@ -3072,16 +3325,29 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not path or not os.path.exists(path):
             await query.message.reply_text("اول یک آهنگ بفرست.")
             return
-        current = (
-            get_tags(path).get(field, "—")
-            if field != "filename"
-            else context.user_data.get("filename", "—")
+        # Close editor menu (Change 2/3/8)
+        await safe_delete_message(query.message)
+        if field == "filename":
+            current = context.user_data.get("filename", "—")
+        else:
+            current = get_tags(path).get(field, "—")
+        if current in (None, "", "—"):
+            current_disp = "ندارد"
+        else:
+            current_disp = current
+        context.user_data["waiting"] = field
+        context.user_data["waiting_mode"] = "field_edit"
+        prompt = (
+            f"✏️ **{FIELDS.get(field, field)}**\n"
+            f"مقدار فعلی: `{current_disp}`\n\n"
+            f"مقدار جدید را بفرست:"
         )
-        await query.message.reply_text(
-            f"**{FIELDS.get(field, field)}**\nCurrent: `{current}`",
-            reply_markup=field_action_keyboard(field),
+        sent = await query.message.chat.send_message(
+            prompt,
+            reply_markup=direct_field_keyboard(field),
             parse_mode=ParseMode.MARKDOWN,
         )
+        nav_push(context, f"field:{field}", sent.message_id, parent="editor")
         return
 
     if data.startswith("edit:"):
@@ -3128,7 +3394,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "action:cancel_field":
-        await query.message.reply_text("لغو شد. برگشتی به منوی ویرایش.")
+        context.user_data["waiting"] = None
+        context.user_data["waiting_mode"] = None
+        await safe_delete_message(query.message)
         await show_editor(
             update,
             context,
@@ -3140,25 +3408,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "action:showlyrics":
         if not path:
             return
+        await safe_delete_message(query.message)
         tags = get_tags(path)
         lyrics = tags.get("lyrics", "—")
-        await query.message.reply_text(
-            lyrics if lyrics != "—" else "متنی ثبت نشده."
+        text = lyrics if lyrics != "—" else "متنی ثبت نشده."
+        sent = await query.message.chat.send_message(
+            text[:4000],
+            reply_markup=lyrics_back_keyboard(),
         )
+        nav_push(context, "showlyrics", sent.message_id, parent="editor")
         return
 
     if data == "action:picture":
+        await safe_delete_message(query.message)
         context.user_data["waiting"] = "picture"
-        await query.message.reply_text(
-            "عکس جدید کاور را به صورت عکس یا فایل بفرست.\nاگر منصرف شدی /cancel بزن."
+        sent = await query.message.chat.send_message(
+            "🖼️ تصویر جدید کاور را به صورت عکس یا فایل بفرست.",
+            reply_markup=picture_cancel_keyboard(),
         )
+        nav_push(context, "picture", sent.message_id, parent="editor")
         return
 
     if data == "action:remove":
-        await query.message.reply_text(
+        await safe_delete_message(query.message)
+        sent = await query.message.chat.send_message(
             "⚠️ آیا مطمئنی می‌خواهی **همه تگ‌ها و کاور** را حذف کنی؟",
             reply_markup=confirm_remove_keyboard(),
+            parse_mode=ParseMode.MARKDOWN,
         )
+        nav_push(context, "remove_confirm", sent.message_id, parent="editor")
         return
 
     if data == "confirm:remove_yes":
@@ -3191,41 +3469,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "action:defaults":
         if not path:
             return
-        user_id = query.from_user.id
-        defaults = get_user_defaults(user_id)
-        is_single = not context.user_data.get("editing_album_track", False)
-        apply_defaults_to_file(
-            path,
-            defaults["single"] if is_single else defaults["album"],
-            is_single=is_single,
-        )
-
-        # کاور اصلی رو دوباره با زور برگردون
-        if context.user_data.get("original_cover"):
-            restore_cover_from_backup(path, context.user_data["original_cover"])
-
-        # بعد از اعمال پیش‌فرض‌ها، اسم فایل را هم از روی آرتیست و عنوان بساز
-        tags = get_tags(path)
-        new_filename = generate_filename(
-            tags.get("artist", ""), tags.get("title", "")
-        )
-        context.user_data["filename"] = new_filename
-
-        await query.message.reply_text(
-            f"✅ تگ‌های پیش‌فرض اعمال شدند.\n"
-            f"اسم فایل هم شد: `{new_filename}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        await show_editor(
-            update,
-            context,
-            is_album=context.user_data.get("editing_album_track", False),
-        )
+        if context.user_data.get("op_busy"):
+            await query.answer("عملیات در حال انجام است.", show_alert=False)
+            return
+        context.user_data["op_busy"] = True
+        await safe_delete_message(query.message)
+        status = await query.message.chat.send_message("⏳ در حال اعمال تگ‌های پیش‌فرض هستیم...")
+        try:
+            for dots in (".", "..", "..."):
+                await asyncio.sleep(1)
+                try:
+                    await status.edit_text(f"⏳ در حال اعمال تگ‌های پیش‌فرض هستیم{dots}")
+                except Exception:
+                    pass
+            user_id = query.from_user.id
+            defaults = get_user_defaults(user_id)
+            is_single = not context.user_data.get("editing_album_track", False)
+            apply_defaults_to_file(
+                path,
+                defaults["single"] if is_single else defaults["album"],
+                is_single=is_single,
+            )
+            if context.user_data.get("original_cover"):
+                restore_cover_from_backup(path, context.user_data["original_cover"])
+            tags = get_tags(path)
+            new_filename = generate_filename(
+                tags.get("artist", ""), tags.get("title", "")
+            )
+            context.user_data["filename"] = new_filename
+            try:
+                await status.edit_text(
+                    f"✅ تگ‌های پیش‌فرض اعمال شدند.\nاسم فایل: `{new_filename}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                await query.message.chat.send_message(
+                    f"✅ تگ‌های پیش‌فرض اعمال شدند.\nاسم فایل: `{new_filename}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            await show_editor(
+                update,
+                context,
+                is_album=context.user_data.get("editing_album_track", False),
+            )
+        finally:
+            context.user_data["op_busy"] = False
         return
 
     if data == "action:save":
         if not path or not os.path.exists(path):
             return
+        if context.user_data.get("op_busy"):
+            await query.answer("عملیات در حال انجام است.", show_alert=False)
+            return
+        context.user_data["op_busy"] = True
+        await safe_delete_message(query.message)
+        status = await query.message.chat.send_message("💾 در حال ذخیره آهنگ هستیم...")
+        try:
+            for dots in (".", "..", "..."):
+                await asyncio.sleep(1)
+                try:
+                    await status.edit_text(f"💾 در حال ذخیره آهنگ هستیم{dots}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            await status.delete()
+        except Exception:
+            pass
         tags = get_tags(path)
         main_artists = (
             context.user_data.get("main_artists")
@@ -3304,6 +3616,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         # Archive tracks are marked complete only after the explicit button press.
         # Single-track and album workflows remain unchanged.
+        finally:
+            context.user_data["op_busy"] = False
         return
 
 
@@ -3399,27 +3713,16 @@ async def show_album_overview(query, context):
             extra = f"   💿 Album: {album}\n   ⚠️ فقط اطلاعات تلگرام؛ فایل دانلود نشده\n"
         text += f"{position}. {title} — {artist}\n" + extra
 
-    buttons = []
-    for position, t in enumerate(tracks, 1):
-        if t.get("path") and os.path.isfile(t["path"]):
-            buttons.append([InlineKeyboardButton(f"✏️ Edit Track {position}", callback_data=f"album:edit:{t['index']}")])
-    buttons.append(
-        [InlineKeyboardButton("📌 Apply Default Tags (Album)", callback_data="album:defaults")]
-    )
-    buttons.append(
-        [InlineKeyboardButton("📝 Apply to All Tracks", callback_data="album:all")]
-    )
-    buttons.append(
-        [InlineKeyboardButton("🎯 Select Tracks for Group Edit", callback_data="album:select_menu")]
-    )
-    buttons.append([InlineKeyboardButton("🧰 Album Tools", callback_data="album:tools")])
-    buttons.append([InlineKeyboardButton("🧹 حذف آرتیست از همه ترک‌ها", callback_data="album:remove_artist")])
-    buttons.append(
-        [InlineKeyboardButton("📊 Album Summary", callback_data="album:summary")]
-    )
-    buttons.append(
-        [InlineKeyboardButton("📩 Save All & Send", callback_data="album:save_all")]
-    )
+    buttons = [
+        [InlineKeyboardButton("✏️ Edit Selected Track", callback_data="album:pick_tracks")],
+        [InlineKeyboardButton("📌 Apply Default Tags (Album)", callback_data="album:defaults")],
+        [InlineKeyboardButton("📝 Apply to All Tracks", callback_data="album:all")],
+        [InlineKeyboardButton("🎯 Select Tracks for Group Edit", callback_data="album:select_menu")],
+        [InlineKeyboardButton("🧰 Album Tools", callback_data="album:tools")],
+        [InlineKeyboardButton("🗑 Remove Artist from All Tracks", callback_data="album:remove_artist")],
+        [InlineKeyboardButton("📊 Album Summary", callback_data="album:summary")],
+        [InlineKeyboardButton("📩 Save All & Send", callback_data="album:save_all")],
+    ]
 
     await query.message.reply_text(
         text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.MARKDOWN

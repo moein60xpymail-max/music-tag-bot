@@ -1,4 +1,15 @@
-# Music Tag Bot — v5.2.1
+# Music Tag Bot — v6.0.0
+
+## v6.0.0 changes
+- Swapped main menu buttons: Album (left) / Single Track (right) with updated emojis.
+- Editor: selecting a field opens direct edit (Copy / Remove / Cancel); intermediate Edit menu removed.
+- Editor menu is closed when an option is chosen and restored after success or cancel.
+- Show Lyrics includes Cancel; Picture opens upload with Cancel only.
+- Apply Default Tags and Save show a ~3s status message before the real operation; duplicate taps blocked.
+- Album Mode: real Cancel/Exit button; request album name after main artists; Album tag applied on finish.
+- Album menu compacted: Edit Selected Track (+ pagination) instead of per-track buttons; Remove Artist label in English.
+- Global tab navigation helpers for cleaner menu lifecycle.
+- Apply-to-All / Group Edit field selection via inline buttons (not typed names).
 
 ## v5.2.1 changes
 - Needs Review warnings always show the exact matched criteria from live classify_detail (Title/Artist/Duration/File Size).
