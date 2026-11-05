@@ -22,6 +22,7 @@ from telegram import (
     ReplyKeyboardRemove,
     BotCommand,
     CopyTextButton,
+    InputMediaAudio,
 )
 from telegram.ext import (
     Application,
@@ -107,10 +108,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v6.1.1"
+VERSION = "v6.2.0"
 VERSION_CHANGES = [
-    "رفع BadRequest: Message is not modified در ویرایش پیام‌های منو",
-    "helper امن برای edit_text/edit_reply_markup بدون سرکوب خطاهای دیگر",
+    "Auto Forward آلبوم: ارسال Media Group با الگوریتم حداقل ۴ و حداکثر ۱۰ ترک",
+    "Album Summary: حذف منوی آلبوم هنگام باز شدن؛ نگه داشتن خلاصه هنگام Edit/Back",
+    "Apply Default Tags و Save All آلبوم: پیام وضعیت و تأخیر ۳ثانیه‌ای مانند Single",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -3187,10 +3189,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "album:back":
-        try:
-            await query.message.delete()
-        except TelegramError:
-            pass
+        # Keep current message (e.g. Album Summary) visible; open album menu again
         await show_album_overview(query, context)
         return
 
@@ -3247,21 +3246,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not tracks:
             await query.message.reply_text("ترکی وجود ندارد.")
             return
-        user_id = query.from_user.id
-        defaults = get_user_defaults(user_id)["album"]
-        for t in tracks:
-            p = t.get("path")
-            if not p or not os.path.isfile(p):
-                continue
-            apply_defaults_to_file(p, defaults, is_single=False)
-            # کاور اصلی همین ترک رو برگردون
-            if t.get("original_cover"):
-                restore_cover_from_backup(p, t["original_cover"])
-        await query.message.reply_text("✅ تگ‌های پیش‌فرض آلبوم روی همه ترک‌ها اعمال شد.")
-        await show_album_overview(query, context)
+        if context.user_data.get("op_busy"):
+            await query.answer("عملیات در حال انجام است.", show_alert=False)
+            return
+        context.user_data["op_busy"] = True
+        await safe_delete_message(query.message)
+        status = await query.message.chat.send_message("⏳ در حال اعمال تگ‌های پیش‌فرض هستیم...")
+        try:
+            for dots in (".", "..", "..."):
+                await asyncio.sleep(1)
+                try:
+                    await status.edit_text(f"⏳ در حال اعمال تگ‌های پیش‌فرض هستیم{dots}")
+                except Exception:
+                    pass
+            user_id = query.from_user.id
+            defaults = get_user_defaults(user_id)["album"]
+            applied = 0
+            for t in tracks:
+                p = t.get("path")
+                if not p or not os.path.isfile(p):
+                    continue
+                apply_defaults_to_file(p, defaults, is_single=False)
+                if t.get("original_cover"):
+                    restore_cover_from_backup(p, t["original_cover"])
+                applied += 1
+            try:
+                await status.edit_text(f"✅ تگ‌های پیش‌فرض آلبوم روی {applied} ترک اعمال شد.")
+            except Exception:
+                await query.message.chat.send_message(f"✅ تگ‌های پیش‌فرض آلبوم روی {applied} ترک اعمال شد.")
+            await show_album_overview(query, context)
+        finally:
+            context.user_data["op_busy"] = False
         return
 
     if data == "album:summary":
+        await safe_delete_message(query.message)
         await send_album_summary(query, context)
         return
 
@@ -3273,14 +3292,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action = data.split(":", 1)[1]
         entries = draft.get("entries", [])
         if action == "menu":
+            # Keep the Album Summary message; open editor UI as a new message
             draft_text = build_album_summary_text(entries, context.user_data.get("main_artists", []), draft.get("album_name", ""))
-            await safe_edit_message_text(query.message, draft_text, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ افزودن آهنگ", callback_data="albumsummary:add")],
-                [InlineKeyboardButton("✏️ ویرایش آهنگ موجود", callback_data="albumsummary:edit")],
-                [InlineKeyboardButton("🗑 حذف آهنگ", callback_data="albumsummary:delete")],
-                [InlineKeyboardButton("✅ تأیید و ثبت خلاصه", callback_data="albumsummary:confirm")],
-                [InlineKeyboardButton("↩️ لغو ویرایش", callback_data="albumsummary:cancel")],
-            ]))
+            await query.message.reply_text(
+                "✏️ ویرایش خلاصه آلبوم:",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("➕ افزودن آهنگ", callback_data="albumsummary:add")],
+                    [InlineKeyboardButton("✏️ ویرایش آهنگ موجود", callback_data="albumsummary:edit")],
+                    [InlineKeyboardButton("🗑 حذف آهنگ", callback_data="albumsummary:delete")],
+                    [InlineKeyboardButton("✅ تأیید و ثبت خلاصه", callback_data="albumsummary:confirm")],
+                    [InlineKeyboardButton("↩️ لغو ویرایش", callback_data="albumsummary:cancel")],
+                ]),
+            )
         elif action == "add":
             try:
                 await query.message.delete()
@@ -3493,33 +3516,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("هیچ ترک مجازی برای ارسال انتخاب نشده است.")
                 return
             context.user_data["af_album_busy"] = True
-            sent_n = failed_n = unknown_n = 0
+            # Preserve track order for media groups; skip already-sent
+            targets = [t for t in targets if _status_for_slot(t, slot) != "sent"]
+            targets = sorted(targets, key=lambda t: (t.get("index") is None, t.get("index", 0)))
             for t in targets:
-                if _status_for_slot(t, slot) == "sent":
-                    continue
                 _set_status_for_slot(t, slot, "sending")
-                try:
-                    await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
-                except TelegramError:
-                    pass
-                status, detail = await send_processed_to_channel(
-                    context.bot,
-                    ch["chat_id"],
-                    t.get("output_path"),
-                    filename=t.get("filename") or "track.mp3",
-                    title=t.get("title"),
-                    performer=t.get("artist"),
-                    duration=t.get("duration"),
-                    cover=t.get("cover"),
-                )
+            try:
+                await safe_edit_reply_markup(query.message, reply_markup=af_album_keyboard(tracks, slot))
+            except TelegramError:
+                pass
+            sent_n, failed_n, unknown_n = await send_album_tracks_as_media_groups(
+                context.bot, ch["chat_id"], targets
+            )
+            for t in targets:
+                status = t.get("_last_send_status") or "failed"
                 _set_status_for_slot(t, slot, status)
                 t.setdefault("selected_slots", {})[str(slot)] = False
-                if status == "sent":
-                    sent_n += 1
-                elif status == "unknown":
-                    unknown_n += 1
-                else:
-                    failed_n += 1
+                t.pop("_last_send_status", None)
             context.user_data["af_album_busy"] = False
             try:
                 await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
@@ -4029,6 +4042,35 @@ async def show_album_summary_draft(message, context):
 async def save_album_all(query, context):
     tracks = context.user_data.get("album_tracks", [])
     main_artists = context.user_data.get("main_artists", [])
+    if context.user_data.get("op_busy"):
+        try:
+            await query.answer("عملیات در حال انجام است.", show_alert=False)
+        except Exception:
+            pass
+        return
+    context.user_data["op_busy"] = True
+    await safe_delete_message(query.message)
+    status_msg = await query.message.chat.send_message("⏳ در حال آماده‌سازی و ارسال آهنگ‌های آلبوم هستیم...")
+    try:
+        for dots in (".", "..", "..."):
+            await asyncio.sleep(1)
+            try:
+                await status_msg.edit_text(f"⏳ در حال آماده‌سازی و ارسال آهنگ‌های آلبوم هستیم{dots}")
+            except Exception:
+                pass
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        await _save_album_all_body(query, context, tracks, main_artists)
+    finally:
+        context.user_data["op_busy"] = False
+
+
+async def _save_album_all_body(query, context, tracks, main_artists):
     for t in tracks:
         path = t.get("path")
         if not path or not os.path.isfile(path):
@@ -4198,6 +4240,119 @@ def _is_audio_media_error(exc: BaseException) -> bool:
     )
     return any(k in msg for k in keywords)
 
+
+
+def album_media_group_sizes(n: int) -> list:
+    """Split n album tracks into Telegram media-group sizes (max 10, last group >= 4 when possible)."""
+    if n <= 0:
+        return []
+    if n < 4:
+        # Cannot form a valid multi-item group; caller may send individually.
+        return [1] * n
+    sizes = []
+    remaining = n
+    while remaining > 10:
+        sizes.append(10)
+        remaining -= 10
+    sizes.append(remaining)
+    if len(sizes) >= 2 and sizes[-1] < 4:
+        need = 4 - sizes[-1]
+        sizes[-2] -= need
+        sizes[-1] += need
+    return sizes
+
+
+async def send_album_tracks_as_media_groups(bot, chat_id, targets: list) -> tuple:
+    """
+    Send album tracks as Telegram media groups following album_media_group_sizes.
+    Returns (sent_n, failed_n, unknown_n).
+    Preserves order. Groups of size 1 are sent as single audio (fallback).
+    """
+    sent_n = failed_n = unknown_n = 0
+    ordered = list(targets)
+    sizes = album_media_group_sizes(len(ordered))
+    idx = 0
+    for size in sizes:
+        group = ordered[idx:idx + size]
+        idx += size
+        if size == 1:
+            t = group[0]
+            status, detail = await send_processed_to_channel(
+                bot,
+                chat_id,
+                t.get("output_path"),
+                filename=t.get("filename") or "track.mp3",
+                title=t.get("title"),
+                performer=t.get("artist"),
+                duration=t.get("duration"),
+                cover=t.get("cover"),
+            )
+            if status == "sent":
+                sent_n += 1
+            elif status == "unknown":
+                unknown_n += 1
+            else:
+                failed_n += 1
+            t["_last_send_status"] = status
+            continue
+        # Media group path
+        file_handles = []
+        media = []
+        try:
+            for t in group:
+                path = t.get("output_path")
+                if not path or not os.path.isfile(path):
+                    raise FileNotFoundError(f"missing {path}")
+                fh = open(path, "rb")
+                file_handles.append(fh)
+                media.append(
+                    InputMediaAudio(
+                        media=fh,
+                        filename=t.get("filename") or "track.mp3",
+                        title=t.get("title") or None,
+                        performer=t.get("artist") or None,
+                        duration=t.get("duration"),
+                    )
+                )
+            await bot.send_media_group(chat_id=chat_id, media=media)
+            for t in group:
+                t["_last_send_status"] = "sent"
+                sent_n += 1
+        except (TimedOut, NetworkError) as e:
+            print("AF album media_group network/timeout:", repr(e))
+            for t in group:
+                t["_last_send_status"] = "unknown"
+                unknown_n += 1
+        except Exception as e:
+            print("AF album media_group error:", repr(e))
+            # Fallback: try one-by-one so partial success is possible
+            for t in group:
+                if t.get("_last_send_status") == "sent":
+                    continue
+                status, detail = await send_processed_to_channel(
+                    bot,
+                    chat_id,
+                    t.get("output_path"),
+                    filename=t.get("filename") or "track.mp3",
+                    title=t.get("title"),
+                    performer=t.get("artist"),
+                    duration=t.get("duration"),
+                    cover=t.get("cover"),
+                )
+                t["_last_send_status"] = status
+                if status == "sent":
+                    sent_n += 1
+                elif status == "unknown":
+                    unknown_n += 1
+                else:
+                    failed_n += 1
+        finally:
+            for fh in file_handles:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+    return sent_n, failed_n, unknown_n
 
 async def send_processed_to_channel(
     bot,

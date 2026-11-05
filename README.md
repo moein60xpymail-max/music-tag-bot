@@ -1,6 +1,11 @@
-# Music Tag Bot — v6.1.1
+# Music Tag Bot — v6.2.0
 
-Built on v6.1.0.
+Built on v6.1.1.
+
+## v6.2.0 changes
+- Album Auto Forward: send selected tracks as Telegram media groups (max 10, last group >= 4 when possible).
+- Album Summary: closes album menu on open; summary stays visible on Edit Summary and Back.
+- Album Apply Default Tags / Save All: same 3s status delay pattern as Single Track.
 
 ## v6.1.1 changes
 - Fix Telegram BadRequest **Message is not modified** on menu edits (e.g. Default Tags Close).
