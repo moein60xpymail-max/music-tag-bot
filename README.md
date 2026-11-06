@@ -1,6 +1,12 @@
-# Music Tag Bot — v6.2.2
+# Music Tag Bot — v6.2.3
 
-Built on v6.2.1 (user-provided base).
+Built on v6.2.2.
+
+## v6.2.3 changes
+- Root fix for album AF packing: full selected list is packed once (11 → 7+4).
+- Removed invalid post-413 split that produced 4+3+4.
+- On HTTP 413, all unsent tracks are re-packed with a smaller viable max_size (still min 4).
+- Cover/thumbnail code left unchanged.
 
 ## v6.2.2 changes
 - Album Auto Forward: strict count packing restored (11 → 7+4); no preemptive size splits that orphan a middle track.
