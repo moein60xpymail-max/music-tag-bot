@@ -1,6 +1,11 @@
-# Music Tag Bot — v6.2.1
+# Music Tag Bot — v6.2.2
 
-Built on v6.2.0.
+Built on v6.2.1 (user-provided base).
+
+## v6.2.2 changes
+- Album Auto Forward: strict count packing restored (11 → 7+4); no preemptive size splits that orphan a middle track.
+- Per-track cover/thumbnail attached to each InputMediaAudio in media groups.
+- On HTTP 413 only, groups are split with a controlled algorithm; generic errors no longer force silent single sends.
 
 ## v6.2.1 changes
 - Album Auto Forward media groups respect total payload size; on HTTP 413 groups are split and retried without duplicate sends.

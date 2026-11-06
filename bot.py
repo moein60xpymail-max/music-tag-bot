@@ -127,11 +127,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v6.2.1"
+VERSION = "v6.2.2"
 VERSION_CHANGES = [
-    "Auto Forward آلبوم: تقسیم Media Group بر اساس حجم برای جلوگیری از HTTP 413",
-    "Fallback امن هنگام 413 با گروه‌های کوچک‌تر و جلوگیری از ارسال تکراری",
-    "تقویت fallback قالب‌بندی Telegram برای parse entities",
+    "Auto Forward آلبوم: بازگشت به تقسیم دقیق شمارشی ۷+۴ و حذف جدا شدن ناخواسته ترک‌ها",
+    "کاور اختصاصی هر ترک در Media Group از طریق thumbnail",
+    "تقسیم مجدد فقط پس از خطای واقعی 413 و بدون تبدیل بی‌دلیل به ارسال تکی",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -4280,92 +4280,41 @@ def album_media_group_sizes(n: int) -> list:
     return sizes
 
 
-# Telegram request payload soft limit for media groups (leave margin under typical 50MB gateways)
-AF_MEDIA_GROUP_MAX_BYTES = 45 * 1024 * 1024
-AF_MEDIA_GROUP_MAX_ITEMS = 10
-AF_MEDIA_GROUP_MIN_ITEMS = 4
-
-
-def _track_file_size(t: dict) -> int:
-    path = t.get("output_path")
-    try:
-        if path and os.path.isfile(path):
-            return int(os.path.getsize(path))
-    except OSError:
-        pass
-    return 0
-
-
 def pack_album_media_groups(tracks: list) -> list:
-    """
-    Pack tracks into groups respecting:
-    - max 10 items
-    - prefer min 4 items when possible
-    - total file size soft limit per group
-    Returns list of track-sublists in original order.
-    """
+    """Strict count-based packing only (no preemptive size splits that orphan tracks)."""
     if not tracks:
         return []
-    # First cut by count algorithm into candidate windows, then re-pack by size inside
-    n = len(tracks)
-    count_sizes = album_media_group_sizes(n)
-    windows = []
-    idx = 0
-    for size in count_sizes:
-        windows.append(tracks[idx:idx + size])
-        idx += size
-
+    sizes = album_media_group_sizes(len(tracks))
     groups = []
-    for window in windows:
-        # Re-pack window by size limits
-        current = []
-        current_bytes = 0
-        for t in window:
-            sz = _track_file_size(t)
-            # Single file larger than limit: alone
-            if sz > AF_MEDIA_GROUP_MAX_BYTES:
-                if current:
-                    groups.append(current)
-                    current = []
-                    current_bytes = 0
-                groups.append([t])
-                continue
-            would = current_bytes + sz
-            if current and (
-                len(current) >= AF_MEDIA_GROUP_MAX_ITEMS
-                or would > AF_MEDIA_GROUP_MAX_BYTES
-            ):
-                groups.append(current)
-                current = [t]
-                current_bytes = sz
-            else:
-                current.append(t)
-                current_bytes = would
-        if current:
-            groups.append(current)
+    idx = 0
+    for size in sizes:
+        groups.append(list(tracks[idx:idx + size]))
+        idx += size
+    return groups
 
-    # Try to avoid tiny trailing groups (1-3) by borrowing from previous when size allows
-    fixed = []
-    i = 0
-    while i < len(groups):
-        g = groups[i]
-        if (
-            i + 1 < len(groups)
-            and len(groups[i + 1]) < AF_MEDIA_GROUP_MIN_ITEMS
-            and len(g) > AF_MEDIA_GROUP_MIN_ITEMS
-        ):
-            need = AF_MEDIA_GROUP_MIN_ITEMS - len(groups[i + 1])
-            # only move if previous stays >= min and size ok
-            if len(g) - need >= AF_MEDIA_GROUP_MIN_ITEMS:
-                moved = g[-need:]
-                moved_bytes = sum(_track_file_size(x) for x in moved)
-                next_bytes = sum(_track_file_size(x) for x in groups[i + 1]) + moved_bytes
-                if next_bytes <= AF_MEDIA_GROUP_MAX_BYTES and len(groups[i + 1]) + need <= AF_MEDIA_GROUP_MAX_ITEMS:
-                    g = g[:-need]
-                    groups[i + 1] = moved + groups[i + 1]
-        fixed.append(g)
-        i += 1
-    return fixed
+
+def _split_group_after_413(group: list) -> list:
+    """
+    Split a failed media group for retry.
+    Prefer both sides >= 4 when len >= 8; otherwise first 4 + rest.
+    Never drop tracks.
+    """
+    n = len(group)
+    if n <= 1:
+        return [group]
+    if n >= 8:
+        mid = n // 2
+        if mid < 4:
+            mid = 4
+        if n - mid < 4:
+            mid = n - 4
+        return [group[:mid], group[mid:]]
+    if n >= 5:
+        return [group[:4], group[4:]]
+    if n >= 2:
+        mid = max(1, n // 2)
+        return [group[:mid], group[mid:]]
+    return [group]
 
 
 def _is_entity_too_large(exc: BaseException) -> bool:
@@ -4378,8 +4327,22 @@ def _is_entity_too_large(exc: BaseException) -> bool:
     )
 
 
+def _cover_bytes_for_track(t: dict) -> Optional[bytes]:
+    """Per-track cover: explicit field, else APIC from the output MP3."""
+    cover = t.get("cover")
+    if cover:
+        return cover
+    path = t.get("output_path")
+    if path and os.path.isfile(path):
+        try:
+            return get_cover(path)
+        except Exception:
+            return None
+    return None
+
+
 async def _send_one_album_group(bot, chat_id, group: list) -> None:
-    """Send one media group or single item; sets _last_send_status on each track."""
+    """Send one media group (or unavoidable single). Sets _last_send_status on each track."""
     if len(group) == 1:
         t = group[0]
         status, detail = await send_processed_to_channel(
@@ -4390,12 +4353,13 @@ async def _send_one_album_group(bot, chat_id, group: list) -> None:
             title=t.get("title"),
             performer=t.get("artist"),
             duration=t.get("duration"),
-            cover=t.get("cover"),
+            cover=_cover_bytes_for_track(t),
         )
         t["_last_send_status"] = status
         return
 
     file_handles = []
+    thumb_handles = []
     try:
         media = []
         for t in group:
@@ -4404,6 +4368,18 @@ async def _send_one_album_group(bot, chat_id, group: list) -> None:
                 raise FileNotFoundError(f"missing {path}")
             fh = open(path, "rb")
             file_handles.append(fh)
+            thumb_arg = None
+            cover = _cover_bytes_for_track(t)
+            if cover:
+                try:
+                    thumb = make_telegram_thumbnail(cover)
+                    if not getattr(thumb, "name", None):
+                        thumb.name = "thumb.jpg"
+                    thumb_handles.append(thumb)
+                    thumb_arg = thumb
+                except Exception as thumb_exc:
+                    print("AF album thumbnail skip:", repr(thumb_exc))
+                    thumb_arg = None
             media.append(
                 InputMediaAudio(
                     media=fh,
@@ -4411,67 +4387,56 @@ async def _send_one_album_group(bot, chat_id, group: list) -> None:
                     title=t.get("title") or None,
                     performer=t.get("artist") or None,
                     duration=t.get("duration"),
+                    thumbnail=thumb_arg,
                 )
             )
         await bot.send_media_group(chat_id=chat_id, media=media)
         for t in group:
             t["_last_send_status"] = "sent"
-    except (TimedOut, NetworkError) as e:
+    except (TimedOut, NetworkError, TelegramError, OSError, Exception) as e:
         if _is_entity_too_large(e) and len(group) > 1:
-            # Split group in half and retry (preserve order); avoid infinite loop via size
-            mid = max(1, len(group) // 2)
-            left, right = group[:mid], group[mid:]
-            print("AF album media_group 413, splitting:", len(group), "->", len(left), len(right))
-            await _send_one_album_group(bot, chat_id, left)
-            await _send_one_album_group(bot, chat_id, right)
+            parts = _split_group_after_413(group)
+            print(
+                "AF album media_group 413, splitting:",
+                len(group),
+                "->",
+                [len(p) for p in parts],
+            )
+            for part in parts:
+                await _send_one_album_group(bot, chat_id, part)
         elif _is_entity_too_large(e) and len(group) == 1:
             print("AF album single file too large:", repr(e))
             group[0]["_last_send_status"] = "failed"
             group[0]["_last_send_detail"] = str(e)
         else:
-            print("AF album media_group network/timeout:", repr(e))
+            print("AF album media_group error:", repr(e))
+            # Do NOT silently convert multi-item groups to singles on non-size errors
             for t in group:
                 if not t.get("_last_send_status"):
-                    t["_last_send_status"] = "unknown"
-    except Exception as e:
-        if _is_entity_too_large(e) and len(group) > 1:
-            mid = max(1, len(group) // 2)
-            print("AF album media_group 413(exc), splitting:", len(group))
-            await _send_one_album_group(bot, chat_id, group[:mid])
-            await _send_one_album_group(bot, chat_id, group[mid:])
-        else:
-            print("AF album media_group error:", repr(e))
-            # Fallback one-by-one for this group only
-            for t in group:
-                if t.get("_last_send_status") == "sent":
-                    continue
-                status, detail = await send_processed_to_channel(
-                    bot,
-                    chat_id,
-                    t.get("output_path"),
-                    filename=t.get("filename") or "track.mp3",
-                    title=t.get("title"),
-                    performer=t.get("artist"),
-                    duration=t.get("duration"),
-                    cover=t.get("cover"),
-                )
-                t["_last_send_status"] = status
+                    t["_last_send_status"] = "unknown" if isinstance(e, (TimedOut, NetworkError)) else "failed"
+                    t["_last_send_detail"] = str(e)
     finally:
         for fh in file_handles:
             try:
                 fh.close()
             except Exception:
                 pass
+        for th in thumb_handles:
+            try:
+                th.close()
+            except Exception:
+                pass
 
 
 async def send_album_tracks_as_media_groups(bot, chat_id, targets: list) -> tuple:
     """
-    Send album tracks as Telegram media groups with count + size limits.
+    Send album tracks as Telegram media groups with strict count packing.
     Returns (sent_n, failed_n, unknown_n). Preserves order. No re-send of already sent items.
     """
     sent_n = failed_n = unknown_n = 0
     ordered = [t for t in targets if t.get("_last_send_status") != "sent"]
     groups = pack_album_media_groups(ordered)
+    print("AF album packed groups:", [len(g) for g in groups])
     for group in groups:
         await _send_one_album_group(bot, chat_id, group)
     for t in ordered:
