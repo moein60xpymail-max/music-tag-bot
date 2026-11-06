@@ -1,6 +1,17 @@
-# Music Tag Bot — v6.2.3
+# Music Tag Bot — v6.2.4
 
-Built on v6.2.2.
+Built on v6.2.3.
+
+## v6.2.4 changes
+- Album Auto Forward restored to sequential single-message sends (one track = one channel message).
+- Removed Media Group packing and group 413 handling.
+- Light delay between tracks to reduce host pressure on large albums.
+
+## v6.2.4 changes
+- Album Auto Forward restored to **sequential single-message** sends (one track = one channel message).
+- Removed Media Group packing, 4–10 split algorithm, and group 413 handling.
+- Light delay between tracks to reduce host pressure on large albums.
+- Cover handling remains via existing  (same as pre-6.2.0 AF).
 
 ## v6.2.3 changes
 - Root fix for album AF packing: full selected list is packed once (11 → 7+4).

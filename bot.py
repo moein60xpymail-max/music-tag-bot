@@ -22,7 +22,6 @@ from telegram import (
     ReplyKeyboardRemove,
     BotCommand,
     CopyTextButton,
-    InputMediaAudio,
 )
 from telegram.ext import (
     Application,
@@ -127,10 +126,10 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v6.2.3"
+VERSION = "v6.2.4"
 VERSION_CHANGES = [
-    "Auto Forward آلبوم: حذف split اشتباه ۴+۳ پس از 413؛ بازبسته‌بندی کل ترک‌های باقی‌مانده",
-    "الگوریتم شمارشی با max_size قابل کاهش تا همیشه حداقل ۴ حفظ شود",
+    "Auto Forward آلبوم: بازگشت به ارسال تکی ترتیبی (بدون Media Group)",
+    "حذف منطق تقسیم ۴–۱۰ و مدیریت 413 گروهی؛ کاهش فشار حافظه روی آلبوم‌های بزرگ",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -3534,23 +3533,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.reply_text("هیچ ترک مجازی برای ارسال انتخاب نشده است.")
                 return
             context.user_data["af_album_busy"] = True
-            # Preserve track order for media groups; skip already-sent
+            # Sequential single-message send (pre-v6.2.0 behavior): one track = one message
             targets = [t for t in targets if _status_for_slot(t, slot) != "sent"]
             targets = sorted(targets, key=lambda t: (t.get("index") is None, t.get("index", 0)))
-            for t in targets:
+            sent_n = failed_n = unknown_n = 0
+            for i, t in enumerate(targets):
+                if _status_for_slot(t, slot) == "sent":
+                    continue
                 _set_status_for_slot(t, slot, "sending")
-            try:
-                await safe_edit_reply_markup(query.message, reply_markup=af_album_keyboard(tracks, slot))
-            except TelegramError:
-                pass
-            sent_n, failed_n, unknown_n = await send_album_tracks_as_media_groups(
-                context.bot, ch["chat_id"], targets
-            )
-            for t in targets:
-                status = t.get("_last_send_status") or "failed"
+                if i == 0 or i == len(targets) - 1 or i % 5 == 0:
+                    try:
+                        await safe_edit_reply_markup(query.message, reply_markup=af_album_keyboard(tracks, slot))
+                    except TelegramError:
+                        pass
+                status, detail = await send_processed_to_channel(
+                    context.bot,
+                    ch["chat_id"],
+                    t.get("output_path"),
+                    filename=t.get("filename") or "track.mp3",
+                    title=t.get("title"),
+                    performer=t.get("artist"),
+                    duration=t.get("duration"),
+                    cover=t.get("cover"),
+                )
                 _set_status_for_slot(t, slot, status)
                 t.setdefault("selected_slots", {})[str(slot)] = False
-                t.pop("_last_send_status", None)
+                if status == "sent":
+                    sent_n += 1
+                elif status == "unknown":
+                    unknown_n += 1
+                else:
+                    failed_n += 1
+                # Light pacing to reduce host pressure on large albums
+                if i + 1 < len(targets):
+                    await asyncio.sleep(0.35)
             context.user_data["af_album_busy"] = False
             try:
                 await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
@@ -4260,115 +4276,14 @@ def _is_audio_media_error(exc: BaseException) -> bool:
 
 
 
-def _min_viable_max_size(n: int, min_size: int = 4) -> int:
-    """Smallest max_size allowing partition of n into parts each in [min_size, max_size]."""
-    if n <= 0:
-        return min_size
-    if n < min_size:
-        return n
-    max_groups = n // min_size
-    if max_groups <= 0:
-        return n
-    return (n + max_groups - 1) // max_groups
-
-
-def album_media_group_sizes(n: int, max_size: int = 10, min_size: int = 4) -> list:
-    """
-    Split n tracks into media-group sizes in one shot over the full album list.
-    Guarantees every group is in [min_size, max_size] when mathematically possible.
-    """
-    if n <= 0:
-        return []
-    max_size = max(1, min(10, int(max_size)))
-    min_size = max(1, min(10, int(min_size)))
-    if n < min_size:
-        return [n]
-    # Ensure max_size is viable for this n
-    viable = _min_viable_max_size(n, min_size=min_size)
-    if max_size < viable:
-        max_size = min(10, viable)
-    sizes = []
-    remaining = n
-    while remaining > max_size:
-        sizes.append(max_size)
-        remaining -= max_size
-    sizes.append(remaining)
-    if len(sizes) >= 2 and sizes[-1] < min_size:
-        need = min_size - sizes[-1]
-        if sizes[-2] - need >= min_size:
-            sizes[-2] -= need
-            sizes[-1] += need
-        elif sizes[-2] + sizes[-1] <= max_size:
-            sizes[-2] += sizes[-1]
-            sizes.pop()
-        else:
-            borrow = max(0, sizes[-2] - min_size)
-            if borrow:
-                sizes[-2] -= borrow
-                sizes[-1] += borrow
-    # Final validation: never emit a middle/last group of 1..min_size-1 when n >= min_size
-    if any(s < min_size for s in sizes) and n >= min_size:
-        # Fallback: single group if fits, else recompute with viable max
-        if n <= 10:
-            return [n]
-        max_size = max(viable, min_size)
-        sizes = []
-        remaining = n
-        while remaining > max_size:
-            sizes.append(max_size)
-            remaining -= max_size
-        sizes.append(remaining)
-        if len(sizes) >= 2 and sizes[-1] < min_size:
-            need = min_size - sizes[-1]
-            sizes[-2] -= need
-            sizes[-1] += need
-    return sizes
-
-
-def pack_album_media_groups(tracks: list, max_size: int = 10) -> list:
-    """Pack the full track list once by count algorithm only."""
-    if not tracks:
-        return []
-    sizes = album_media_group_sizes(len(tracks), max_size=max_size, min_size=4)
-    groups = []
-    idx = 0
-    for size in sizes:
-        groups.append(list(tracks[idx:idx + size]))
-        idx += size
-    return groups
-
-
-def _is_entity_too_large(exc: BaseException) -> bool:
-    msg = str(exc).lower()
-    return (
-        "413" in msg
-        or "request entity too large" in msg
-        or "entity too large" in msg
-        or "request_entity_too_large" in msg
+async def send_album_tracks_as_media_groups(bot, chat_id, targets: list) -> tuple:
+    """Backward-compatible name: sequential single sends (no Media Group)."""
+    sent_n = failed_n = unknown_n = 0
+    ordered = sorted(
+        [t for t in targets if t.get("_last_send_status") != "sent"],
+        key=lambda t: (t.get("index") is None, t.get("index", 0)),
     )
-
-
-def _cover_bytes_for_track(t: dict) -> Optional[bytes]:
-    """Per-track cover: explicit field, else APIC from the output MP3."""
-    cover = t.get("cover")
-    if cover:
-        return cover
-    path = t.get("output_path")
-    if path and os.path.isfile(path):
-        try:
-            return get_cover(path)
-        except Exception:
-            return None
-    return None
-
-
-async def _send_one_album_group_once(bot, chat_id, group: list) -> str:
-    """
-    Send exactly one media group without internal splitting.
-    Returns: sent | too_large | failed | unknown
-    """
-    if len(group) == 1:
-        t = group[0]
+    for i, t in enumerate(ordered):
         status, detail = await send_processed_to_channel(
             bot,
             chat_id,
@@ -4377,153 +4292,17 @@ async def _send_one_album_group_once(bot, chat_id, group: list) -> str:
             title=t.get("title"),
             performer=t.get("artist"),
             duration=t.get("duration"),
-            cover=_cover_bytes_for_track(t),
+            cover=t.get("cover"),
         )
         t["_last_send_status"] = status
-        return status
-
-    file_handles = []
-    thumb_handles = []
-    try:
-        media = []
-        for t in group:
-            path = t.get("output_path")
-            if not path or not os.path.isfile(path):
-                raise FileNotFoundError(f"missing {path}")
-            fh = open(path, "rb")
-            file_handles.append(fh)
-            thumb_arg = None
-            cover = _cover_bytes_for_track(t)
-            if cover:
-                try:
-                    thumb = make_telegram_thumbnail(cover)
-                    if not getattr(thumb, "name", None):
-                        thumb.name = "thumb.jpg"
-                    thumb_handles.append(thumb)
-                    thumb_arg = thumb
-                except Exception as thumb_exc:
-                    print("AF album thumbnail skip:", repr(thumb_exc))
-                    thumb_arg = None
-            media.append(
-                InputMediaAudio(
-                    media=fh,
-                    filename=t.get("filename") or "track.mp3",
-                    title=t.get("title") or None,
-                    performer=t.get("artist") or None,
-                    duration=t.get("duration"),
-                    thumbnail=thumb_arg,
-                )
-            )
-        await bot.send_media_group(chat_id=chat_id, media=media)
-        for t in group:
-            t["_last_send_status"] = "sent"
-        return "sent"
-    except (TimedOut, NetworkError, TelegramError, OSError, Exception) as e:
-        if _is_entity_too_large(e):
-            print("AF album media_group 413 on group size", len(group), ":", repr(e))
-            return "too_large"
-        print("AF album media_group error:", repr(e))
-        if isinstance(e, (TimedOut, NetworkError)):
-            return "unknown"
-        return "failed"
-    finally:
-        for fh in file_handles:
-            try:
-                fh.close()
-            except Exception:
-                pass
-        for th in thumb_handles:
-            try:
-                th.close()
-            except Exception:
-                pass
-
-
-async def send_album_tracks_as_media_groups(bot, chat_id, targets: list) -> tuple:
-    """
-    1) Take the full selected album track list
-    2) Pack once with count algorithm
-    3) Send groups in order
-    On 413: re-pack ALL unsent tracks with a smaller viable max_size (never emit 4+3+4).
-    """
-    sent_n = failed_n = unknown_n = 0
-    ordered = list(targets)
-    for t in ordered:
-        if t.get("_last_send_status") != "sent":
-            t.pop("_last_send_status", None)
-            t.pop("_last_send_detail", None)
-
-    max_size = 10
-    safety = 0
-    while safety < 30:
-        safety += 1
-        unsent = [t for t in ordered if t.get("_last_send_status") != "sent"]
-        if not unsent:
-            break
-        n = len(unsent)
-        floor_max = _min_viable_max_size(n, min_size=4)
-        if max_size < floor_max:
-            max_size = floor_max
-        groups = pack_album_media_groups(unsent, max_size=max_size)
-        print("AF album packed groups (max_size=%s):" % max_size, [len(g) for g in groups])
-        # Hard guard: refuse invalid packs like 4+3+4
-        if any(len(g) < 4 for g in groups) and n >= 4:
-            print("AF album invalid pack prevented:", [len(g) for g in groups])
-            max_size = max(max_size, floor_max)
-            groups = pack_album_media_groups(unsent, max_size=max_size)
-            print("AF album re-packed:", [len(g) for g in groups])
-
-        aborted_for_repack = False
-        progress = False
-        for group in groups:
-            group = [t for t in group if t.get("_last_send_status") != "sent"]
-            if not group:
-                continue
-            result = await _send_one_album_group_once(bot, chat_id, group)
-            if result == "sent":
-                progress = True
-                continue
-            if result == "too_large":
-                # Reduce max_size but never below viable floor for remaining unsent
-                unsent_now = [t for t in ordered if t.get("_last_send_status") != "sent"]
-                floor = _min_viable_max_size(len(unsent_now), min_size=4)
-                new_max = max(floor, min(max_size - 1, len(group) - 1))
-                if new_max < max_size and new_max >= floor:
-                    max_size = new_max
-                    print("AF album 413 -> re-pack unsent with max_size", max_size)
-                    aborted_for_repack = True
-                    break
-                # Cannot shrink without invalid groups: mark failed (no silent singles / no 4+3)
-                print("AF album 413 cannot re-pack without invalid groups; mark failed")
-                for t in group:
-                    if t.get("_last_send_status") != "sent":
-                        t["_last_send_status"] = "failed"
-                        t["_last_send_detail"] = "Request Entity Too Large"
-                progress = True
-                continue
-            if result == "unknown":
-                for t in group:
-                    if t.get("_last_send_status") != "sent":
-                        t["_last_send_status"] = "unknown"
-                progress = True
-                continue
-            for t in group:
-                if t.get("_last_send_status") != "sent":
-                    t["_last_send_status"] = "failed"
-            progress = True
-        if aborted_for_repack:
-            continue
-        if not progress:
-            break
-
-    for t in ordered:
-        status = t.get("_last_send_status") or "failed"
         if status == "sent":
             sent_n += 1
         elif status == "unknown":
             unknown_n += 1
         else:
             failed_n += 1
+        if i + 1 < len(ordered):
+            await asyncio.sleep(0.35)
     return sent_n, failed_n, unknown_n
 
 
