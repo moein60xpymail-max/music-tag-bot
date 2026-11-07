@@ -1,6 +1,11 @@
-# Music Tag Bot — v6.2.4
+# Music Tag Bot — v6.2.5
 
-Built on v6.2.3.
+Built on v6.2.4.
+
+## v6.2.5 Hotfix
+- Fix AttributeError in receive_audio when Update has no message (use effective_message + None guard).
+- Escape dynamic song/artist/album/filename text for Markdown and HTML parse modes; keep parse-entities fallback.
+- More resilient polling: longer getUpdates timeout, bootstrap_retries=-1, concurrent_updates=False, clearer transient NetworkError logging.
 
 ## v6.2.4 changes
 - Album Auto Forward restored to sequential single-message sends (one track = one channel message).

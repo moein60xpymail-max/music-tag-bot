@@ -5,6 +5,7 @@ import re
 import json
 import shutil
 import tempfile
+import html as html_module
 from pathlib import Path
 from collections import Counter
 from dupes import classify as classify_duplicate, classify_detail
@@ -40,6 +41,24 @@ from telegram.request import HTTPXRequest
 from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, ID3NoHeaderError, TPUB, APIC
 from music_tag import load_file as mt_load
+
+# ==================== Escape helpers for Telegram parse modes ====================
+def escape_md(text: Any) -> str:
+    """Escape dynamic text for Telegram legacy Markdown (ParseMode.MARKDOWN)."""
+    if text is None:
+        return ""
+    s = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def escape_html(text: Any) -> str:
+    """Escape dynamic text for Telegram HTML parse mode."""
+    if text is None:
+        return ""
+    return html_module.escape(str(text), quote=False)
+
 
 # ==================== پایداری ارتباط و ارسال پیام ====================
 def install_telegram_resilience():
@@ -126,10 +145,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v6.2.4"
+VERSION = "v6.2.5"
 VERSION_CHANGES = [
-    "Auto Forward آلبوم: بازگشت به ارسال تکی ترتیبی (بدون Media Group)",
-    "حذف منطق تقسیم ۴–۱۰ و مدیریت 413 گروهی؛ کاهش فشار حافظه روی آلبوم‌های بزرگ",
+    "رفع AttributeError در receive_audio هنگام Update بدون message",
+    "Escape متن‌های پویا برای Markdown/HTML و fallback امن Parse Mode",
+    "پایداری بیشتر Polling در برابر NetworkError/Bad Gateway موقت",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -978,7 +998,7 @@ def defaults_import_summary(single: dict, album: dict) -> str:
             elif m == "keep":
                 parts.append(f"• {FIELDS.get(k, k)}: Keep")
             else:
-                parts.append(f"• {FIELDS.get(k, k)}: Apply `{block.get(k, '')}`")
+                parts.append(f"• {FIELDS.get(k, k)}: Apply `{escape_md(block.get(k, ''))}`")
         return chr(10).join(parts) if len(parts) > 1 else f"**{label}**: (خالی)"
     return lines("Single", single) + chr(10) + chr(10) + lines("Album", album)
 
@@ -1019,17 +1039,17 @@ def editor_text(path: str, filename: str = "—") -> str:
         bitrate = sample = duration = size = "?"
     return (
         "🎵 **Music Tag Editor**\n\n"
-        f"📁 File Name: {filename}\n"
-        f"Title: {tags['title']}\n"
-        f"Artist: {tags['artist']}\n"
-        f"Album: {tags['album']}\n"
-        f"Year: {tags['year']}\n"
-        f"Genre: {tags['genre']}\n"
-        f"Composer: {tags['composer']}\n"
-        f"Publisher: {tags['publisher']}\n"
-        f"Disc N: {tags['disc']}\n"
-        f"Track N: {tags['track']}\n"
-        f"Album Artist: {tags['albumartist']}\n"
+        f"📁 File Name: {escape_md(filename)}\n"
+        f"Title: {escape_md(tags['title'])}\n"
+        f"Artist: {escape_md(tags['artist'])}\n"
+        f"Album: {escape_md(tags['album'])}\n"
+        f"Year: {escape_md(tags['year'])}\n"
+        f"Genre: {escape_md(tags['genre'])}\n"
+        f"Composer: {escape_md(tags['composer'])}\n"
+        f"Publisher: {escape_md(tags['publisher'])}\n"
+        f"Disc N: {escape_md(tags['disc'])}\n"
+        f"Track N: {escape_md(tags['track'])}\n"
+        f"Album Artist: {escape_md(tags['albumartist'])}\n"
         "----------------------\n"
         f"Bitrate: {bitrate} kbps\n"
         f"Sample Rate: {sample} Hz\n"
@@ -1197,11 +1217,11 @@ async def channelstatus_command(update: Update, context: ContextTypes.DEFAULT_TY
     ch2 = get_af_channel(context, "2")
     lines = ["📢 وضعیت کانال‌های Auto Forward\n"]
     if ch1:
-        lines.append(f"۱) Main: `{ch1['chat_id']}` — {ch1.get('title') or '—'}")
+        lines.append(f"۱) Main: `{ch1['chat_id']}` — {escape_md(ch1.get('title') or '—')}")
     else:
         lines.append("۱) Main: تنظیم نشده (/setchannel1)")
     if ch2:
-        lines.append(f"۲) Full Archive: `{ch2['chat_id']}` — {ch2.get('title') or '—'}")
+        lines.append(f"۲) Full Archive: `{ch2['chat_id']}` — {escape_md(ch2.get('title') or '—')}")
     else:
         lines.append("۲) Full Archive: تنظیم نشده (/setchannel2)")
     lines.append("\nاین تنظیمات فقط در حافظه‌اند و با ریستارت پاک می‌شوند.")
@@ -1494,7 +1514,7 @@ async def update_progress_dashboard(message, context, operation, *, outcome=None
     title = {"album": "📥 دریافت آهنگ‌های آلبوم", "summary": "📊 دریافت آهنگ‌ها برای خلاصه", "archive_a": "📥 دریافت منبع A", "archive_b": "📥 دریافت منبع B"}.get(operation, "⚙️ پردازش فایل‌ها")
     lines = [title, "", f"📦 فایل‌های ثبت‌شده: {state['received']}",
              f"✅ موفق: {state['success']}   |   ⏭ دانلودنشده: {state['skipped']}   |   ❌ خطا: {state['failed']}",
-             f"🎵 آخرین فایل: {state['current']}"]
+             f"🎵 آخرین فایل: {escape_html(state['current'])}"]
     if final:
         lines.insert(1, "<b>عملیات پایان یافت</b>")
     text = "\n".join(lines)
@@ -1547,8 +1567,10 @@ async def finish_progress_dashboard(context, operation, *, keep=True):
 
 # ==================== دریافت فایل و متن ====================
 async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    document = message.document or message.audio
+    message = update.effective_message
+    if message is None:
+        return
+    document = getattr(message, "document", None) or getattr(message, "audio", None)
 
     # Default Tags import (owner only)
     if context.user_data.get("waiting") == "defaults_import_file":
@@ -2373,7 +2395,7 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_user_defaults(user_id, mode, key, value)
         context.user_data["waiting"] = None
         await update.message.reply_text(
-            f"✅ پیش‌فرض `{key}` برای حالت `{mode}` ذخیره شد: `{value}`",
+            f"✅ پیش‌فرض `{escape_md(key)}` برای حالت `{escape_md(mode)}` ذخیره شد: `{escape_md(value)}`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -2836,7 +2858,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif mstate == "keep":
                 state = "⏸ Keep"
             else:
-                state = f"✅ Apply `{current.get(k, '')}`"
+                state = f"✅ Apply `{escape_md(current.get(k, ''))}`"
             text += f"• {FIELDS.get(k, k)}: {state}\n"
         text += "\nدکمه وضعیت را بزن تا بین Apply / Keep / Remove جابه‌جا شوی. دکمه ✏️ برای ویرایش مقدار Apply است."
         await safe_edit_message_text(
@@ -2875,7 +2897,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif mstate == "keep":
                 state = "⏸ Keep"
             else:
-                state = f"✅ Apply `{current.get(k, '')}`"
+                state = f"✅ Apply `{escape_md(current.get(k, ''))}`"
             lines.append(f"• {FIELDS.get(k, k)}: {state}")
         await safe_edit_message_text(
             query.message,
@@ -3606,7 +3628,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["waiting_mode"] = "field_edit"
         prompt = (
             f"✏️ **{FIELDS.get(field, field)}**\n"
-            f"مقدار فعلی: `{current_disp}`\n\n"
+            f"مقدار فعلی: `{escape_md(current_disp)}`\n\n"
             f"مقدار جدید را بفرست:"
         )
         sent = await query.message.chat.send_message(
@@ -3654,7 +3676,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = get_tags(path).get(field, "") if path else ""
         if val and val != "—":
             await query.message.reply_text(
-                f"📋 مقدار فعلی (کپی کن):\n`{val}`", parse_mode=ParseMode.MARKDOWN
+                f"📋 مقدار فعلی (کپی کن):\n`{escape_md(val)}`", parse_mode=ParseMode.MARKDOWN
             )
         else:
             await query.message.reply_text("این فیلد خالی است.")
@@ -3766,12 +3788,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["filename"] = new_filename
             try:
                 await status.edit_text(
-                    f"✅ تگ‌های پیش‌فرض اعمال شدند.\nاسم فایل: `{new_filename}`",
+                    f"✅ تگ‌های پیش‌فرض اعمال شدند.\nاسم فایل: `{escape_md(new_filename)}`",
                     parse_mode=ParseMode.MARKDOWN,
                 )
             except Exception:
                 await query.message.chat.send_message(
-                    f"✅ تگ‌های پیش‌فرض اعمال شدند.\nاسم فایل: `{new_filename}`",
+                    f"✅ تگ‌های پیش‌فرض اعمال شدند.\nاسم فایل: `{escape_md(new_filename)}`",
                     parse_mode=ParseMode.MARKDOWN,
                 )
             await show_editor(
@@ -4549,8 +4571,13 @@ async def membership_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def error_handler(update, context):
     import traceback
-    print("BOT ERROR:", repr(context.error))
-    traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
+    err = context.error
+    # Temporary network/gateway failures are retried by the updater; log briefly.
+    if isinstance(err, (NetworkError, TimedOut)):
+        print(f"BOT TRANSIENT NETWORK ERROR (will retry): {err!r}")
+        return
+    print("BOT ERROR:", repr(err))
+    traceback.print_exception(type(err), err, err.__traceback__)
 
 
 def main():
@@ -4575,17 +4602,26 @@ def main():
             BotCommand("cancel", "❌ لغو عملیات فعلی"),
         ])
 
+    # Separate HTTP clients: long read timeout for getUpdates long-polling,
+    # and resilient timeouts for regular Bot API calls.
     request = HTTPXRequest(
         connection_pool_size=20, connect_timeout=30, read_timeout=90,
         write_timeout=90, pool_timeout=30,
     )
     updates_request = HTTPXRequest(
-        connection_pool_size=8, connect_timeout=30, read_timeout=60,
+        connection_pool_size=8, connect_timeout=30, read_timeout=90,
         write_timeout=60, pool_timeout=30,
     )
     install_telegram_resilience()
-    app = (Application.builder().token(TOKEN).request(request)
-           .get_updates_request(updates_request).post_init(post_init).build())
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(request)
+        .get_updates_request(updates_request)
+        .post_init(post_init)
+        .concurrent_updates(False)  # avoid overlapping update processing
+        .build()
+    )
 
     app.add_handler(TypeHandler(Update, membership_gate), group=-1)
 
@@ -4619,7 +4655,16 @@ def main():
     app.add_error_handler(error_handler)
 
     print("Music Tag Bot is running...")
-    app.run_polling()
+    # drop_pending_updates=False keeps backlog; bootstrap_retries=-1 retries
+    # temporary network failures (e.g. Bad Gateway) during startup forever.
+    # PTB's updater already applies backoff on NetworkError during getUpdates.
+    app.run_polling(
+        drop_pending_updates=False,
+        bootstrap_retries=-1,
+        poll_interval=1.0,
+        timeout=30,
+        allowed_updates=None,
+    )
 
 
 if __name__ == "__main__":
