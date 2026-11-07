@@ -61,61 +61,85 @@ def escape_html(text: Any) -> str:
 
 
 
-def resolve_incoming_audio(message):
-    """Resolve Telegram Audio or Document into a processable media object.
+def ensure_mp3_filename(raw_name, title=None) -> str:
+    """Build a usable .mp3 filename from Telegram Audio/Document metadata."""
+    raw = (raw_name or "").strip()
+    if raw.lower().endswith(".mp3"):
+        return raw
+    if raw:
+        lower = raw.lower()
+        for ext in (".m4a", ".aac", ".wav", ".ogg", ".flac", ".wma", ".mp4", ".mpeg", ".mpga"):
+            if lower.endswith(ext):
+                return raw[: -len(ext)] + ".mp3"
+        # Titles like "01. Intro" must not be stripped by Path.stem
+        return raw + ".mp3"
+    if title and str(title).strip():
+        return str(title).strip() + ".mp3"
+    return "music.mp3"
 
-    Returns (media, source, name) where:
-      media  – Audio or Document object (or None)
+
+def is_audio_mime(mime: str) -> bool:
+    m = (mime or "").lower().strip()
+    if not m:
+        return True  # Telegram often omits mime for valid MP3
+    if m.startswith("audio/"):
+        return True
+    if m in (
+        "application/octet-stream",
+        "application/mp3",
+        "application/x-mp3",
+        "binary/octet-stream",
+    ):
+        return True
+    return False
+
+
+def has_non_audio_extension(name: str) -> bool:
+    lower = (name or "").lower()
+    return any(
+        lower.endswith(ext)
+        for ext in (
+            ".txt", ".json", ".jpg", ".jpeg", ".png", ".webp", ".gif",
+            ".pdf", ".zip", ".rar", ".7z", ".doc", ".docx", ".csv",
+        )
+    )
+
+
+def resolve_incoming_audio(message):
+    """Resolve Telegram Audio or Document into processable MP3 media.
+
+    Returns (media, source, name):
+      media  – Audio or Document (or None)
       source – "audio" | "document" | None
-      name   – a filename that ends with .mp3 when the media is accepted as MP3
-    Rejects only when neither is present or the document is clearly non-MP3.
+      name   – filename ending with .mp3 when accepted as track
     """
     audio = getattr(message, "audio", None)
     document = getattr(message, "document", None)
 
-    def ensure_mp3_name(raw_name, title=None):
-        raw = (raw_name or "").strip()
-        if raw.lower().endswith(".mp3"):
-            return raw
-        if raw:
-            # Telegram Music often sends title-like names without extension
-            stem = Path(raw).stem or raw
-            return f"{stem}.mp3"
-        if title and str(title).strip():
-            return f"{str(title).strip()}.mp3"
-        return "music.mp3"
-
-    # Prefer native Telegram Audio (Music) — these are valid tracks even when
-    # file_name has no .mp3 suffix or mime is missing/generic.
+    # 1) Native Telegram Music / Audio — always treat as valid track.
+    #    file_name often lacks ".mp3"; mime may be missing. Trust the type.
     if audio is not None:
-        mime = (getattr(audio, "mime_type", None) or "").lower()
-        # Reject only if Telegram explicitly marks a non-audio mime
-        if mime and not (
-            mime.startswith("audio/")
-            or mime in ("application/octet-stream", "application/mp3", "")
-        ):
-            pass  # still accept; Telegram Audio type is authoritative
-        name = ensure_mp3_name(getattr(audio, "file_name", None), getattr(audio, "title", None))
+        name = ensure_mp3_filename(
+            getattr(audio, "file_name", None),
+            getattr(audio, "title", None),
+        )
         return audio, "audio", name
 
+    # 2) Document attachment
     if document is not None:
-        mime = (getattr(document, "mime_type", None) or "").lower()
+        mime = getattr(document, "mime_type", None) or ""
         fname = getattr(document, "file_name", None) or ""
-        # Images handled elsewhere
-        if mime.startswith("image/"):
+        if mime.lower().startswith("image/"):
             return document, "document", fname or "file"
-        is_mp3_name = fname.lower().endswith(".mp3")
-        is_mp3_mime = mime in (
-            "audio/mpeg", "audio/mp3", "audio/x-mpeg", "audio/x-mp3",
-            "audio/mpeg3", "application/octet-stream", "",
-        ) or mime.startswith("audio/")
-        if is_mp3_name or (is_mp3_mime and not fname.lower().endswith((".txt", ".json", ".jpg", ".jpeg", ".png", ".webp", ".gif"))):
-            name = ensure_mp3_name(fname)
-            return document, "document", name
-        # Non-MP3 document (e.g. archive manifest .txt) — return as-is for caller checks
+        if fname.lower().endswith(".mp3") or (
+            is_audio_mime(mime) and not has_non_audio_extension(fname)
+        ):
+            return document, "document", ensure_mp3_filename(fname)
+        # Not accepted as MP3 (e.g. manifest .txt) — caller decides
         return document, "document", fname or "file"
 
     return None, None, ""
+
 
 
 # ==================== پایداری ارتباط و ارسال پیام ====================
@@ -203,11 +227,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v6.2.6"
+VERSION = "v6.2.7"
 VERSION_CHANGES = [
-    "پذیرش صحیح Telegram Audio/Music حتی بدون پسوند .mp3 در file_name",
-    "اعتبارسنجی جداگانه برای message.audio و message.document",
-    "Escape پویا + fallback Parse Mode (حفظ‌شده از 6.2.5)",
+    "پذیرش قطعی message.audio (Music) بدون وابستگی به پسوند یا MIME",
+    "پذیرش Document با پسوند .mp3 یا MIME صوتی/نامشخص؛ رد فقط برای غیرصوتی",
+    "لاگ تشخیصی هنگام رد فایل برای عیب‌یابی",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1678,12 +1702,13 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not document:
             return
         file_name = resolved_name or getattr(document, "file_name", None) or "forwarded_track.mp3"
-        # Accept Telegram Audio even without .mp3 in the original file_name
-        if media_source != "audio" and not file_name.lower().endswith(".mp3"):
+        if media_source == "audio":
+            file_name = ensure_mp3_filename(file_name, getattr(document, "title", None))
+        elif not (file_name or "").lower().endswith(".mp3"):
             await message.reply_text("برای خلاصه‌سازی، فایل MP3 بفرست.")
             return
-        if not file_name.lower().endswith(".mp3"):
-            file_name = f"{Path(file_name).stem}.mp3" if file_name else "forwarded_track.mp3"
+        else:
+            file_name = ensure_mp3_filename(file_name)
         context.user_data.setdefault("summary_session", {"tracks": []})
         if getattr(document, "file_size", 0) and document.file_size > MAX_SIZE:
             context.user_data["summary_session"]["tracks"].append({
@@ -1755,12 +1780,19 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as exc:
             await message.reply_text(f"خواندن فایل فهرست ناموفق بود: {exc}")
         return
-    # Telegram Audio (Music) is accepted even when file_name lacks .mp3.
-    # Documents need .mp3 extension or an audio/* mime (already resolved above).
+    # Accept:
+    #   - any Telegram Audio/Music (media_source == "audio")
+    #   - Document whose resolved name ends with .mp3
+    # Reject only clearly non-MP3 documents.
     if media_source == "audio":
-        if not name.lower().endswith(".mp3"):
-            name = f"{Path(name).stem}.mp3" if name else "music.mp3"
-    elif not name.lower().endswith(".mp3"):
+        name = ensure_mp3_filename(name, getattr(document, "title", None))
+    elif not (name or "").lower().endswith(".mp3"):
+        mime_dbg = getattr(document, "mime_type", None)
+        fname_dbg = getattr(document, "file_name", None)
+        print(
+            f"reject non-mp3 media: source={media_source!r} "
+            f"file_name={fname_dbg!r} mime={mime_dbg!r} resolved={name!r}"
+        )
         await message.reply_text("فقط فایل MP3 یا فایل متنی فهرست آرشیو قبول می‌کنم.")
         return
 

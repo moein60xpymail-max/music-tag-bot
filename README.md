@@ -1,6 +1,13 @@
-# Music Tag Bot — v6.2.6
+# Music Tag Bot — v6.2.7
 
-Built on v6.2.5.
+Built on v6.2.6.
+
+## v6.2.7 Hotfix
+- **Telegram Music/Audio always accepted** — no dependency on `.mp3` suffix or MIME.
+- Document MP3 accepted via `.mp3` name **or** audio/empty/octet-stream MIME.
+- Safer filename builder (keeps titles like `01. Intro`).
+- Diagnostic log when a file is rejected.
+- Single/Album/Archive/Summary paths covered.
 
 ## v6.2.6 Hotfix
 - Accept Telegram **Music / Audio** messages even when `file_name` has no `.mp3` suffix.
