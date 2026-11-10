@@ -232,13 +232,13 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.0.0"
+VERSION = "v7.0.1"
 VERSION_CHANGES = [
-    "Archive: گزارش پایان Source A/B + ادامه دریافت یا تأیید نهایی",
-    "Archive Analyze: جایگزینی معیارهای نام/حجم با Audio Fingerprinting",
-    "تکراری‌ها بدون حذف خودکار؛ انتخاب دستی + قرنطینه منطقی Scanner",
-    "خروجی TXT فهرست منابع با حفظ file_id",
-    "Fallback content-hash/soft-fp وقتی fpcalc در دسترس نیست",
+    "حذف خودکار Duplicate قطعی با اولویت Source A بر B",
+    "Audio Scanner مرکز واحد تحلیل؛ حذف دکمه «تحلیل و ساخت فهرست»",
+    "UI ساده‌شده Scanner: اسکن، نیازمند بررسی، خروجی فهرست",
+    "خروجی archive-v1 سازگار با ورودی بررسی منابع",
+    "اصلاح متن راهنمای منوی آرشیو",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1444,19 +1444,19 @@ def export_source_txt(archive: dict, source_key: str) -> bytes:
 
 def archive_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔎 بررسی آهنگ‌های منابع", callback_data="arch:review_menu")],
+        [InlineKeyboardButton("📥 دریافت Source A / B", callback_data="arch:review_menu")],
+        [InlineKeyboardButton("🎧 Audio Scanner", callback_data="ascan:menu")],
         [InlineKeyboardButton("📥 ورودی بررسی منابع", callback_data="arch:input_menu")],
-        [InlineKeyboardButton("🎧 Audio Similarity Scanner", callback_data="ascan:menu")],
         [InlineKeyboardButton("❌ بستن آرشیو", callback_data="arch:close")],
     ])
 
 def audio_scanner_keyboard():
+    """Minimal scanner UI — definite dups are auto-resolved; only review needs attention."""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Scan Archive", callback_data="ascan:scan")],
-        [InlineKeyboardButton("📊 Scan Results", callback_data="ascan:results"),
-         InlineKeyboardButton("🗂 Duplicate Groups", callback_data="ascan:groups")],
-        [InlineKeyboardButton("♻️ Quarantine", callback_data="ascan:quarantine")],
-        [InlineKeyboardButton("⚙️ Scanner Settings", callback_data="ascan:settings")],
+        [InlineKeyboardButton("🔍 شروع / ادامه اسکن", callback_data="ascan:scan")],
+        [InlineKeyboardButton("📊 گزارش آخرین اسکن", callback_data="ascan:results")],
+        [InlineKeyboardButton("🔎 نیازمند بررسی", callback_data="ascan:review_list")],
+        [InlineKeyboardButton("📄 دریافت خروجی فهرست", callback_data="ascan:export")],
         [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
     ])
 
@@ -1486,118 +1486,369 @@ def scanner_sync_current_archive(context, user_id, chat_id):
     return count
 
 
-async def audio_scanner_worker(context, user_id, chat_id, progress_message_id):
-    store = get_audio_scanner_store()
-    bot = context.application.bot
-    temp_dir = None
+
+async def _fingerprint_source_item(context, entry, source_label, temp_root: Path):
+    """Download one archive source item and return (item_dict, analysis_or_none)."""
+    item = dict(
+        entry,
+        source=source_label,
+        duplicate_level="independent",
+        review=False,
+        status="pending",
+        fingerprint_score=None,
+        removed=False,
+        removed_reason=None,
+    )
+    fid = entry.get("file_id")
+    if not fid:
+        item["review"] = True
+        item["duplicate_level"] = "unanalyzed"
+        item["review_note"] = "بدون file_id"
+        return item, None
+    if int(entry.get("size") or 0) > MAX_SIZE:
+        item["review"] = True
+        item["duplicate_level"] = "unanalyzed"
+        item["review_note"] = "حجم بیش از حد مجاز"
+        return item, None
+    tmp = temp_root / f"{source_label}_{entry.get('message_id') or id(entry)}.mp3"
     try:
-        if not fpcalc_available():
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=progress_message_id,
-                text="❌ ابزار Chromaprint (fpcalc) روی سرور پیدا نشد. باید در محیط میزبانی نصب باشد؛ فایل‌های آرشیو تغییری نکردند."
-            )
-            return
-        tracks = store.tracks(user_id)
-        total = len(tracks)
-        if not total:
-            await bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id,
-                text="آرشیوی برای اسکن پیدا نشد. ابتدا آهنگ‌های منبع A و B را در بخش بررسی آهنگ‌های منابع وارد کن.")
-            return
-        temp_dir = tempfile.mkdtemp(prefix="audio_scan_", dir=str(DATA_DIR))
-        processed = 0
-        errors = 0
-        cached = 0
-        for index, track in enumerate(tracks, 1):
-            if context.user_data.get("audio_scan_cancel"):
-                await bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id,
-                    text=(f"⏹ اسکن متوقف شد.\n\nبررسی‌شده: {processed} از {total}\n" 
-                          f"اثر انگشت‌های ذخیره‌شده: {cached}\nخطاها: {errors}\n\n"
-                          "برای ادامه، دوباره Scan Archive را بزن؛ اثر انگشت‌های قبلی دوباره محاسبه نمی‌شوند."))
-                return
-            if track.get("fingerprint") and track.get("fp_version") == 1:
-                cached += 1
-                processed += 1
-                continue
-            name = track.get("name") or f"Track {index}"
-            if int(track.get("size") or 0) > MAX_SIZE:
-                store.save_error(track["id"], "حجم فایل از سقف دانلود Bot API (۲۰ مگابایت) بیشتر است.")
-                errors += 1
-                processed += 1
-                continue
-            local_path = os.path.join(temp_dir, f"{track['id']}.audio")
-            try:
-                tg_file = await bot.get_file(track["file_id"])
-                await download_to_drive_retry(tg_file, local_path)
-                fp, duration = await asyncio.to_thread(fingerprint_file, local_path)
-                store.save_fingerprint(track["id"], fp, duration or float(track.get("duration") or 0))
-            except Exception as exc:
-                store.save_error(track["id"], f"{type(exc).__name__}: {str(exc)[:350]}")
-                errors += 1
-            finally:
-                try:
-                    if os.path.exists(local_path): os.remove(local_path)
-                except OSError:
-                    pass
-            processed += 1
-            if processed == total or processed % 3 == 0:
-                try:
-                    await bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id,
-                        text=(f"🎧 در حال اسکن آرشیو صوتی\n\nپیشرفت: {processed}/{total} ({processed*100/total:.1f}%)\n"
-                              f"اثر انگشت‌های ذخیره‌شده: {cached}\nخطاها: {errors}\n"
-                              f"آخرین فایل: {escape_html(name)[:100]}"), parse_mode=ParseMode.HTML,
-                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹ لغو اسکن", callback_data="ascan:cancel")]]))
-                except BadRequest as exc:
-                    if "message is not modified" not in str(exc).lower():
-                        print("Audio scanner progress edit failed:", repr(exc))
-        if context.user_data.get("audio_scan_cancel"):
-            await bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id,
-                text=(f"⏹ اسکن پیش از مقایسه گروه‌ها متوقف شد.\nبررسی‌شده: {processed} از {total}\n"
-                      "اثر انگشت‌های ذخیره‌شده حفظ شدند؛ برای ادامه دوباره Scan Archive را اجرا کن."))
-            return
-        rows = store.tracks(user_id)
-        threshold = store.threshold(user_id)
+        tg_file = await context.bot.get_file(fid)
+        await download_to_drive_retry(tg_file, str(tmp))
+        analysis = await asyncio.to_thread(analyze_local_file, tmp)
+        return item, analysis
+    except Exception as exc:
+        item["review"] = True
+        item["duplicate_level"] = "unanalyzed"
+        item["review_note"] = f"خطا: {exc!r}"
+        return item, None
+    finally:
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id,
-                text=f"🧮 اثر انگشت {len(rows)} آهنگ آماده است؛ در حال مقایسه صوتی گروه‌ها...\nاین مرحله ممکن است کمی زمان ببرد.")
+            tmp.unlink(missing_ok=True)
         except Exception:
             pass
-        groups = await asyncio.to_thread(build_similarity_groups, rows, threshold)
-        scan_id = store.create_scan(user_id, len(tracks), processed, groups, errors)
-        duplicate_ids = {int(tid) for group in groups for tid in group.get("track_ids", [])}
-        fingerprinted_count = sum(1 for row in rows if row.get("fingerprint"))
-        unmatched_count = max(0, fingerprinted_count - len(duplicate_ids))
+
+
+def _is_exact_match(analysis_a, analysis_b) -> tuple[bool, float]:
+    if not analysis_a or not analysis_b:
+        return False, 0.0
+    score = similarity_between_analyses(analysis_a, analysis_b)
+    return score >= EXACT_THRESHOLD, score
+
+
+def _is_review_match(analysis_a, analysis_b) -> tuple[bool, float]:
+    if not analysis_a or not analysis_b:
+        return False, 0.0
+    score = similarity_between_analyses(analysis_a, analysis_b)
+    return REVIEW_THRESHOLD <= score < EXACT_THRESHOLD, score
+
+
+async def resolve_archive_with_priority(context, progress_cb=None) -> dict:
+    """Fingerprint Source A/B, auto-drop definite duplicates with A priority.
+
+    Returns stats + final queue written into context.user_data['archive']['queue'].
+    """
+    archive = context.user_data.setdefault("archive", {"sources": {"source_a": [], "source_b": []}, "queue": []})
+    sources = archive.setdefault("sources", {"source_a": [], "source_b": []})
+    temp_root = Path(tempfile.mkdtemp(prefix="arch_resolve_", dir=str(DATA_DIR)))
+    stats = {
+        "total_received": 0,
+        "from_a": 0,
+        "from_b": 0,
+        "kept_a": 0,
+        "kept_b": 0,
+        "removed_definite": 0,
+        "removed_within_a": 0,
+        "removed_within_b": 0,
+        "removed_b_vs_a": 0,
+        "review_count": 0,
+        "errors": 0,
+        "final_count": 0,
+    }
+    try:
+        a_raw = list(sources.get("source_a") or [])
+        b_raw = list(sources.get("source_b") or [])
+        stats["from_a"] = len(a_raw)
+        stats["from_b"] = len(b_raw)
+        stats["total_received"] = len(a_raw) + len(b_raw)
+
+        # --- analyze A ---
+        a_items = []  # list of (item, analysis)
+        for i, entry in enumerate(sorted(a_raw, key=lambda x: x.get("message_id") or 0)):
+            if progress_cb:
+                await progress_cb(f"تحلیل Source A: {i+1}/{len(a_raw)}")
+            item, analysis = await _fingerprint_source_item(context, entry, "A", temp_root)
+            if item.get("duplicate_level") == "unanalyzed":
+                stats["errors"] += 1
+            a_items.append((item, analysis))
+
+        # Dedup within A (keep first occurrence of each exact cluster)
+        kept_a = []  # list of (item, analysis)
+        for item, analysis in a_items:
+            if item.get("duplicate_level") == "unanalyzed":
+                item["review"] = True
+                kept_a.append((item, analysis))
+                stats["review_count"] += 1
+                continue
+            drop = False
+            for kept_item, kept_an in kept_a:
+                if kept_item.get("removed"):
+                    continue
+                exact, score = _is_exact_match(analysis, kept_an)
+                if exact:
+                    item["removed"] = True
+                    item["removed_reason"] = f"duplicate_within_A score={score}"
+                    item["fingerprint_score"] = score
+                    stats["removed_within_a"] += 1
+                    stats["removed_definite"] += 1
+                    drop = True
+                    break
+                rev, score = _is_review_match(analysis, kept_an)
+                if rev:
+                    item["review"] = True
+                    item["duplicate_level"] = "review"
+                    item["fingerprint_score"] = score
+                    item["review_matches"] = [{
+                        "title": track_display_name(kept_item),
+                        "criteria": [f"Audio Fingerprint {score}%"],
+                    }]
+                    item["review_note"] = "مشابه داخل Source A — نیاز به بررسی"
+                    stats["review_count"] += 1
+            if not drop:
+                kept_a.append((item, analysis))
+
+        # --- analyze B ---
+        b_items = []
+        for i, entry in enumerate(sorted(b_raw, key=lambda x: x.get("message_id") or 0)):
+            if progress_cb:
+                await progress_cb(f"تحلیل Source B: {i+1}/{len(b_raw)}")
+            item, analysis = await _fingerprint_source_item(context, entry, "B", temp_root)
+            if item.get("duplicate_level") == "unanalyzed":
+                stats["errors"] += 1
+            b_items.append((item, analysis))
+
+        kept_b = []
+        for item, analysis in b_items:
+            if item.get("duplicate_level") == "unanalyzed":
+                item["review"] = True
+                kept_b.append((item, analysis))
+                stats["review_count"] += 1
+                continue
+            # Compare against kept A — A always wins
+            drop = False
+            for kept_item, kept_an in kept_a:
+                exact, score = _is_exact_match(analysis, kept_an)
+                if exact:
+                    item["removed"] = True
+                    item["removed_reason"] = f"duplicate_of_A score={score}"
+                    item["fingerprint_score"] = score
+                    kept_item["also_in_source_b"] = True
+                    kept_item["fingerprint_score"] = score
+                    stats["removed_b_vs_a"] += 1
+                    stats["removed_definite"] += 1
+                    drop = True
+                    break
+                rev, score = _is_review_match(analysis, kept_an)
+                if rev:
+                    item["review"] = True
+                    item["duplicate_level"] = "review"
+                    item["fingerprint_score"] = score
+                    item["review_matches"] = [{
+                        "title": track_display_name(kept_item),
+                        "criteria": [f"Audio Fingerprint {score}%"],
+                    }]
+                    item["review_note"] = "مشابه با Source A — نیاز به بررسی (حذف خودکار نشد)"
+                    stats["review_count"] += 1
+            if drop:
+                continue
+            # Dedup within kept B
+            for kb_item, kb_an in kept_b:
+                exact, score = _is_exact_match(analysis, kb_an)
+                if exact:
+                    item["removed"] = True
+                    item["removed_reason"] = f"duplicate_within_B score={score}"
+                    item["fingerprint_score"] = score
+                    stats["removed_within_b"] += 1
+                    stats["removed_definite"] += 1
+                    drop = True
+                    break
+            if not drop:
+                kept_b.append((item, analysis))
+
+        # Build final queue: only non-removed
+        final = []
+        for item, _an in kept_a:
+            if item.get("removed"):
+                continue
+            item.pop("_analysis", None)
+            final.append(item)
+            stats["kept_a"] += 1
+        for item, _an in kept_b:
+            if item.get("removed"):
+                continue
+            item.pop("_analysis", None)
+            final.append(item)
+            stats["kept_b"] += 1
+
+        for i, x in enumerate(final, 1):
+            x["number"] = i
+            x["status"] = x.get("status") or "pending"
+
+        archive["queue"] = final
+        archive["phase"] = "queue"
+        archive["scan_stats"] = stats
+        # Keep a side log of removed items for report (not in queue)
+        archive["removed_log"] = [
+            {
+                "name": (it.get("name") or it.get("title")),
+                "source": it.get("source"),
+                "reason": it.get("removed_reason"),
+                "score": it.get("fingerprint_score"),
+            }
+            for it, _ in (a_items + b_items)
+            if it.get("removed")
+        ]
+        stats["final_count"] = len(final)
+        return stats
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def build_archive_manifest_bytes(archive: dict) -> bytes:
+    """Produce archive-v1 text+JSON payload compatible with ورودی بررسی منابع."""
+    queue = archive.get("queue") or []
+    stats = archive.get("scan_stats") or {}
+    lines = [
+        "ARCHIVE-MANIFEST v1",
+        f"تعداد آهنگ‌های نهایی: {len(queue)}",
+        f"حذف‌شده قطعی: {stats.get('removed_definite', 0)}",
+        f"نیازمند بررسی: {sum(1 for x in queue if x.get('review'))}",
+        f"از Source A: {stats.get('kept_a', 0)}",
+        f"جدید از Source B: {stats.get('kept_b', 0)}",
+        "",
+        "فهرست آهنگ‌ها:",
+    ]
+    for x in queue:
+        mark = "❗ " if x.get("review") else ""
+        artist = x.get("artist") or "هنرمند نامشخص"
+        name = x.get("title") or Path(str(x.get("name") or "بدون نام")).stem
+        score = x.get("fingerprint_score")
+        score_s = f" [{score}%]" if score else ""
+        lines.append(f"{int(x.get('number') or 0):03d}. {mark}{name} - {artist}{score_s}")
+        if x.get("review") and x.get("review_matches"):
+            for h in x["review_matches"]:
+                crit = ", ".join(h.get("criteria") or []) or "—"
+                lines.append(f"    ↳ مشابه: {h.get('title') or '—'} | {crit}")
+        if x.get("review_note"):
+            lines.append(f"    ↳ {x['review_note']}")
+    manifest = {
+        "format": "archive-v1",
+        "tracks": [{
+            k: x.get(k) for k in (
+                "number", "name", "title", "artist", "duration", "size",
+                "file_id", "file_unique_id", "review", "possible_match",
+                "review_matches", "review_criteria", "source",
+                "fingerprint_score", "duplicate_level", "review_note",
+            )
+        } for x in queue],
+        "stats": stats,
+    }
+    lines += ["", "---DATA---", json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+async def audio_scanner_worker(context, user_id, chat_id, progress_message_id):
+    """Scan Source A/B, auto-remove definite dups (A wins), build final archive queue + manifest."""
+    bot = context.application.bot
+    try:
+        archive = context.user_data.get("archive") or {}
+        sources = archive.get("sources") or {}
+        n_a = len(sources.get("source_a") or [])
+        n_b = len(sources.get("source_b") or [])
+        if n_a + n_b == 0:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=progress_message_id,
+                text="آرشیوی برای اسکن نیست. ابتدا Source A و B را از «دریافت Source A/B» وارد کن.",
+                reply_markup=audio_scanner_keyboard(),
+            )
+            return
+
+        # Register in store for cache continuity (best-effort)
+        try:
+            scanner_sync_current_archive(context, user_id, chat_id)
+        except Exception as exc:
+            print("scanner_sync warning:", repr(exc))
+
+        method = "chromaprint" if fpcalc_available() else "content-hash/soft-fp"
         await bot.edit_message_text(
             chat_id=chat_id, message_id=progress_message_id,
-            text=(f"✅ اسکن صوتی تمام شد\n\n📦 کل فایل‌های آرشیو: {len(tracks)}\n"
-                  f"🔍 بررسی‌شده: {processed}\n🎧 گروه‌های مشابه: {len(groups)}\n"
-                  f"♻️ فایل‌های حاضر در گروه‌های مشابه: {len(duplicate_ids)}\n"
-                  f"🎵 بدون تطابق در آستانه فعلی: {unmatched_count}\n"
-                  f"🧑‍⚖️ گروه‌های نیازمند انتخاب دستی: {len(groups)}\n"
-                  f"❗ فایل‌های دارای خطای تحلیل: {errors}\n📏 آستانه شباهت: {threshold:.1f}%\n"
-                  f"شناسه اسکن: {scan_id}\n\nبرای انتخاب نسخه باقی‌ماندنی وارد Duplicate Groups شو."),
-            reply_markup=audio_scanner_keyboard()
+            text=(
+                f"🎧 Audio Scanner\n\n"
+                f"Source A: {n_a} | Source B: {n_b}\n"
+                f"روش: {method}\n"
+                f"اولویت: Source A بر B\n\nشروع تحلیل…"
+            ),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹ لغو", callback_data="ascan:cancel")]]),
         )
-        failed = store.failed_tracks(user_id)
-        if failed:
-            lines = ["⚠️ فایل‌هایی که تحلیل نشدند:"]
-            for item in failed[:30]:
-                lines.append(f"• {item['name']}\n  دلیل: {item.get('last_error') or 'نامشخص'}")
-            if len(failed) > 30:
-                lines.append(f"… و {len(failed)-30} مورد دیگر")
-            await bot.send_message(chat_id=chat_id, text="\n".join(lines)[:3900])
+
+        async def progress_cb(msg: str):
+            if context.user_data.get("audio_scan_cancel"):
+                raise asyncio.CancelledError()
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=progress_message_id,
+                    text=f"🎧 Audio Scanner\n\n{msg}",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏹ لغو", callback_data="ascan:cancel")]]),
+                )
+            except Exception:
+                pass
+
+        try:
+            stats = await resolve_archive_with_priority(context, progress_cb=progress_cb)
+        except asyncio.CancelledError:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=progress_message_id,
+                text="⏹ اسکن لغو شد. می‌توانی دوباره شروع کنی.",
+                reply_markup=audio_scanner_keyboard(),
+            )
+            return
+
+        # Persist last report
+        context.user_data["scanner_last_report"] = stats
+        archive = context.user_data.get("archive") or {}
+        archive["scan_stats"] = stats
+
+        report = (
+            "📊 گزارش Audio Scanner\n\n"
+            f"• کل دریافتی: {stats['total_received']} (A={stats['from_a']} + B={stats['from_b']})\n"
+            f"• Duplicate قطعی حذف‌شده: {stats['removed_definite']}\n"
+            f"  ↳ داخل A: {stats['removed_within_a']} | B در برابر A: {stats['removed_b_vs_a']} | داخل B: {stats['removed_within_b']}\n"
+            f"• باقی‌مانده از Source A: {stats['kept_a']}\n"
+            f"• جدید از Source B: {stats['kept_b']}\n"
+            f"• نهایی در آرشیو: {stats['final_count']}\n"
+            f"• نیازمند بررسی: {stats['review_count']}\n"
+            f"• خطا / غیرقابل تحلیل: {stats['errors']}\n\n"
+            "Duplicateهای قطعی از صف نهایی حذف شدند (اولویت با Source A).\n"
+            "فایل خروجی با «📄 دریافت خروجی فهرست» برای ورودی بررسی منابع آماده است."
+        )
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=progress_message_id,
+            text=report,
+            reply_markup=audio_scanner_keyboard(),
+        )
     except Exception as exc:
         print("Audio scanner worker error:", repr(exc))
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=progress_message_id,
-                text=f"❌ اسکن با خطا متوقف شد: {type(exc).__name__}: {str(exc)[:300]}\nاثر انگشت‌های موفق قبلی حفظ شده‌اند.",
-                reply_markup=audio_scanner_keyboard())
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=progress_message_id,
+                text=f"❌ اسکن متوقف شد: {type(exc).__name__}: {str(exc)[:300]}",
+                reply_markup=audio_scanner_keyboard(),
+            )
         except Exception:
             pass
     finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir, ignore_errors=True)
         context.user_data.pop("audio_scan_task", None)
         context.user_data.pop("audio_scan_cancel", None)
+
 
 
 async def audio_scanner_show_group(query, context, group_id):
@@ -1770,7 +2021,7 @@ async def archive_start(update, context):
     context.user_data["archive"] = {"phase": "menu", "sources": {"source_a": [], "source_b": []}, "queue": [], "cursor": 0}
     context.user_data["album_mode"] = False
     context.user_data["waiting"] = None
-    await update.message.reply_text("📚 آرشیو موسیقی\n\nیکی از دو مرحله را انتخاب کن:", reply_markup=archive_keyboard())
+    await update.message.reply_text("📚 آرشیو موسیقی\n\nیکی از گزینه‌های زیر را انتخاب کن:\n• دریافت Source A/B\n• Audio Scanner\n• ورودی بررسی منابع", reply_markup=archive_keyboard())
 
 def archive_norm(name):
     import unicodedata
@@ -2976,115 +3227,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("درخواست توقف ثبت شد؛ پس از پایان پردازش فایل جاری، اسکن متوقف می‌شود.")
             return
         if data == "ascan:results":
-            result = store.latest_scan(user_id)
-            if not result:
-                await query.message.reply_text("هنوز اسکن کاملی ثبت نشده است.", reply_markup=audio_scanner_keyboard())
-                return
-            await query.message.reply_text(
-                f"📊 آخرین نتیجه اسکن\n\nکل فایل‌ها: {result['total']}\nبررسی‌شده: {result['processed']}\nگروه‌های مشابه: {result['group_count']}\nخطاهای تحلیل: {result['error_count']}\nزمان ثبت: {time.strftime('%Y-%m-%d %H:%M', time.localtime(result['created_at']))}",
-                reply_markup=audio_scanner_keyboard())
-            return
-        if data == "ascan:groups":
-            groups = store.groups(user_id, pending_only=False)
-            if not groups:
-                await query.message.reply_text("هنوز گروه مشابهی ثبت نشده. ابتدا Scan Archive را اجرا کن.", reply_markup=audio_scanner_keyboard())
-                return
-            lines = ["🗂 گروه‌های مشابه آخرین اسکن", ""]
-            buttons = []
-            for group in groups[:30]:
-                d = group["data"]
-                names = [x.get("name", "بدون نام") for x in d.get("tracks", [])]
-                status = "⏳ نیازمند انتخاب" if group["status"] == "pending" else "✅ انتخاب انجام شده"
-                lines.append(f"گروه {group['group_no']} | {len(names)} فایل | شباهت {group['score']:.2f}% | {status}")
-                buttons.append([InlineKeyboardButton(f"گروه {group['group_no']} ({len(names)} فایل)", callback_data=f"ascan:group:{group['id']}")])
-            if len(groups) > 30: lines.append(f"\n{len(groups)-30} گروه دیگر در فهرست پایگاه داده باقی مانده‌اند.")
-            buttons.append([InlineKeyboardButton("🔙 Scanner Menu", callback_data="ascan:menu")])
-            await query.message.reply_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(buttons))
-            return
-        if data.startswith("ascan:group:"):
-            try: group_id = int(data.split(":", 2)[2])
-            except ValueError:
-                await query.message.reply_text("شناسه گروه نامعتبر است."); return
-            await audio_scanner_show_group(query, context, group_id)
-            return
-        if data.startswith("ascan:keep:"):
-            try:
-                _, _, group_id, track_id = data.split(":", 3)
-                moved = store.choose_keep(user_id, int(group_id), int(track_id))
+            stats = context.user_data.get("scanner_last_report") or (context.user_data.get("archive") or {}).get("scan_stats")
+            if not stats:
                 await query.message.reply_text(
-                    f"✅ انتخاب ثبت شد.\nنسخه انتخابی در فهرست فعال باقی ماند و {moved} نسخه به قرنطینه Scanner منتقل شد.\n\nتوجه: پیام و فایل اصلی در تلگرام حذف نشده‌اند؛ قرنطینه فقط وضعیت آن‌ها را در فهرست Scanner تغییر می‌دهد.",
-                    reply_markup=audio_scanner_keyboard())
-            except Exception as exc:
-                await query.message.reply_text(f"❌ انتخاب انجام نشد: {str(exc)[:250]}")
-            return
-        if data == "ascan:quarantine":
-            items = store.quarantine_items(user_id)
-            if not items:
-                await query.message.reply_text("قرنطینه خالی است.", reply_markup=audio_scanner_keyboard())
+                    "هنوز اسکن کاملی ثبت نشده. «شروع اسکن» را بزن.",
+                    reply_markup=audio_scanner_keyboard(),
+                )
                 return
-            lines = ["♻️ قرنطینه Scanner", "فایل‌های زیر از فهرست فعال کنار گذاشته شده‌اند؛ فایل اصلی تلگرام دست‌نخورده است.", ""]
-            buttons = []
-            for item in items[:25]:
-                lines.append(f"{item['id']}. {item['name']}")
-                buttons.append([
-                    InlineKeyboardButton(f"↩️ بازیابی {item['id']}", callback_data=f"ascan:restore:{item['id']}"),
-                    InlineKeyboardButton(f"🗑 حذف از فهرست", callback_data=f"ascan:forget_confirm:{item['id']}")
-                ])
-            buttons.append([InlineKeyboardButton("🔙 Scanner Menu", callback_data="ascan:menu")])
-            await query.message.reply_text("\n".join(lines)[:3900], reply_markup=InlineKeyboardMarkup(buttons))
-            return
-        if data.startswith("ascan:forget_confirm:"):
-            try: qid = int(data.rsplit(":", 1)[1])
-            except ValueError:
-                await query.message.reply_text("شناسه قرنطینه نامعتبر است."); return
             await query.message.reply_text(
-                "⚠️ تأیید حذف از فهرست Scanner\n\nاین کار فقط رکورد و شناسه فایل را از پایگاه داده Scanner حذف می‌کند. پیام و فایل اصلی در تلگرام حذف نخواهد شد. ادامه می‌دهی؟",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("تأیید حذف از فهرست", callback_data=f"ascan:forget:{qid}")],
-                    [InlineKeyboardButton("لغو", callback_data="ascan:quarantine")],
-                ]))
+                "📊 گزارش آخرین اسکن\n\n"
+                f"• کل دریافتی: {stats.get('total_received', 0)}\n"
+                f"• Duplicate قطعی حذف‌شده: {stats.get('removed_definite', 0)}\n"
+                f"• باقی‌مانده از A: {stats.get('kept_a', 0)}\n"
+                f"• جدید از B: {stats.get('kept_b', 0)}\n"
+                f"• نهایی: {stats.get('final_count', 0)}\n"
+                f"• نیازمند بررسی: {stats.get('review_count', 0)}\n"
+                f"• خطا: {stats.get('errors', 0)}",
+                reply_markup=audio_scanner_keyboard(),
+            )
             return
-        if data.startswith("ascan:forget:"):
-            try: qid = int(data.rsplit(":", 1)[1])
-            except ValueError:
-                await query.message.reply_text("شناسه قرنطینه نامعتبر است."); return
-            if store.remove_from_index(user_id, qid):
-                await query.message.reply_text("رکورد از فهرست Scanner حذف شد؛ پیام اصلی تلگرام دست‌نخورده باقی ماند.", reply_markup=audio_scanner_keyboard())
-            else:
-                await query.message.reply_text("این مورد در قرنطینه پیدا نشد.")
+        if data == "ascan:review_list":
+            queue = (context.user_data.get("archive") or {}).get("queue") or []
+            reviews = [x for x in queue if x.get("review")]
+            if not reviews:
+                await query.message.reply_text(
+                    "مورد نیازمند بررسی‌ای در فهرست نهایی نیست.",
+                    reply_markup=audio_scanner_keyboard(),
+                )
+                return
+            lines = [f"🔎 نیازمند بررسی ({len(reviews)} مورد):\n"]
+            for x in reviews[:40]:
+                name = x.get("title") or Path(str(x.get("name") or "?")).stem
+                src = x.get("source") or "?"
+                note = x.get("review_note") or ""
+                score = x.get("fingerprint_score")
+                sc = f" {score}%" if score else ""
+                lines.append(f"• [{src}] {name}{sc}")
+                if note:
+                    lines.append(f"  {note}")
+            if len(reviews) > 40:
+                lines.append(f"… و {len(reviews)-40} مورد دیگر")
+            await query.message.reply_text("\n".join(lines)[:3900], reply_markup=audio_scanner_keyboard())
             return
-        if data.startswith("ascan:restore:"):
-            try: qid = int(data.rsplit(":", 1)[1])
-            except ValueError:
-                await query.message.reply_text("شناسه قرنطینه نامعتبر است."); return
-            if store.restore(user_id, qid):
-                await query.message.reply_text("✅ فایل به فهرست فعال Scanner بازگردانده شد. فایل اصلی تلگرام تغییری نکرد.", reply_markup=audio_scanner_keyboard())
-            else:
-                await query.message.reply_text("این مورد در قرنطینه پیدا نشد.")
+        if data == "ascan:export":
+            archive = context.user_data.get("archive") or {}
+            queue = archive.get("queue") or []
+            if not queue:
+                await query.message.reply_text(
+                    "فهرست نهایی خالی است. ابتدا اسکن را اجرا کن.",
+                    reply_markup=audio_scanner_keyboard(),
+                )
+                return
+            payload = build_archive_manifest_bytes(archive)
+            buf = BytesIO(payload)
+            buf.name = "archive_manifest.txt"
+            await query.message.reply_document(
+                document=buf,
+                filename="archive_manifest.txt",
+                caption=(
+                    f"فهرست نهایی آرشیو ({len(queue)} آهنگ).\n"
+                    "این فایل را به «ورودی بررسی منابع» بده."
+                ),
+            )
             return
-        if data == "ascan:settings":
-            threshold = store.threshold(user_id)
+        # Legacy callbacks kept as soft redirects
+        if data in ("ascan:groups", "ascan:quarantine", "ascan:settings") or data.startswith("ascan:group:") or data.startswith("ascan:keep:") or data.startswith("ascan:restore:") or data.startswith("ascan:forget") or data.startswith("ascan:threshold:"):
             await query.message.reply_text(
-                f"⚙️ تنظیمات Scanner\n\nآستانه فعلی: {threshold:.1f}%\n\nآستانه پایین‌تر گروه‌های بیشتری برای بررسی نشان می‌دهد و احتمال موارد مشابه کاذب را بالا می‌برد.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("۹۵٪", callback_data="ascan:threshold:95"), InlineKeyboardButton("۹۷٪", callback_data="ascan:threshold:97"), InlineKeyboardButton("۹۹٪", callback_data="ascan:threshold:99")],
-                    [InlineKeyboardButton("🔙 Scanner Menu", callback_data="ascan:menu")],
-                ]))
-            return
-        if data.startswith("ascan:threshold:"):
-            try: value = float(data.rsplit(":", 1)[1])
-            except ValueError:
-                await query.message.reply_text("آستانه نامعتبر است."); return
-            store.set_threshold(user_id, value)
-            await query.message.reply_text(f"✅ آستانه شباهت روی {store.threshold(user_id):.1f}% تنظیم شد. برای اعمال آن، اسکن جدید اجرا کن.", reply_markup=audio_scanner_keyboard())
-            return
-        return
-
-    if data.startswith("arch:"):
-        a = context.user_data.get("archive")
-        if data == "arch:close":
-            context.user_data.pop("archive", None)
-            await safe_edit_message_text(query.message, "آرشیو بسته شد. فایل‌های قبلی ربات دست‌نخورده‌اند.")
+                "این بخش ساده‌سازی شده است.\nDuplicateهای قطعی خودکار حذف می‌شوند.\nاز منوی اصلی Scanner استفاده کن.",
+                reply_markup=audio_scanner_keyboard(),
+            )
             return
         if data == "arch:menu":
             if a: a["phase"] = "menu"
@@ -3095,7 +3306,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if data == "arch:review_menu":
             a["phase"] = "menu"
-            await query.message.reply_text("برای بررسی، منبع A را اضافه کن و سپس منبع B را. هر منبع را جداگانه پایان بده.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],[InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],[InlineKeyboardButton("🧮 تحلیل و ساخت فهرست", callback_data="arch:analyze")]]))
+            await query.message.reply_text(
+                "دریافت منابع:\n"
+                "۱) Source A را بفرست و پایان را تأیید کن\n"
+                "۲) Source B را بفرست و پایان را تأیید کن\n"
+                "۳) Audio Scanner را اجرا کن تا تکراری‌های قطعی حذف و فهرست نهایی ساخته شود",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],
+                    [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
+                    [InlineKeyboardButton("🎧 Audio Scanner", callback_data="ascan:menu")],
+                    [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+                ]),
+            )
             return
         if data == "arch:input_menu":
             context.user_data["waiting"] = "archive_manifest"
@@ -3167,7 +3389,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(
                 f"در مجموع {stats['received']} آهنگ از Source B دریافت شده است.\nآیا دریافت این منبع را تأیید می‌کنی؟\n\nپس از تأیید، تحلیل Audio Fingerprint اجرا می‌شود.",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ تأیید و شروع تحلیل اثرانگشت", callback_data="arch:confirm_b_yes")],
+                    [InlineKeyboardButton("✅ تأیید Source B", callback_data="arch:confirm_b_yes")],
                     [InlineKeyboardButton("↩️ بازگشت به Source B", callback_data="arch:continue_b")],
                 ]),
             )
@@ -3175,11 +3397,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == "arch:confirm_b_yes":
             a["phase"] = "menu"
             a["source_b_confirmed"] = True
+            n_a = len((a.get("sources") or {}).get("source_a") or [])
+            n_b = len((a.get("sources") or {}).get("source_b") or [])
             await query.message.reply_text(
-                f"✅ Source B نهایی شد ({len((a.get('sources') or {}).get('source_b') or [])} آهنگ).\nدر حال آماده‌سازی تحلیل…",
+                f"✅ Source B نهایی شد.\nSource A: {n_a} | Source B: {n_b}\n\n"
+                "حالا Audio Scanner را باز کن تا تکراری‌های قطعی حذف شوند و فهرست نهایی ساخته شود.",
+                reply_markup=audio_scanner_keyboard(),
             )
-            # Fall through into fingerprint analyze by reusing arch:analyze logic
-            data = "arch:analyze"
+            return
         if data in ("arch:export_a", "arch:export_b"):
             key = "source_a" if data.endswith("_a") else "source_b"
             label = "A" if key == "source_a" else "B"
@@ -3193,172 +3418,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if data == "arch:analyze":
-            # Fingerprint-based duplicate detection (replaces 4-criteria name/size matching).
-            status = await query.message.reply_text("🔬 در حال تحلیل Audio Fingerprint منابع A و B…")
-            merged = []
-            fp_exact = 0
-            fp_review = 0
-            fp_errors = 0
-            analyses = {}  # key = id(entry dict) via message_id+source
-
-            async def _analyze_entry(entry, source_label):
-                nonlocal fp_errors
-                item = dict(entry, source=source_label, duplicate_level="independent",
-                            review=False, status="pending", fingerprint_score=None)
-                fid = entry.get("file_id")
-                if not fid:
-                    item["review"] = True
-                    item["duplicate_level"] = "unanalyzed"
-                    item["review_note"] = "بدون file_id — نیاز به بررسی دستی"
-                    fp_errors += 1
-                    return item
-                if int(entry.get("size") or 0) > MAX_SIZE:
-                    item["review"] = True
-                    item["duplicate_level"] = "unanalyzed"
-                    item["review_note"] = "حجم بیش از حد — نیاز به بررسی دستی"
-                    fp_errors += 1
-                    return item
-                tmp_dir = tempfile.mkdtemp(prefix="arch_fp_")
-                tmp_path = Path(tmp_dir) / "track.mp3"
-                try:
-                    tg_file = await context.bot.get_file(fid)
-                    await download_to_drive_retry(tg_file, str(tmp_path))
-                    analysis = await asyncio.to_thread(analyze_local_file, tmp_path)
-                    item["_analysis"] = analysis
-                    if analysis.get("error") and not analysis.get("content_hash"):
-                        item["review"] = True
-                        item["duplicate_level"] = "unanalyzed"
-                        item["review_note"] = f"خطای تحلیل: {analysis.get('error')}"
-                        fp_errors += 1
-                except Exception as exc:
-                    item["review"] = True
-                    item["duplicate_level"] = "unanalyzed"
-                    item["review_note"] = f"دانلود/تحلیل ناموفق: {exc!r}"
-                    fp_errors += 1
-                finally:
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                return item
-
-            # Analyze A then B (sequential to limit resources)
-            for entry in sorted(a["sources"].get("source_a") or [], key=lambda x: x.get("message_id", 0)):
-                merged.append(await _analyze_entry(entry, "A"))
-            b_items = []
-            for entry in sorted(a["sources"].get("source_b") or [], key=lambda x: x.get("message_id", 0)):
-                b_items.append(await _analyze_entry(entry, "B"))
-
-            # Compare each B track against A tracks using fingerprint similarity
-            for item in b_items:
-                analysis_b = item.pop("_analysis", None) or {}
-                best = None
-                best_score = 0.0
-                best_idx = None
-                for i, prev in enumerate(merged):
-                    if prev.get("source") != "A":
-                        continue
-                    analysis_a = prev.get("_analysis") or {}
-                    if not analysis_a and not analysis_b:
-                        continue
-                    score = similarity_between_analyses(analysis_a, analysis_b) if analysis_a and analysis_b else 0.0
-                    if score > best_score:
-                        best_score = score
-                        best = prev
-                        best_idx = i
-                item["fingerprint_score"] = best_score
-                if best_score >= EXACT_THRESHOLD:
-                    # Mark A as also present in B; keep B as review so user chooses
-                    merged[best_idx].setdefault("also_in_source_b", True)
-                    merged[best_idx]["fingerprint_score"] = best_score
-                    item["review"] = True
-                    item["duplicate_level"] = "exact_fp"
-                    item["possible_match"] = best_idx + 1
-                    item["review_matches"] = [{
-                        "number": best_idx + 1,
-                        "title": track_display_name(best),
-                        "criteria": [f"Audio Fingerprint {best_score}%"],
-                    }]
-                    item["review_criteria"] = [f"Audio Fingerprint {best_score}%"]
-                    item["review_note"] = "تطابق صوتی بسیار بالا — انتخاب نسخه با شماست"
-                    fp_exact += 1
-                    merged.append(item)
-                elif best_score >= REVIEW_THRESHOLD:
-                    item["review"] = True
-                    item["duplicate_level"] = "review"
-                    item["possible_match"] = (best_idx + 1) if best_idx is not None else None
-                    item["review_matches"] = [{
-                        "number": (best_idx + 1) if best_idx is not None else None,
-                        "title": track_display_name(best) if best else "—",
-                        "criteria": [f"Audio Fingerprint {best_score}%"],
-                    }]
-                    item["review_criteria"] = [f"Audio Fingerprint {best_score}%"]
-                    fp_review += 1
-                    merged.append(item)
-                else:
-                    # Independent track (or unanalyzed already flagged)
-                    if item.get("duplicate_level") == "unanalyzed":
-                        fp_review += 1
-                    merged.append(item)
-
-            # Strip internal analysis blobs before persist
-            for x in merged:
-                x.pop("_analysis", None)
-
-            for i, x in enumerate(merged, 1):
-                x["number"] = i
-            a["queue"] = merged
-            a["phase"] = "queue"
-
-            lines = [
-                "ARCHIVE-MANIFEST v1",
-                f"تعداد آهنگ‌ها: {len(merged)}",
-                f"تطابق صوتی قطعی/بسیار بالا: {fp_exact}",
-                f"نیازمند بررسی (شامل خطای تحلیل): {fp_review + sum(1 for x in merged if x.get('duplicate_level')=='unanalyzed')}",
-                f"خطاهای پردازش اثرانگشت: {fp_errors}",
-                "",
-                "فهرست آهنگ‌ها:",
-            ]
-            for x in merged:
-                mark = "❗ " if x.get("review") else ""
-                artist = x.get("artist") or "هنرمند نامشخص"
-                name = x.get("title") or Path(x.get("name") or "بدون نام").stem
-                score = x.get("fingerprint_score")
-                score_s = f" [{score}%]" if score else ""
-                lines.append(f"{x['number']:03d}. {mark}{name} - {artist}{score_s}")
-                if x.get("review") and x.get("review_matches"):
-                    for h in x["review_matches"]:
-                        crit = ", ".join(h.get("criteria") or []) or "—"
-                        lines.append(f"    ↳ مشابه: {h.get('title') or '—'} | {crit}")
-                if x.get("review_note"):
-                    lines.append(f"    ↳ {x['review_note']}")
-            manifest = {
-                "format": "archive-v1",
-                "tracks": [{
-                    k: x.get(k) for k in (
-                        "number", "name", "title", "artist", "duration", "size",
-                        "file_id", "file_unique_id", "review", "possible_match",
-                        "review_matches", "review_criteria", "source",
-                        "fingerprint_score", "duplicate_level", "review_note",
-                    )
-                } for x in merged],
-            }
-            lines += ["", "---DATA---", json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))]
-            report = "\n".join(lines)
-            preview = "\n".join(lines[: min(len(lines), 24)])
-            try:
-                await status.edit_text(
-                    preview + ("\n… فهرست کامل داخل فایل متنی پیوست است." if len(lines) > 24 else "")
-                )
-            except Exception:
-                await query.message.reply_text(
-                    preview + ("\n… فهرست کامل داخل فایل متنی پیوست است." if len(lines) > 24 else "")
-                )
-            report_file = BytesIO(report.encode("utf-8"))
-            report_file.name = "archive_manifest.txt"
-            await query.message.reply_document(
-                document=report_file,
-                filename="archive_manifest.txt",
-                caption="تحلیل بر اساس Audio Fingerprint. این فایل را برای «ورودی بررسی منابع» بفرست.",
+            # Removed independent analyze step — Audio Scanner is the only analysis path.
+            await query.message.reply_text(
+                "مرحله «تحلیل و ساخت فهرست» حذف شده است.\nاز Audio Scanner استفاده کن.",
+                reply_markup=audio_scanner_keyboard(),
             )
-            await query.message.reply_text("فهرست کامل آماده شد.", reply_markup=archive_keyboard())
             return
         if data == "arch:list":
             await archive_show_list(query, context)
