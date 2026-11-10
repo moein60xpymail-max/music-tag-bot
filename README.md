@@ -1,6 +1,19 @@
-# Music Tag Bot — v6.2.7
+# Music Tag Bot — v6.2.8
 
-Built on v6.2.6.
+Built on v6.2.7.
+
+## v6.2.8 — Audio Similarity Scanner
+- Adds a dedicated Scanner section under Archive for tracks collected from Source A and Source B.
+- Uses full-track Chromaprint `fpcalc` raw audio fingerprints; titles, artists, tags, and filenames are not used to calculate similarity.
+- Downloads one Telegram track at a time, fingerprints it, then deletes the temporary local copy.
+- Stores compact fingerprints and Telegram file references in `DATA_DIR/audio_scanner.sqlite3`; later scans reuse cached fingerprints.
+- Similar tracks are grouped and show pairwise fingerprint similarity. The percentage is a fingerprint bit-similarity score, not a probability of identity.
+- The user manually chooses one track to keep in each group. Other entries move to Scanner quarantine; restore is available.
+- Quarantine is logical: it removes entries from the active Scanner catalog only. It does NOT delete original Telegram messages or media from source channels.
+- The Scanner requires the system executable `fpcalc` from the Chromaprint package. Nixpacks setup now includes `chromaprint` alongside `ffmpeg`.
+- Telegram Bot API downloads over 20 MB are reported as unprocessable by this bot setup; their names and reasons are shown in the final report.
+- Persistent scan history requires `DATA_DIR` to point to persistent storage on the hosting provider.
+- Because previous releases did not persist Source A/B Telegram references, the first scan after upgrading can only see tracks newly added after this release (or still present in the current in-memory archive session); re-add the source lists once after deployment to seed the new catalog.
 
 ## v6.2.7 Hotfix
 - **Telegram Music/Audio always accepted** — no dependency on `.mp3` suffix or MIME.

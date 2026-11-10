@@ -6,7 +6,7 @@ s = Path("bot.py").read_text(encoding="utf-8")
 
 
 def test_version():
-    assert 'VERSION = "v6.2.7"' in s
+    assert 'VERSION = "v6.2.8"' in s
 
 
 def test_helpers_present():
