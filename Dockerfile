@@ -1,10 +1,11 @@
 FROM python:3.12-slim
 
-# fpcalc (Chromaprint) + ffmpeg for Audio Scanner on EthioDeploy
+# On Debian Trixie the package name is libchromaprint-tools (provides fpcalc)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    chromaprint-tools \
+    libchromaprint-tools \
     ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && fpcalc -version
 
 WORKDIR /app
 
