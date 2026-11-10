@@ -1,3 +1,28 @@
+# Music Tag Bot — v7.0.0
+
+ادغام پایدار نسخه‌های 6.2.8 و 6.3.0 با بازطراحی Archive Mode.
+
+## v7.0.0 highlights
+- **پایان Source A/B**: گزارش آماری → ادامه دریافت یا تأیید نهایی (دیگر پرش مستقیم نیست).
+- **Analyze با Audio Fingerprint**: جایگزینی کامل معیارهای نام/خواننده/حجم/مدت با اثرانگشت صوتی.
+- **بدون حذف خودکار**: تطابق‌ها فقط علامت‌گذاری می‌شوند؛ انتخاب نسخه با کاربر است.
+- **خروجی TXT** فهرست Source با حفظ `file_id` در بخش `---DATA---`.
+- **Fallback**: content-hash + soft-fp وقتی `fpcalc` نصب نباشد؛ با `fpcalc` از Chromaprint استفاده می‌شود.
+- Scanner مستقل آرشیو (از 6.2.8) + fallbackهای 6.3.0 حفظ شده‌اند.
+- Auto Forward ترتیبی، Single/Album، تگ/کاور بدون تغییر مخرب.
+
+### نیاز سرور
+- اختیاری ولی توصیه‌شده: `chromaprint` (`fpcalc`) — در `nixpacks.toml` آمده است.
+- `DATA_DIR` پایدار برای SQLite اسکنر و نشست‌ها.
+
+### ادغام از نسخه‌ها
+| منبع | چه چیزی نگه داشته شد |
+|------|----------------------|
+| 6.2.8 | audio_scanner SQLite، ثبت track هنگام intake، منوی ascan، quarantine منطقی، chromaprint |
+| 6.3.0 | content-hash، soft fingerprint، آستانه‌های EXACT/REVIEW، ایده‌های resume/کش |
+
+---
+
 # Music Tag Bot — v6.2.8
 
 Built on v6.2.7.

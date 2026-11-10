@@ -10,7 +10,9 @@ from pathlib import Path
 from collections import Counter
 from dupes import classify as classify_duplicate, classify_detail
 from audio_scanner import (
-    AudioScannerStore, fpcalc_available, fingerprint_file, build_similarity_groups, DEFAULT_THRESHOLD
+    AudioScannerStore, fpcalc_available, fingerprint_file, build_similarity_groups,
+    DEFAULT_THRESHOLD, EXACT_THRESHOLD, REVIEW_THRESHOLD,
+    analyze_local_file, similarity_between_analyses, content_hash_file,
 )
 from typing import Dict, List, Optional, Any
 from io import BytesIO
@@ -230,13 +232,13 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v6.2.8"
+VERSION = "v7.0.0"
 VERSION_CHANGES = [
-    "افزودن Audio Similarity Scanner برای اسکن صوتی منابع A و B",
-    "ذخیره پایدار file_id و اثر انگشت صوتی در SQLite؛ دانلود و تحلیل مرحله‌ای",
-    "گروه‌بندی شباهت‌های صوتی و انتخاب دستی نسخه باقی‌ماندنی",
-    "قرنطینه منطقی و امکان بازیابی بدون حذف پیام اصلی تلگرام",
-    "ادامه اسکن با استفاده از اثر انگشت‌های ذخیره‌شده پس از توقف یا راه‌اندازی مجدد",
+    "Archive: گزارش پایان Source A/B + ادامه دریافت یا تأیید نهایی",
+    "Archive Analyze: جایگزینی معیارهای نام/حجم با Audio Fingerprinting",
+    "تکراری‌ها بدون حذف خودکار؛ انتخاب دستی + قرنطینه منطقی Scanner",
+    "خروجی TXT فهرست منابع با حفظ file_id",
+    "Fallback content-hash/soft-fp وقتی fpcalc در دسترس نیست",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 
@@ -1374,6 +1376,72 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==================== آرشیو موسیقی (نسخه پایه قابل استفاده) ====================
+
+def source_intake_stats(archive: dict, source_key: str) -> dict:
+    bucket = (archive.get("sources") or {}).get(source_key) or []
+    received = len(bucket)
+    too_large = sum(1 for x in bucket if int(x.get("size") or 0) > MAX_SIZE)
+    invalid = sum(1 for x in bucket if not x.get("file_id"))
+    processable = sum(1 for x in bucket if x.get("file_id") and int(x.get("size") or 0) <= MAX_SIZE)
+    failed = sum(1 for x in bucket if x.get("error") or x.get("status") == "failed")
+    return {
+        "received": received, "too_large": too_large, "invalid": invalid,
+        "failed": failed, "processable": processable,
+        "label": "A" if source_key == "source_a" else "B", "key": source_key,
+    }
+
+
+def format_source_intake_report(stats: dict) -> str:
+    label = stats["label"]
+    return (
+        f"📋 گزارش دریافت Source {label}\n\n"
+        f"• تعداد آهنگ‌های دریافت‌شده: {stats['received']}\n"
+        f"• تعداد فایل‌های بزرگ‌تر از حد مجاز: {stats['too_large']}\n"
+        f"• تعداد فایل‌های نامعتبر (بدون file_id): {stats['invalid']}\n"
+        f"• تعداد خطاهای ثبت‌شده: {stats['failed']}\n"
+        f"• تعداد آهنگ‌های قابل پردازش: {stats['processable']}"
+    )
+
+
+def source_finish_keyboard(source_key: str) -> InlineKeyboardMarkup:
+    label = "A" if source_key == "source_a" else "B"
+    cont = "arch:continue_a" if source_key == "source_a" else "arch:continue_b"
+    conf = "arch:confirm_a" if source_key == "source_a" else "arch:confirm_b"
+    export = "arch:export_a" if source_key == "source_a" else "arch:export_b"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➕ ادامه دریافت Source {label}", callback_data=cont)],
+        [InlineKeyboardButton(f"✅ اتمام Source {label} و مرحله بعد", callback_data=conf)],
+        [InlineKeyboardButton(f"📄 خروجی TXT فهرست Source {label}", callback_data=export)],
+        [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+    ])
+
+
+def export_source_txt(archive: dict, source_key: str) -> bytes:
+    bucket = (archive.get("sources") or {}).get(source_key) or []
+    lines = [
+        f"# Music Tag Bot — Source {'A' if source_key=='source_a' else 'B'} track list",
+        f"# count={len(bucket)}",
+        "# Edit display names if needed. Keep the ---DATA--- section intact.",
+        "",
+    ]
+    tracks = []
+    for i, x in enumerate(bucket, 1):
+        title = (x.get("title") or Path(str(x.get("name") or f"track_{i}")).stem).strip()
+        artist = (x.get("artist") or "").strip()
+        display = f"{title} - {artist}" if artist else title
+        lines.append(display)
+        tracks.append({
+            "number": i, "name": x.get("name"), "title": x.get("title"),
+            "artist": x.get("artist"), "duration": x.get("duration"), "size": x.get("size"),
+            "file_id": x.get("file_id"), "file_unique_id": x.get("file_unique_id"),
+            "message_id": x.get("message_id"),
+            "source": "A" if source_key == "source_a" else "B", "display": display,
+        })
+    payload = {"format": "source-list-v1", "source": source_key, "tracks": tracks}
+    lines += ["", "---DATA---", json.dumps(payload, ensure_ascii=False, separators=(",", ":"))]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
 def archive_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 بررسی آهنگ‌های منابع", callback_data="arch:review_menu")],
@@ -3042,72 +3110,254 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("📥 فایل‌های MP3 منبع B را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع B", callback_data="arch:finish_b")]]))
             return
         if data == "arch:finish_a":
-            a["phase"] = "menu"
             await finish_progress_dashboard(context, "archive_a", keep=True)
-            await safe_edit_reply_markup(query.message, reply_markup=archive_keyboard())
+            a["phase"] = "source_a_review"
+            stats = source_intake_stats(a, "source_a")
+            await query.message.reply_text(
+                format_source_intake_report(stats),
+                reply_markup=source_finish_keyboard("source_a"),
+            )
             return
         if data == "arch:finish_b":
-            a["phase"] = "menu"
             await finish_progress_dashboard(context, "archive_b", keep=True)
-            await safe_edit_reply_markup(query.message, reply_markup=archive_keyboard())
+            a["phase"] = "source_b_review"
+            stats = source_intake_stats(a, "source_b")
+            await query.message.reply_text(
+                format_source_intake_report(stats),
+                reply_markup=source_finish_keyboard("source_b"),
+            )
+            return
+        if data == "arch:continue_a":
+            a["phase"] = "source_a"
+            await query.message.reply_text(
+                "📥 ادامه دریافت Source A — فایل‌های جدید را بفرست.\nاطلاعات قبلی حفظ شده‌اند.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A", callback_data="arch:finish_a")]]),
+            )
+            return
+        if data == "arch:continue_b":
+            a["phase"] = "source_b"
+            await query.message.reply_text(
+                "📥 ادامه دریافت Source B — فایل‌های جدید را بفرست.\nاطلاعات قبلی حفظ شده‌اند.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع B", callback_data="arch:finish_b")]]),
+            )
+            return
+        if data == "arch:confirm_a":
+            stats = source_intake_stats(a, "source_a")
+            await query.message.reply_text(
+                f"در مجموع {stats['received']} آهنگ از Source A دریافت شده است.\nآیا دریافت این منبع را تأیید می‌کنی؟",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ تأیید و رفتن به Source B", callback_data="arch:confirm_a_yes")],
+                    [InlineKeyboardButton("↩️ بازگشت به Source A", callback_data="arch:continue_a")],
+                ]),
+            )
+            return
+        if data == "arch:confirm_a_yes":
+            a["phase"] = "menu"
+            a["source_a_confirmed"] = True
+            await query.message.reply_text(
+                f"✅ Source A نهایی شد ({len((a.get('sources') or {}).get('source_a') or [])} آهنگ).\nحالا Source B را اضافه کن.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
+                    [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+                ]),
+            )
+            return
+        if data == "arch:confirm_b":
+            stats = source_intake_stats(a, "source_b")
+            await query.message.reply_text(
+                f"در مجموع {stats['received']} آهنگ از Source B دریافت شده است.\nآیا دریافت این منبع را تأیید می‌کنی؟\n\nپس از تأیید، تحلیل Audio Fingerprint اجرا می‌شود.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ تأیید و شروع تحلیل اثرانگشت", callback_data="arch:confirm_b_yes")],
+                    [InlineKeyboardButton("↩️ بازگشت به Source B", callback_data="arch:continue_b")],
+                ]),
+            )
+            return
+        if data == "arch:confirm_b_yes":
+            a["phase"] = "menu"
+            a["source_b_confirmed"] = True
+            await query.message.reply_text(
+                f"✅ Source B نهایی شد ({len((a.get('sources') or {}).get('source_b') or [])} آهنگ).\nدر حال آماده‌سازی تحلیل…",
+            )
+            # Fall through into fingerprint analyze by reusing arch:analyze logic
+            data = "arch:analyze"
+        if data in ("arch:export_a", "arch:export_b"):
+            key = "source_a" if data.endswith("_a") else "source_b"
+            label = "A" if key == "source_a" else "B"
+            payload = export_source_txt(a, key)
+            buf = BytesIO(payload)
+            buf.name = f"source_{label}_list.txt"
+            await query.message.reply_document(
+                document=buf,
+                filename=f"source_{label}_list.txt",
+                caption=f"فهرست Source {label} — بخش ---DATA--- شناسه‌های تلگرام را حفظ می‌کند.",
+            )
             return
         if data == "arch:analyze":
-            merged=[]; definite_count=0; review_count=0
-            # Keep all A tracks in original order; B matches attach to A and do not create another queue row.
-            for entry in sorted(a["sources"]["source_a"], key=lambda x:x.get("message_id",0)):
-                merged.append(dict(entry, source="A", duplicate_level="independent", review=False, status="pending"))
-            for entry in sorted(a["sources"]["source_b"], key=lambda x:x.get("message_id",0)):
-                item=dict(entry, source="B", duplicate_level="independent", review=False, status="pending")
-                definite_hit=None
-                manual_hits=[]
-                for i, previous in enumerate(merged):
-                    result, labels = classify_detail(previous, item)
-                    if result=="definite":
-                        definite_hit=i
-                        break
-                    if result=="manual":
-                        manual_hits.append({
-                            "index": i,
-                            "number": previous.get("number") or (i + 1),
-                            "title": track_display_name(previous),
-                            "criteria": list(labels),
-                        })
-                if definite_hit is not None:
-                    merged[definite_hit].setdefault("also_in_source_b", True); definite_count+=1
-                elif manual_hits:
-                    item["review"]=True
-                    item["duplicate_level"]="review"
-                    item["possible_match"]=manual_hits[0]["index"]+1
-                    item["review_matches"]=[{
-                        "number": h.get("number"),
-                        "title": h.get("title"),
-                        "criteria": h.get("criteria") or [],
-                    } for h in manual_hits]
-                    if manual_hits[0].get("criteria"):
-                        item["review_criteria"]=list(manual_hits[0]["criteria"])
-                    merged.append(item); review_count+=1
-                else:
+            # Fingerprint-based duplicate detection (replaces 4-criteria name/size matching).
+            status = await query.message.reply_text("🔬 در حال تحلیل Audio Fingerprint منابع A و B…")
+            merged = []
+            fp_exact = 0
+            fp_review = 0
+            fp_errors = 0
+            analyses = {}  # key = id(entry dict) via message_id+source
+
+            async def _analyze_entry(entry, source_label):
+                nonlocal fp_errors
+                item = dict(entry, source=source_label, duplicate_level="independent",
+                            review=False, status="pending", fingerprint_score=None)
+                fid = entry.get("file_id")
+                if not fid:
+                    item["review"] = True
+                    item["duplicate_level"] = "unanalyzed"
+                    item["review_note"] = "بدون file_id — نیاز به بررسی دستی"
+                    fp_errors += 1
+                    return item
+                if int(entry.get("size") or 0) > MAX_SIZE:
+                    item["review"] = True
+                    item["duplicate_level"] = "unanalyzed"
+                    item["review_note"] = "حجم بیش از حد — نیاز به بررسی دستی"
+                    fp_errors += 1
+                    return item
+                tmp_dir = tempfile.mkdtemp(prefix="arch_fp_")
+                tmp_path = Path(tmp_dir) / "track.mp3"
+                try:
+                    tg_file = await context.bot.get_file(fid)
+                    await download_to_drive_retry(tg_file, str(tmp_path))
+                    analysis = await asyncio.to_thread(analyze_local_file, tmp_path)
+                    item["_analysis"] = analysis
+                    if analysis.get("error") and not analysis.get("content_hash"):
+                        item["review"] = True
+                        item["duplicate_level"] = "unanalyzed"
+                        item["review_note"] = f"خطای تحلیل: {analysis.get('error')}"
+                        fp_errors += 1
+                except Exception as exc:
+                    item["review"] = True
+                    item["duplicate_level"] = "unanalyzed"
+                    item["review_note"] = f"دانلود/تحلیل ناموفق: {exc!r}"
+                    fp_errors += 1
+                finally:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                return item
+
+            # Analyze A then B (sequential to limit resources)
+            for entry in sorted(a["sources"].get("source_a") or [], key=lambda x: x.get("message_id", 0)):
+                merged.append(await _analyze_entry(entry, "A"))
+            b_items = []
+            for entry in sorted(a["sources"].get("source_b") or [], key=lambda x: x.get("message_id", 0)):
+                b_items.append(await _analyze_entry(entry, "B"))
+
+            # Compare each B track against A tracks using fingerprint similarity
+            for item in b_items:
+                analysis_b = item.pop("_analysis", None) or {}
+                best = None
+                best_score = 0.0
+                best_idx = None
+                for i, prev in enumerate(merged):
+                    if prev.get("source") != "A":
+                        continue
+                    analysis_a = prev.get("_analysis") or {}
+                    if not analysis_a and not analysis_b:
+                        continue
+                    score = similarity_between_analyses(analysis_a, analysis_b) if analysis_a and analysis_b else 0.0
+                    if score > best_score:
+                        best_score = score
+                        best = prev
+                        best_idx = i
+                item["fingerprint_score"] = best_score
+                if best_score >= EXACT_THRESHOLD:
+                    # Mark A as also present in B; keep B as review so user chooses
+                    merged[best_idx].setdefault("also_in_source_b", True)
+                    merged[best_idx]["fingerprint_score"] = best_score
+                    item["review"] = True
+                    item["duplicate_level"] = "exact_fp"
+                    item["possible_match"] = best_idx + 1
+                    item["review_matches"] = [{
+                        "number": best_idx + 1,
+                        "title": track_display_name(best),
+                        "criteria": [f"Audio Fingerprint {best_score}%"],
+                    }]
+                    item["review_criteria"] = [f"Audio Fingerprint {best_score}%"]
+                    item["review_note"] = "تطابق صوتی بسیار بالا — انتخاب نسخه با شماست"
+                    fp_exact += 1
                     merged.append(item)
-            for i,x in enumerate(merged,1): x["number"]=i
-            a["queue"]=merged; a["phase"]="queue"
-            lines=["ARCHIVE-MANIFEST v1",f"تعداد آهنگ‌ها: {len(merged)}",f"تکراری قطعی حذف‌شده: {definite_count}",f"نیازمند بررسی: {review_count}","", "فهرست آهنگ‌ها:"]
+                elif best_score >= REVIEW_THRESHOLD:
+                    item["review"] = True
+                    item["duplicate_level"] = "review"
+                    item["possible_match"] = (best_idx + 1) if best_idx is not None else None
+                    item["review_matches"] = [{
+                        "number": (best_idx + 1) if best_idx is not None else None,
+                        "title": track_display_name(best) if best else "—",
+                        "criteria": [f"Audio Fingerprint {best_score}%"],
+                    }]
+                    item["review_criteria"] = [f"Audio Fingerprint {best_score}%"]
+                    fp_review += 1
+                    merged.append(item)
+                else:
+                    # Independent track (or unanalyzed already flagged)
+                    if item.get("duplicate_level") == "unanalyzed":
+                        fp_review += 1
+                    merged.append(item)
+
+            # Strip internal analysis blobs before persist
             for x in merged:
-                mark="❗ " if x.get("review") else ""
-                artist=x.get("artist") or "هنرمند نامشخص"
-                name=x.get("title") or Path(x.get("name") or "بدون نام").stem
-                lines.append(f"{x['number']:03d}. {mark}{name} - {artist}")
+                x.pop("_analysis", None)
+
+            for i, x in enumerate(merged, 1):
+                x["number"] = i
+            a["queue"] = merged
+            a["phase"] = "queue"
+
+            lines = [
+                "ARCHIVE-MANIFEST v1",
+                f"تعداد آهنگ‌ها: {len(merged)}",
+                f"تطابق صوتی قطعی/بسیار بالا: {fp_exact}",
+                f"نیازمند بررسی (شامل خطای تحلیل): {fp_review + sum(1 for x in merged if x.get('duplicate_level')=='unanalyzed')}",
+                f"خطاهای پردازش اثرانگشت: {fp_errors}",
+                "",
+                "فهرست آهنگ‌ها:",
+            ]
+            for x in merged:
+                mark = "❗ " if x.get("review") else ""
+                artist = x.get("artist") or "هنرمند نامشخص"
+                name = x.get("title") or Path(x.get("name") or "بدون نام").stem
+                score = x.get("fingerprint_score")
+                score_s = f" [{score}%]" if score else ""
+                lines.append(f"{x['number']:03d}. {mark}{name} - {artist}{score_s}")
                 if x.get("review") and x.get("review_matches"):
                     for h in x["review_matches"]:
-                        crit=", ".join(h.get("criteria") or []) or "—"
-                        lines.append(f"    ↳ مشابه: {h.get('title') or '—'} | معیارها: {crit}")
-            # JSON payload after readable list lets the same text be imported without losing file references.
-            manifest={"format":"archive-v1","tracks":[{k:x.get(k) for k in ("number","name","title","artist","duration","size","file_id","file_unique_id","review","possible_match","review_matches","review_criteria","source")} for x in merged]}
-            lines += ["", "---DATA---", json.dumps(manifest,ensure_ascii=False,separators=(",",":"))]
-            report="\n".join(lines)
-            preview="\n".join(lines[:min(len(lines), 24)])
-            await query.message.reply_text(preview + ("\n… فهرست کامل داخل فایل متنی پیوست است." if len(lines)>24 else ""))
-            report_file=BytesIO(report.encode("utf-8")); report_file.name="archive_manifest.txt"
-            await query.message.reply_document(document=report_file, filename="archive_manifest.txt", caption="این فایل متنی را برای مرحله دوم به گزینه «ورودی بررسی منابع» بده.")
+                        crit = ", ".join(h.get("criteria") or []) or "—"
+                        lines.append(f"    ↳ مشابه: {h.get('title') or '—'} | {crit}")
+                if x.get("review_note"):
+                    lines.append(f"    ↳ {x['review_note']}")
+            manifest = {
+                "format": "archive-v1",
+                "tracks": [{
+                    k: x.get(k) for k in (
+                        "number", "name", "title", "artist", "duration", "size",
+                        "file_id", "file_unique_id", "review", "possible_match",
+                        "review_matches", "review_criteria", "source",
+                        "fingerprint_score", "duplicate_level", "review_note",
+                    )
+                } for x in merged],
+            }
+            lines += ["", "---DATA---", json.dumps(manifest, ensure_ascii=False, separators=(",", ":"))]
+            report = "\n".join(lines)
+            preview = "\n".join(lines[: min(len(lines), 24)])
+            try:
+                await status.edit_text(
+                    preview + ("\n… فهرست کامل داخل فایل متنی پیوست است." if len(lines) > 24 else "")
+                )
+            except Exception:
+                await query.message.reply_text(
+                    preview + ("\n… فهرست کامل داخل فایل متنی پیوست است." if len(lines) > 24 else "")
+                )
+            report_file = BytesIO(report.encode("utf-8"))
+            report_file.name = "archive_manifest.txt"
+            await query.message.reply_document(
+                document=report_file,
+                filename="archive_manifest.txt",
+                caption="تحلیل بر اساس Audio Fingerprint. این فایل را برای «ورودی بررسی منابع» بفرست.",
+            )
             await query.message.reply_text("فهرست کامل آماده شد.", reply_markup=archive_keyboard())
             return
         if data == "arch:list":

@@ -17,6 +17,72 @@ from typing import Any
 
 FP_VERSION = 1
 DEFAULT_THRESHOLD = 95.0
+REVIEW_THRESHOLD = 95.0
+EXACT_THRESHOLD = 99.0
+
+
+def content_hash_file(path: str | Path) -> str:
+    import hashlib
+    path = Path(path)
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        header = f.read(10)
+        if len(header) >= 10 and header[0:3] == b"ID3":
+            size = (
+                ((header[6] & 0x7F) << 21)
+                | ((header[7] & 0x7F) << 14)
+                | ((header[8] & 0x7F) << 7)
+                | (header[9] & 0x7F)
+            )
+            f.seek(10 + size)
+        else:
+            f.seek(0)
+        while True:
+            chunk = f.read(256 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def soft_window_fingerprint(path: str | Path, windows: int = 32) -> list[str]:
+    import hashlib
+    path = Path(path)
+    with path.open("rb") as f:
+        header = f.read(10)
+        if len(header) >= 10 and header[0:3] == b"ID3":
+            size = (
+                ((header[6] & 0x7F) << 21)
+                | ((header[7] & 0x7F) << 14)
+                | ((header[8] & 0x7F) << 7)
+                | (header[9] & 0x7F)
+            )
+            f.seek(10 + size)
+        else:
+            f.seek(0)
+        data = f.read()
+    if not data:
+        return []
+    n = len(data)
+    if n < windows:
+        return [hashlib.md5(data).hexdigest()[:12]]
+    step = max(n // windows, 1)
+    win = max(min(n // windows, 4096), 256)
+    return [
+        hashlib.md5(data[min(i * step, max(n - win, 0)): min(i * step, max(n - win, 0)) + win]).hexdigest()[:12]
+        for i in range(windows)
+    ]
+
+
+def soft_similarity(fa: list[str], fb: list[str]) -> float:
+    if not fa or not fb:
+        return 0.0
+    n = min(len(fa), len(fb))
+    ordered = sum(1 for i in range(n) if fa[i] == fb[i]) / n
+    sa, sb = set(fa), set(fb)
+    jacc = len(sa & sb) / max(len(sa | sb), 1)
+    return round(max(0.0, min(99.9, (0.65 * ordered + 0.35 * jacc) * 100.0)), 2)
+
 
 
 class AudioScannerStore:
@@ -365,3 +431,69 @@ def build_similarity_groups(track_rows: list[dict], threshold: float = DEFAULT_T
         })
     result.sort(key=lambda g: (-len(g["track_ids"]), -g["score"]))
     return result
+
+
+def analyze_local_file(path: str | Path) -> dict:
+    path = Path(path)
+    result = {
+        "content_hash": None,
+        "fingerprint": None,
+        "soft_fp": None,
+        "duration": None,
+        "method": None,
+        "error": None,
+    }
+    try:
+        result["content_hash"] = content_hash_file(path)
+    except Exception as exc:
+        result["error"] = f"hash:{exc!r}"
+        return result
+    if fpcalc_available():
+        try:
+            fp, dur = fingerprint_file(path)
+            result["fingerprint"] = fp
+            result["duration"] = dur
+            result["method"] = "chromaprint"
+            return result
+        except Exception as exc:
+            result["error"] = f"fpcalc:{exc!r}"
+    try:
+        result["soft_fp"] = soft_window_fingerprint(path)
+        result["method"] = "soft"
+        try:
+            from mutagen.mp3 import MP3
+            audio = MP3(str(path))
+            if audio.info:
+                result["duration"] = float(getattr(audio.info, "length", 0) or 0)
+        except Exception:
+            pass
+    except Exception as exc:
+        result["error"] = (result.get("error") or "") + f"|soft:{exc!r}"
+    return result
+
+
+def similarity_between_analyses(a: dict, b: dict) -> float:
+    if a.get("content_hash") and a["content_hash"] == b.get("content_hash"):
+        return 100.0
+    scores = []
+    if a.get("fingerprint") and b.get("fingerprint"):
+        s = fingerprint_similarity(
+            a["fingerprint"], b["fingerprint"],
+            a.get("duration"), b.get("duration"),
+        )
+        if s is not None:
+            scores.append(float(s))
+    if a.get("soft_fp") and b.get("soft_fp"):
+        scores.append(soft_similarity(a["soft_fp"], b["soft_fp"]))
+    if not scores:
+        return 0.0
+    score = max(scores)
+    try:
+        da, db = a.get("duration"), b.get("duration")
+        if da is not None and db is not None and abs(float(da) - float(db)) > 15:
+            score = min(score, 90.0)
+    except (TypeError, ValueError):
+        pass
+    if score >= 100.0:
+        score = 99.9
+    return round(score, 2)
