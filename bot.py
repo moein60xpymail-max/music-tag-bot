@@ -232,8 +232,9 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.0.1"
+VERSION = "v7.0.2"
 VERSION_CHANGES = [
+    "Dockerfile با chromaprint-tools (fpcalc) برای EthioDeploy",
     "حذف خودکار Duplicate قطعی با اولویت Source A بر B",
     "Audio Scanner مرکز واحد تحلیل؛ حذف دکمه «تحلیل و ساخت فهرست»",
     "UI ساده‌شده Scanner: اسکن، نیازمند بررسی، خروجی فهرست",
