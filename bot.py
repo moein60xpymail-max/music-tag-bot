@@ -232,8 +232,9 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.0.2"
+VERSION = "v7.0.3"
 VERSION_CHANGES = [
+    "اصلاح callbackهای آرشیو که داخل ascan گیر کرده بودند",
     "Dockerfile با chromaprint-tools (fpcalc) برای EthioDeploy",
     "حذف خودکار Duplicate قطعی با اولویت Source A بر B",
     "Audio Scanner مرکز واحد تحلیل؛ حذف دکمه «تحلیل و ساخت فهرست»",
@@ -3209,11 +3210,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             synced = scanner_sync_current_archive(context, user_id, chat_id)
             tracks = store.tracks(user_id)
-            if not tracks:
+            sources = (context.user_data.get("archive") or {}).get("sources") or {}
+            n_src = len(sources.get("source_a") or []) + len(sources.get("source_b") or [])
+            if not tracks and n_src == 0:
                 await query.message.reply_text("هنوز آهنگی از منبع A یا B ثبت نشده. ابتدا منابع را وارد کن.")
-                return
-            if not fpcalc_available():
-                await query.message.reply_text("❌ ابزار Chromaprint / fpcalc روی سرور نصب نیست. در نسخه جدید وابستگی سیستمی آن تنظیم شده؛ پس از Deploy باید نصب بودنش تأیید شود.")
                 return
             sent = await query.message.reply_text(
                 f"⏳ اسکن صوتی شروع شد.\nفایل‌های فعال: {len(tracks)}\nموارد همگام‌شده از نشست فعلی: {synced}\nپردازش کاملاً مرحله‌ای است.",
@@ -3298,258 +3298,267 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=audio_scanner_keyboard(),
             )
             return
-        if data == "arch:menu":
-            if a: a["phase"] = "menu"
-            await safe_edit_message_text(query.message, "📚 منوی آرشیو", reply_markup=archive_keyboard())
-            return
-        if not a:
-            await query.message.reply_text("آرشیوی فعال نیست؛ از دکمه آرشیو موسیقی شروع کن.")
-            return
-        if data == "arch:review_menu":
-            a["phase"] = "menu"
-            await query.message.reply_text(
-                "دریافت منابع:\n"
-                "۱) Source A را بفرست و پایان را تأیید کن\n"
-                "۲) Source B را بفرست و پایان را تأیید کن\n"
-                "۳) Audio Scanner را اجرا کن تا تکراری‌های قطعی حذف و فهرست نهایی ساخته شود",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],
-                    [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
-                    [InlineKeyboardButton("🎧 Audio Scanner", callback_data="ascan:menu")],
-                    [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
-                ]),
-            )
-            return
-        if data == "arch:input_menu":
-            context.user_data["waiting"] = "archive_manifest"
-            await query.message.reply_text("متن کامل خروجی مرحله «بررسی آهنگ‌های منابع» را ارسال کن.")
-            return
-        if data == "arch:start_a":
-            a["phase"] = "source_a"
-            await query.message.reply_text("📥 فایل‌های MP3 منبع A را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A", callback_data="arch:finish_a")]]))
-            return
-        if data == "arch:start_b":
-            a["phase"] = "source_b"
-            await query.message.reply_text("📥 فایل‌های MP3 منبع B را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع B", callback_data="arch:finish_b")]]))
-            return
-        if data == "arch:finish_a":
-            await finish_progress_dashboard(context, "archive_a", keep=True)
-            a["phase"] = "source_a_review"
-            stats = source_intake_stats(a, "source_a")
-            await query.message.reply_text(
-                format_source_intake_report(stats),
-                reply_markup=source_finish_keyboard("source_a"),
-            )
-            return
-        if data == "arch:finish_b":
-            await finish_progress_dashboard(context, "archive_b", keep=True)
-            a["phase"] = "source_b_review"
-            stats = source_intake_stats(a, "source_b")
-            await query.message.reply_text(
-                format_source_intake_report(stats),
-                reply_markup=source_finish_keyboard("source_b"),
-            )
-            return
-        if data == "arch:continue_a":
-            a["phase"] = "source_a"
-            await query.message.reply_text(
-                "📥 ادامه دریافت Source A — فایل‌های جدید را بفرست.\nاطلاعات قبلی حفظ شده‌اند.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A", callback_data="arch:finish_a")]]),
-            )
-            return
-        if data == "arch:continue_b":
-            a["phase"] = "source_b"
-            await query.message.reply_text(
-                "📥 ادامه دریافت Source B — فایل‌های جدید را بفرست.\nاطلاعات قبلی حفظ شده‌اند.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع B", callback_data="arch:finish_b")]]),
-            )
-            return
-        if data == "arch:confirm_a":
-            stats = source_intake_stats(a, "source_a")
-            await query.message.reply_text(
-                f"در مجموع {stats['received']} آهنگ از Source A دریافت شده است.\nآیا دریافت این منبع را تأیید می‌کنی؟",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ تأیید و رفتن به Source B", callback_data="arch:confirm_a_yes")],
-                    [InlineKeyboardButton("↩️ بازگشت به Source A", callback_data="arch:continue_a")],
-                ]),
-            )
-            return
-        if data == "arch:confirm_a_yes":
-            a["phase"] = "menu"
-            a["source_a_confirmed"] = True
-            await query.message.reply_text(
-                f"✅ Source A نهایی شد ({len((a.get('sources') or {}).get('source_a') or [])} آهنگ).\nحالا Source B را اضافه کن.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
-                    [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
-                ]),
-            )
-            return
-        if data == "arch:confirm_b":
-            stats = source_intake_stats(a, "source_b")
-            await query.message.reply_text(
-                f"در مجموع {stats['received']} آهنگ از Source B دریافت شده است.\nآیا دریافت این منبع را تأیید می‌کنی؟\n\nپس از تأیید، تحلیل Audio Fingerprint اجرا می‌شود.",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ تأیید Source B", callback_data="arch:confirm_b_yes")],
-                    [InlineKeyboardButton("↩️ بازگشت به Source B", callback_data="arch:continue_b")],
-                ]),
-            )
-            return
-        if data == "arch:confirm_b_yes":
-            a["phase"] = "menu"
-            a["source_b_confirmed"] = True
-            n_a = len((a.get("sources") or {}).get("source_a") or [])
-            n_b = len((a.get("sources") or {}).get("source_b") or [])
-            await query.message.reply_text(
-                f"✅ Source B نهایی شد.\nSource A: {n_a} | Source B: {n_b}\n\n"
-                "حالا Audio Scanner را باز کن تا تکراری‌های قطعی حذف شوند و فهرست نهایی ساخته شود.",
-                reply_markup=audio_scanner_keyboard(),
-            )
-            return
-        if data in ("arch:export_a", "arch:export_b"):
-            key = "source_a" if data.endswith("_a") else "source_b"
-            label = "A" if key == "source_a" else "B"
-            payload = export_source_txt(a, key)
-            buf = BytesIO(payload)
-            buf.name = f"source_{label}_list.txt"
-            await query.message.reply_document(
-                document=buf,
-                filename=f"source_{label}_list.txt",
-                caption=f"فهرست Source {label} — بخش ---DATA--- شناسه‌های تلگرام را حفظ می‌کند.",
-            )
-            return
-        if data == "arch:analyze":
-            # Removed independent analyze step — Audio Scanner is the only analysis path.
-            await query.message.reply_text(
-                "مرحله «تحلیل و ساخت فهرست» حذف شده است.\nاز Audio Scanner استفاده کن.",
-                reply_markup=audio_scanner_keyboard(),
-            )
-            return
-        if data == "arch:list":
-            await archive_show_list(query, context)
-            return
-        if data == "arch:report":
-            await query.message.reply_text(
-                archive_report_text(a.get("queue", [])),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 نمایش فهرست آرشیو", callback_data="arch:list")]])
-            )
-            return
-        if data == "arch:finish_current":
-            queue = a.get("queue", [])
-            idx = context.user_data.get("archive_current")
-            if not isinstance(idx, int) or not (0 <= idx < len(queue)):
-                await query.message.reply_text("ترک فعال آرشیو پیدا نشد.")
-                return
-            queue[idx]["status"] = "confirmed"
-            await query.message.edit_reply_markup(
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ این آهنگ تکمیل شد", callback_data="arch:already_done")],
-                    [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
-                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
-                ])
-            )
-            await query.message.reply_text("این آهنگ تکمیل شد.")
-            return
-        if data == "arch:already_done":
-            await query.message.reply_text("این آهنگ قبلاً تأیید شده است.")
-            return
-        if data == "arch:previous":
-            queue = a.get("queue", [])
-            idx = context.user_data.get("archive_current")
-            if not isinstance(idx, int) or idx <= 0 or idx >= len(queue):
-                await query.message.reply_text("ترک قبلی وجود ندارد.")
-                return
-            prev_idx = idx - 1
-            item = queue[prev_idx]
-            # Re-open the previous item for review/editing, even if it was previously skipped or confirmed.
-            if queue[idx].get("status") == "in_progress":
-                queue[idx]["status"] = "pending"
-            item["status"] = "in_progress"
-            context.user_data.update({"archive_current": prev_idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
-            title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
-            artist = (item.get("artist") or "هنرمند نامشخص").strip()
-            warning = format_review_warning(item, queue)
-            progress = ((prev_idx + 1) / len(queue) * 100) if queue else 0
-            title_button = InlineKeyboardButton(text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"), copy_text=CopyTextButton(text=title or ""))
-            await query.message.reply_text(
-                f"🎵 ترک {prev_idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
-                reply_markup=InlineKeyboardMarkup([
-                    [title_button],
-                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
-                    [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
-                ])
-            )
-            await query.message.reply_text("به آهنگ قبلی برگشتی.")
-            return
-        if data == "arch:skip_current":
-            queue = a.get("queue", [])
-            idx = context.user_data.get("archive_current")
-            if not isinstance(idx, int) or not (0 <= idx < len(queue)):
-                await query.message.reply_text("ترک فعال آرشیو پیدا نشد.")
-                return
-            queue[idx]["status"] = "skipped"
-            await query.message.reply_text("این ترک رد شد.")
-            data = "arch:open_next"
-        if data == "arch:next":
-            queue = a.get("queue", [])
-            idx = context.user_data.get("archive_current")
-            if isinstance(idx, int) and 0 <= idx < len(queue):
-                if queue[idx].get("status") != "confirmed":
-                    await query.message.reply_text("اول دکمهٔ «این آهنگ تموم شد» را بزن.")
-                    return
-            data = "arch:open_next"
-        if data == "arch:start_begin":
-            # Mark nothing skipped; open first pending from start
-            context.user_data.pop("archive_start_from", None)
-            data = "arch:open_next"
-        if data == "arch:start_pick":
-            queue = a.get("queue", [])
-            if not queue:
-                await query.message.reply_text("صف آرشیو خالی است.")
-                return
-            context.user_data["waiting"] = "archive_start_number"
-            await query.message.reply_text(
-                f"شماره آهنگ شروع را بفرست (۱ تا {len(queue)}).\n"
-                "آهنگ‌های قبل از این شماره در این اجرا رد می‌شوند."
-            )
-            return
-        if data == "arch:start_cancel":
-            context.user_data["waiting"] = None
-            await query.message.reply_text("انتخاب نقطه شروع لغو شد.", reply_markup=archive_keyboard())
-            return
-        if data == "arch:open_next":
-            queue = a.get("queue", [])
-            idx = next((i for i,x in enumerate(queue) if x.get("status")=="pending"), None)
-            if idx is None:
-                await query.message.reply_text(
-                    "✅ همه ترک‌های در انتظار بررسی شدند.\n\n" + archive_report_text(queue),
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📊 گزارش آرشیو", callback_data="arch:report")],
-                        [InlineKeyboardButton("📋 فهرست آرشیو", callback_data="arch:list")],
-                    ])
-                )
-                return
-            item = queue[idx]
-            item["status"] = "in_progress"
-            context.user_data.update({"archive_current":idx,"waiting":"archive_track","album_mode":False,"editing_album_track":False})
-            title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
-            artist = (item.get("artist") or "هنرمند نامشخص").strip()
-            warning = format_review_warning(item, queue)
-            progress = ((idx + 1) / len(queue) * 100) if queue else 0
-            title_button = InlineKeyboardButton(
-                text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),
-                copy_text=CopyTextButton(text=title or ""),
-            )
-            await query.message.reply_text(
-                f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
-                reply_markup=InlineKeyboardMarkup([
-                    [title_button],
-                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
-                    [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
-                ]),
-            )
-            return
+        return  # end ascan:* handlers
+    # ---------- Archive Mode callbacks ----------
+    a = context.user_data.get("archive")
+    if a is None and isinstance(data, str) and data.startswith("arch:"):
+        # Auto-create archive session so menu buttons always work after /archive or restart
+        if data != "arch:close":
+            a = {"phase": "menu", "sources": {"source_a": [], "source_b": []}, "queue": [], "cursor": 0}
+            context.user_data["archive"] = a
+
+    if data == "arch:menu":
+        if a: a["phase"] = "menu"
+        await safe_edit_message_text(query.message, "📚 منوی آرشیو", reply_markup=archive_keyboard())
         return
+    if not a:
+        await query.message.reply_text("آرشیوی فعال نیست؛ از دکمه آرشیو موسیقی شروع کن.")
+        return
+    if data == "arch:review_menu":
+        a["phase"] = "menu"
+        await query.message.reply_text(
+            "دریافت منابع:\n"
+            "۱) Source A را بفرست و پایان را تأیید کن\n"
+            "۲) Source B را بفرست و پایان را تأیید کن\n"
+            "۳) Audio Scanner را اجرا کن تا تکراری‌های قطعی حذف و فهرست نهایی ساخته شود",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],
+                [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
+                [InlineKeyboardButton("🎧 Audio Scanner", callback_data="ascan:menu")],
+                [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+            ]),
+        )
+        return
+    if data == "arch:input_menu":
+        context.user_data["waiting"] = "archive_manifest"
+        await query.message.reply_text("متن کامل خروجی مرحله «بررسی آهنگ‌های منابع» را ارسال کن.")
+        return
+    if data == "arch:start_a":
+        a["phase"] = "source_a"
+        await query.message.reply_text("📥 فایل‌های MP3 منبع A را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A", callback_data="arch:finish_a")]]))
+        return
+    if data == "arch:start_b":
+        a["phase"] = "source_b"
+        await query.message.reply_text("📥 فایل‌های MP3 منبع B را بفرست. برای پایان، دکمه زیر را بزن.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع B", callback_data="arch:finish_b")]]))
+        return
+    if data == "arch:finish_a":
+        await finish_progress_dashboard(context, "archive_a", keep=True)
+        a["phase"] = "source_a_review"
+        stats = source_intake_stats(a, "source_a")
+        await query.message.reply_text(
+            format_source_intake_report(stats),
+            reply_markup=source_finish_keyboard("source_a"),
+        )
+        return
+    if data == "arch:finish_b":
+        await finish_progress_dashboard(context, "archive_b", keep=True)
+        a["phase"] = "source_b_review"
+        stats = source_intake_stats(a, "source_b")
+        await query.message.reply_text(
+            format_source_intake_report(stats),
+            reply_markup=source_finish_keyboard("source_b"),
+        )
+        return
+    if data == "arch:continue_a":
+        a["phase"] = "source_a"
+        await query.message.reply_text(
+            "📥 ادامه دریافت Source A — فایل‌های جدید را بفرست.\nاطلاعات قبلی حفظ شده‌اند.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع A", callback_data="arch:finish_a")]]),
+        )
+        return
+    if data == "arch:continue_b":
+        a["phase"] = "source_b"
+        await query.message.reply_text(
+            "📥 ادامه دریافت Source B — فایل‌های جدید را بفرست.\nاطلاعات قبلی حفظ شده‌اند.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("پایان منبع B", callback_data="arch:finish_b")]]),
+        )
+        return
+    if data == "arch:confirm_a":
+        stats = source_intake_stats(a, "source_a")
+        await query.message.reply_text(
+            f"در مجموع {stats['received']} آهنگ از Source A دریافت شده است.\nآیا دریافت این منبع را تأیید می‌کنی؟",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تأیید و رفتن به Source B", callback_data="arch:confirm_a_yes")],
+                [InlineKeyboardButton("↩️ بازگشت به Source A", callback_data="arch:continue_a")],
+            ]),
+        )
+        return
+    if data == "arch:confirm_a_yes":
+        a["phase"] = "menu"
+        a["source_a_confirmed"] = True
+        await query.message.reply_text(
+            f"✅ Source A نهایی شد ({len((a.get('sources') or {}).get('source_a') or [])} آهنگ).\nحالا Source B را اضافه کن.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
+                [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+            ]),
+        )
+        return
+    if data == "arch:confirm_b":
+        stats = source_intake_stats(a, "source_b")
+        await query.message.reply_text(
+            f"در مجموع {stats['received']} آهنگ از Source B دریافت شده است.\nآیا دریافت این منبع را تأیید می‌کنی؟\n\nپس از تأیید، تحلیل Audio Fingerprint اجرا می‌شود.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ تأیید Source B", callback_data="arch:confirm_b_yes")],
+                [InlineKeyboardButton("↩️ بازگشت به Source B", callback_data="arch:continue_b")],
+            ]),
+        )
+        return
+    if data == "arch:confirm_b_yes":
+        a["phase"] = "menu"
+        a["source_b_confirmed"] = True
+        n_a = len((a.get("sources") or {}).get("source_a") or [])
+        n_b = len((a.get("sources") or {}).get("source_b") or [])
+        await query.message.reply_text(
+            f"✅ Source B نهایی شد.\nSource A: {n_a} | Source B: {n_b}\n\n"
+            "حالا Audio Scanner را باز کن تا تکراری‌های قطعی حذف شوند و فهرست نهایی ساخته شود.",
+            reply_markup=audio_scanner_keyboard(),
+        )
+        return
+    if data in ("arch:export_a", "arch:export_b"):
+        key = "source_a" if data.endswith("_a") else "source_b"
+        label = "A" if key == "source_a" else "B"
+        payload = export_source_txt(a, key)
+        buf = BytesIO(payload)
+        buf.name = f"source_{label}_list.txt"
+        await query.message.reply_document(
+            document=buf,
+            filename=f"source_{label}_list.txt",
+            caption=f"فهرست Source {label} — بخش ---DATA--- شناسه‌های تلگرام را حفظ می‌کند.",
+        )
+        return
+    if data == "arch:analyze":
+        # Removed independent analyze step — Audio Scanner is the only analysis path.
+        await query.message.reply_text(
+            "مرحله «تحلیل و ساخت فهرست» حذف شده است.\nاز Audio Scanner استفاده کن.",
+            reply_markup=audio_scanner_keyboard(),
+        )
+        return
+    if data == "arch:list":
+        await archive_show_list(query, context)
+        return
+    if data == "arch:report":
+        await query.message.reply_text(
+            archive_report_text(a.get("queue", [])),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 نمایش فهرست آرشیو", callback_data="arch:list")]])
+        )
+        return
+    if data == "arch:finish_current":
+        queue = a.get("queue", [])
+        idx = context.user_data.get("archive_current")
+        if not isinstance(idx, int) or not (0 <= idx < len(queue)):
+            await query.message.reply_text("ترک فعال آرشیو پیدا نشد.")
+            return
+        queue[idx]["status"] = "confirmed"
+        await query.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ این آهنگ تکمیل شد", callback_data="arch:already_done")],
+                [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
+                [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
+            ])
+        )
+        await query.message.reply_text("این آهنگ تکمیل شد.")
+        return
+    if data == "arch:already_done":
+        await query.message.reply_text("این آهنگ قبلاً تأیید شده است.")
+        return
+    if data == "arch:previous":
+        queue = a.get("queue", [])
+        idx = context.user_data.get("archive_current")
+        if not isinstance(idx, int) or idx <= 0 or idx >= len(queue):
+            await query.message.reply_text("ترک قبلی وجود ندارد.")
+            return
+        prev_idx = idx - 1
+        item = queue[prev_idx]
+        # Re-open the previous item for review/editing, even if it was previously skipped or confirmed.
+        if queue[idx].get("status") == "in_progress":
+            queue[idx]["status"] = "pending"
+        item["status"] = "in_progress"
+        context.user_data.update({"archive_current": prev_idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
+        title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
+        artist = (item.get("artist") or "هنرمند نامشخص").strip()
+        warning = format_review_warning(item, queue)
+        progress = ((prev_idx + 1) / len(queue) * 100) if queue else 0
+        title_button = InlineKeyboardButton(text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"), copy_text=CopyTextButton(text=title or ""))
+        await query.message.reply_text(
+            f"🎵 ترک {prev_idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
+            reply_markup=InlineKeyboardMarkup([
+                [title_button],
+                [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
+                [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
+            ])
+        )
+        await query.message.reply_text("به آهنگ قبلی برگشتی.")
+        return
+    if data == "arch:skip_current":
+        queue = a.get("queue", [])
+        idx = context.user_data.get("archive_current")
+        if not isinstance(idx, int) or not (0 <= idx < len(queue)):
+            await query.message.reply_text("ترک فعال آرشیو پیدا نشد.")
+            return
+        queue[idx]["status"] = "skipped"
+        await query.message.reply_text("این ترک رد شد.")
+        data = "arch:open_next"
+    if data == "arch:next":
+        queue = a.get("queue", [])
+        idx = context.user_data.get("archive_current")
+        if isinstance(idx, int) and 0 <= idx < len(queue):
+            if queue[idx].get("status") != "confirmed":
+                await query.message.reply_text("اول دکمهٔ «این آهنگ تموم شد» را بزن.")
+                return
+        data = "arch:open_next"
+    if data == "arch:start_begin":
+        # Mark nothing skipped; open first pending from start
+        context.user_data.pop("archive_start_from", None)
+        data = "arch:open_next"
+    if data == "arch:start_pick":
+        queue = a.get("queue", [])
+        if not queue:
+            await query.message.reply_text("صف آرشیو خالی است.")
+            return
+        context.user_data["waiting"] = "archive_start_number"
+        await query.message.reply_text(
+            f"شماره آهنگ شروع را بفرست (۱ تا {len(queue)}).\n"
+            "آهنگ‌های قبل از این شماره در این اجرا رد می‌شوند."
+        )
+        return
+    if data == "arch:start_cancel":
+        context.user_data["waiting"] = None
+        await query.message.reply_text("انتخاب نقطه شروع لغو شد.", reply_markup=archive_keyboard())
+        return
+    if data == "arch:open_next":
+        queue = a.get("queue", [])
+        idx = next((i for i,x in enumerate(queue) if x.get("status")=="pending"), None)
+        if idx is None:
+            await query.message.reply_text(
+                "✅ همه ترک‌های در انتظار بررسی شدند.\n\n" + archive_report_text(queue),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 گزارش آرشیو", callback_data="arch:report")],
+                    [InlineKeyboardButton("📋 فهرست آرشیو", callback_data="arch:list")],
+                ])
+            )
+            return
+        item = queue[idx]
+        item["status"] = "in_progress"
+        context.user_data.update({"archive_current":idx,"waiting":"archive_track","album_mode":False,"editing_album_track":False})
+        title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
+        artist = (item.get("artist") or "هنرمند نامشخص").strip()
+        warning = format_review_warning(item, queue)
+        progress = ((idx + 1) / len(queue) * 100) if queue else 0
+        title_button = InlineKeyboardButton(
+            text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),
+            copy_text=CopyTextButton(text=title or ""),
+        )
+        await query.message.reply_text(
+            f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
+            reply_markup=InlineKeyboardMarkup([
+                [title_button],
+                [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
+                [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
+            ]),
+        )
+        return
+    return
 
     # ---------- تنظیمات پیش‌فرض ----------
 
