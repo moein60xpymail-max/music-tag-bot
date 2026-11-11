@@ -22,6 +22,7 @@ def empty_state() -> dict[str, Any]:
         "tracks": [],
         "results": None,
         "analyses": {},
+        "decisions": {},
     }
 
 
@@ -37,6 +38,7 @@ def save_state(data_dir: Path, user_id: int, st: dict[str, Any]) -> None:
         "phase": st.get("phase"),
         "tracks": st.get("tracks") or [],
         "results": st.get("results"),
+        "decisions": st.get("decisions") or {},
         "updated": time.time(),
         "analyses": {},
     }
@@ -69,6 +71,7 @@ def load_state(data_dir: Path, user_id: int) -> dict[str, Any]:
         st["tracks"] = list(data.get("tracks") or [])
         st["results"] = data.get("results")
         st["analyses"] = dict(data.get("analyses") or {})
+        st["decisions"] = dict(data.get("decisions") or {})
         st["phase"] = data.get("phase") or "menu"
     except Exception as exc:
         print("self_scan load error:", repr(exc))
@@ -273,3 +276,163 @@ def export_report_bytes(st: dict) -> bytes:
     }
     lines += ["", "---DATA---", json.dumps(payload, ensure_ascii=False, separators=(",", ":"))]
     return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def apply_keep_choice(st: dict, group_index: int, keep_member_index: int) -> str:
+    """Mark one member kept and other group members dropped (list only)."""
+    res = st.get("results") or {}
+    groups = res.get("groups") or []
+    tracks = st.get("tracks") or []
+    if group_index < 0 or group_index >= len(groups):
+        return "گروه نامعتبر"
+    members = list(groups[group_index].get("members") or [])
+    if keep_member_index < 0 or keep_member_index >= len(members):
+        return "انتخاب نامعتبر"
+    keep_idx = members[keep_member_index]
+    decisions = st.setdefault("decisions", {})
+    for tidx in members:
+        decisions[str(tidx)] = "keep" if tidx == keep_idx else "drop"
+    st["decisions"] = decisions
+    kept = tracks[keep_idx] if 0 <= keep_idx < len(tracks) else {}
+    name = kept.get("title") or kept.get("name") or f"#{keep_idx + 1}"
+    return f"گروه {group_index + 1}: نگه داشته شد «{name}» — بقیه فقط در فهرست drop شدند"
+
+
+def clear_decisions(st: dict) -> None:
+    st["decisions"] = {}
+
+
+def track_status(st: dict, track_index: int) -> str:
+    d = (st.get("decisions") or {}).get(str(track_index))
+    if d in ("keep", "drop"):
+        return d
+    return "undecided"
+
+
+def format_management_summary(st: dict) -> str:
+    tracks = st.get("tracks") or []
+    decisions = st.get("decisions") or {}
+    keep = sum(1 for v in decisions.values() if v == "keep")
+    drop = sum(1 for v in decisions.values() if v == "drop")
+    in_group: set[int] = set()
+    undecided_in_groups = 0
+    for g in (st.get("results") or {}).get("groups") or []:
+        for idx in g.get("members") or []:
+            in_group.add(idx)
+            if str(idx) not in decisions:
+                undecided_in_groups += 1
+    return "\n".join([
+        "🛠 مدیریت نتایج Self-Scan",
+        "",
+        f"• کل آهنگ‌ها: {len(tracks)}",
+        f"• در گروه‌های تکراری: {len(in_group)}",
+        f"• انتخاب Keep: {keep}",
+        f"• علامت Drop: {drop}",
+        f"• هنوز تصمیم نگرفته (داخل گروه): {undecided_in_groups}",
+        "",
+        "حذف پیام تلگرام انجام نمی‌شود؛ فقط وضعیت فهرست تغییر می‌کند.",
+    ])
+
+
+def format_group_manage(st: dict, group_index: int) -> str:
+    groups = (st.get("results") or {}).get("groups") or []
+    tracks = st.get("tracks") or []
+    if group_index < 0 or group_index >= len(groups):
+        return "گروهی نیست."
+    g = groups[group_index]
+    lines = [
+        f"Duplicate #{group_index + 1} / {len(groups)}",
+        f"شباهت ≥ {g.get('min_score', '?')}%",
+        "یکی را برای نگه داشتن انتخاب کن:",
+        "",
+    ]
+    for mi, idx in enumerate(g.get("members") or []):
+        tr = tracks[idx] if 0 <= idx < len(tracks) else {}
+        stt = track_status(st, idx)
+        mark = {"keep": "✅", "drop": "🗑", "undecided": "•"}.get(stt, "•")
+        name = tr.get("title") or Path(str(tr.get("name") or "?")).stem
+        lines.append(
+            f"{mark} {mi + 1}) #{tr.get('number', idx + 1)} | {name} | "
+            f"{tr.get('artist') or '—'} | {format_duration_ss(tr.get('duration'))}"
+        )
+    return "\n".join(lines)
+
+
+def export_clean_list_bytes(st: dict) -> bytes:
+    tracks = st.get("tracks") or []
+    decisions = st.get("decisions") or {}
+    kept = [tr for i, tr in enumerate(tracks) if decisions.get(str(i)) != "drop"]
+    lines = [
+        "self-scan-clean-v1",
+        f"total_original={len(tracks)}",
+        f"total_kept={len(kept)}",
+        f"total_dropped={sum(1 for v in decisions.values() if v == 'drop')}",
+        "",
+    ]
+    for tr in kept:
+        lines.append(
+            f"#{tr.get('number')} | {tr.get('title') or tr.get('name')} | "
+            f"{tr.get('artist') or '—'} | {tr.get('file_id', '')}"
+        )
+    payload = {
+        "format": "self-scan-clean-v1",
+        "tracks": [
+            {k: tr.get(k) for k in (
+                "number", "name", "title", "artist", "duration", "size",
+                "file_id", "file_unique_id", "cache_key",
+            )}
+            for tr in kept
+        ],
+    }
+    lines += ["", "---DATA---", json.dumps(payload, ensure_ascii=False, separators=(",", ":"))]
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def health_check_tracks(tracks: list) -> dict:
+    total = len(tracks)
+    missing_title = missing_artist = missing_duration = tiny = huge = no_file_id = 0
+    for tr in tracks:
+        title = (tr.get("title") or "").strip()
+        name = (tr.get("name") or "").strip()
+        if not title and not name:
+            missing_title += 1
+        if not (tr.get("artist") or "").strip():
+            missing_artist += 1
+        try:
+            d = float(tr.get("duration") or 0)
+        except (TypeError, ValueError):
+            d = 0.0
+        if d <= 0:
+            missing_duration += 1
+        size = int(tr.get("size") or 0)
+        if 0 < size < 50_000:
+            tiny += 1
+        if size > 20 * 1024 * 1024:
+            huge += 1
+        if not tr.get("file_id"):
+            no_file_id += 1
+    return {
+        "total": total,
+        "missing_title": missing_title,
+        "missing_artist": missing_artist,
+        "missing_duration": missing_duration,
+        "tiny_files": tiny,
+        "oversize_files": huge,
+        "no_file_id": no_file_id,
+    }
+
+
+def format_health_report(stats: dict, source_label: str) -> str:
+    return "\n".join([
+        f"🩺 گزارش سلامت — {source_label}",
+        "",
+        f"• تعداد کل: {stats.get('total', 0)}",
+        f"• بدون عنوان/نام: {stats.get('missing_title', 0)}",
+        f"• بدون هنرمند: {stats.get('missing_artist', 0)}",
+        f"• بدون مدت‌زمان: {stats.get('missing_duration', 0)}",
+        f"• فایل خیلی کوچک (<50KB): {stats.get('tiny_files', 0)}",
+        f"• فایل خیلی بزرگ (>20MB): {stats.get('oversize_files', 0)}",
+        f"• بدون file_id: {stats.get('no_file_id', 0)}",
+        "",
+        "بررسی فقط روی متادیتای ذخیره‌شده است؛ فایل دوباره دانلود نمی‌شود.",
+    ])

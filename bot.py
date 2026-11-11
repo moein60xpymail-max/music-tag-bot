@@ -233,8 +233,12 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.1.0"
+VERSION = "v7.2.1"
 VERSION_CHANGES = [
+    "رفع دکمه بستن آرشیو + پاک‌سازی پیام/نشست منوهای اضافه",
+    "مدیریت نتایج Self-Scan: انتخاب Keep/Drop بدون حذف تلگرام",
+    "گزارش سلامت آرشیو (Health Check) روی متادیتا",
+    "خروجی فهرست تمیز پس از تصمیم‌گیری Self-Scan",
     "Archive Self-Scan: تشخیص تکراری داخل یک آرشیو واحد (بدون حذف خودکار)",
     "رفع مسدود شدن همه دکمه‌ها به‌خاطر شرط archive",
     "اصلاح callbackهای آرشیو که داخل ascan گیر کرده بودند",
@@ -1452,6 +1456,7 @@ def archive_keyboard():
         [InlineKeyboardButton("📥 دریافت Source A / B", callback_data="arch:review_menu")],
         [InlineKeyboardButton("🎧 Audio Scanner (A/B)", callback_data="ascan:menu")],
         [InlineKeyboardButton("🔍 Archive Self-Scan", callback_data="sscan:menu")],
+        [InlineKeyboardButton("🩺 سلامت منابع A/B", callback_data="arch:health")],
         [InlineKeyboardButton("📥 ورودی بررسی منابع", callback_data="arch:input_menu")],
         [InlineKeyboardButton("❌ بستن آرشیو", callback_data="arch:close")],
     ])
@@ -1472,8 +1477,11 @@ def self_scan_keyboard():
         [InlineKeyboardButton("📥 دریافت / ادامه آهنگ‌های آرشیو", callback_data="sscan:intake")],
         [InlineKeyboardButton("🔍 شروع اسکن آرشیو", callback_data="sscan:run")],
         [InlineKeyboardButton("📊 مشاهده نتایج آخرین اسکن", callback_data="sscan:results")],
+        [InlineKeyboardButton("🛠 مدیریت تکراری‌ها (Keep/Drop)", callback_data="sscan:manage")],
         [InlineKeyboardButton("🔎 موارد نیازمند بررسی", callback_data="sscan:review")],
-        [InlineKeyboardButton("📄 دریافت گزارش", callback_data="sscan:export")],
+        [InlineKeyboardButton("📄 گزارش کامل", callback_data="sscan:export")],
+        [InlineKeyboardButton("📁 فهرست تمیز (بدون Drop)", callback_data="sscan:export_clean")],
+        [InlineKeyboardButton("🩺 سلامت این آرشیو", callback_data="sscan:health")],
         [InlineKeyboardButton("🗑 پاک کردن نشست Self-Scan", callback_data="sscan:clear")],
         [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
     ])
@@ -3376,14 +3384,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["self_scan"] = st
             n = len(st.get("tracks") or [])
             has_res = bool(st.get("results"))
-            await query.message.reply_text(
+            text = (
                 "🔍 Archive Self-Scan\n\n"
                 "آهنگ‌های یک آرشیو را بفرست؛ ربات همه را با هم مقایسه می‌کند.\n"
                 "حذف خودکار انجام نمی‌شود.\n\n"
                 f"آهنگ‌های ثبت‌شده: {n}\n"
-                f"نتیجه قبلی: {'بله' if has_res else 'خیر'}",
-                reply_markup=self_scan_keyboard(),
+                f"نتیجه قبلی: {'بله' if has_res else 'خیر'}"
             )
+            try:
+                await safe_edit_message_text(query.message, text, reply_markup=self_scan_keyboard())
+            except Exception:
+                await query.message.reply_text(text, reply_markup=self_scan_keyboard())
             return
         if data == "sscan:intake":
             st["phase"] = "intake"
@@ -3475,6 +3486,117 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 caption="گزارش Archive Self-Scan (بدون حذف خودکار)",
             )
             return
+        if data == "sscan:manage":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            groups = (st.get("results") or {}).get("groups") or []
+            if not groups:
+                await query.message.reply_text(
+                    "گروه تکراری‌ای برای مدیریت نیست. اول اسکن را اجرا کن.",
+                    reply_markup=self_scan_keyboard(),
+                )
+                return
+            context.user_data["sscan_manage_gi"] = 0
+            await query.message.reply_text(
+                self_scan.format_management_summary(st),
+                reply_markup=self_scan_keyboard(),
+            )
+            text = self_scan.format_group_manage(st, 0)
+            members = groups[0].get("members") or []
+            rows = []
+            for mi in range(len(members)):
+                rows.append([InlineKeyboardButton(
+                    f" نگه داشتن نسخه {mi + 1}",
+                    callback_data=f"sscan:keep:0:{mi}",
+                )])
+            rows.append([
+                InlineKeyboardButton("⏭ گروه بعد", callback_data="sscan:mgr:next"),
+                InlineKeyboardButton("🔙 منوی Self-Scan", callback_data="sscan:menu"),
+            ])
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if data.startswith("sscan:keep:"):
+            if not user_id:
+                return
+            st = self_scan.load_state(DATA_DIR, user_id)
+            context.user_data["self_scan"] = st
+            parts = data.split(":")
+            try:
+                gi = int(parts[2])
+                mi = int(parts[3])
+            except (IndexError, ValueError):
+                await query.message.reply_text("داده نامعتبر")
+                return
+            msg = self_scan.apply_keep_choice(st, gi, mi)
+            self_scan.save_state(DATA_DIR, user_id, st)
+            context.user_data["self_scan"] = st
+            await query.message.reply_text(msg, reply_markup=self_scan_keyboard())
+            groups = (st.get("results") or {}).get("groups") or []
+            if gi < len(groups):
+                text = self_scan.format_group_manage(st, gi)
+                members = groups[gi].get("members") or []
+                rows = []
+                for mii in range(len(members)):
+                    rows.append([InlineKeyboardButton(
+                        f" نگه داشتن نسخه {mii + 1}",
+                        callback_data=f"sscan:keep:{gi}:{mii}",
+                    )])
+                rows.append([
+                    InlineKeyboardButton("⏭ گروه بعد", callback_data="sscan:mgr:next"),
+                    InlineKeyboardButton("🔙 منوی Self-Scan", callback_data="sscan:menu"),
+                ])
+                await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if data == "sscan:mgr:next":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            groups = (st.get("results") or {}).get("groups") or []
+            if not groups:
+                await query.message.reply_text("گروهی نیست.", reply_markup=self_scan_keyboard())
+                return
+            gi = int(context.user_data.get("sscan_manage_gi") or 0) + 1
+            if gi >= len(groups):
+                gi = 0
+            context.user_data["sscan_manage_gi"] = gi
+            text = self_scan.format_group_manage(st, gi)
+            members = groups[gi].get("members") or []
+            rows = []
+            for mii in range(len(members)):
+                rows.append([InlineKeyboardButton(
+                    f" نگه داشتن نسخه {mii + 1}",
+                    callback_data=f"sscan:keep:{gi}:{mii}",
+                )])
+            rows.append([
+                InlineKeyboardButton("⏭ گروه بعد", callback_data="sscan:mgr:next"),
+                InlineKeyboardButton("🔙 منوی Self-Scan", callback_data="sscan:menu"),
+            ])
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(rows))
+            return
+        if data == "sscan:export_clean":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            payload = self_scan.export_clean_list_bytes(st)
+            buf = BytesIO(payload)
+            buf.name = "self_scan_clean.txt"
+            await query.message.reply_document(
+                document=buf,
+                filename="self_scan_clean.txt",
+                caption="فهرست تمیز (Drop فقط از فهرست؛ پیام تلگرام حذف نشده)",
+            )
+            return
+        if data == "sscan:health":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            stats = self_scan.health_check_tracks(st.get("tracks") or [])
+            await query.message.reply_text(
+                self_scan.format_health_report(stats, "Self-Scan"),
+                reply_markup=self_scan_keyboard(),
+            )
+            return
         if data == "sscan:clear":
             st = self_scan.empty_state()
             context.user_data["self_scan"] = st
@@ -3495,9 +3617,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         store = get_audio_scanner_store()
         chat_id = query.message.chat_id
         if data == "ascan:menu":
-            await query.message.reply_text(
-                "🎧 Audio Similarity Scanner\n\nاین ابزار آهنگ‌های ثبت‌شده از منابع A و B را با اثر انگشت صوتی مقایسه می‌کند. فایل‌ها یکی‌یکی دانلود و پس از تحلیل فوراً پاک می‌شوند.",
-                reply_markup=audio_scanner_keyboard())
+            text = (
+                "🎧 Audio Similarity Scanner\n\n"
+                "این ابزار آهنگ‌های ثبت‌شده از منابع A و B را با اثر انگشت صوتی مقایسه می‌کند. "
+                "فایل‌ها یکی‌یکی دانلود و پس از تحلیل فوراً پاک می‌شوند."
+            )
+            try:
+                await safe_edit_message_text(query.message, text, reply_markup=audio_scanner_keyboard())
+            except Exception:
+                await query.message.reply_text(text, reply_markup=audio_scanner_keyboard())
             return
         if data == "ascan:scan":
             if context.user_data.get("audio_scan_task") and not context.user_data["audio_scan_task"].done():
@@ -3608,23 +3736,82 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await query.message.reply_text("📚 منوی آرشیو", reply_markup=archive_keyboard())
             return
+        if data == "arch:close":
+            # Full archive session teardown + UI cleanup
+            context.user_data.pop("archive", None)
+            context.user_data.pop("archive_current", None)
+            context.user_data.pop("archive_start_from", None)
+            context.user_data.pop("sscan_manage_gi", None)
+            w = context.user_data.get("waiting")
+            if w is None or w in {"archive_track", "archive_start_number", "archive_manifest"} or str(w).startswith("archive"):
+                context.user_data["waiting"] = None
+            # Stop any running archive-related progress keys if present
+            for k in list(context.user_data.keys()):
+                if k in ("audio_scan_cancel", "self_scan_cancel"):
+                    context.user_data[k] = True
+            # Remove inline menu message (stale "tabs")
+            try:
+                await safe_delete_message(query.message)
+            except Exception:
+                try:
+                    await safe_edit_message_text(query.message, "آرشیو بسته شد.", reply_markup=None)
+                except Exception:
+                    pass
+            await query.message.chat.send_message(
+                "✅ آرشیو بسته شد.\nنشست Source A/B و صف بررسی پاک شد.\n(Self-Scan جداست و پاک نشده)",
+                reply_markup=main_reply_keyboard(),
+            )
+            return
         if not a:
             await query.message.reply_text("آرشیوی فعال نیست؛ از دکمه آرشیو موسیقی شروع کن.")
             return
         if data == "arch:review_menu":
             a["phase"] = "menu"
-            await query.message.reply_text(
+            text = (
                 "دریافت منابع:\n"
                 "۱) Source A را بفرست و پایان را تأیید کن\n"
                 "۲) Source B را بفرست و پایان را تأیید کن\n"
-                "۳) Audio Scanner را اجرا کن تا تکراری‌های قطعی حذف و فهرست نهایی ساخته شود",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],
-                    [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
-                    [InlineKeyboardButton("🎧 Audio Scanner", callback_data="ascan:menu")],
-                    [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
-                ]),
+                "۳) Audio Scanner را اجرا کن تا تکراری‌های قطعی حذف و فهرست نهایی ساخته شود"
             )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📥 افزودن منبع A", callback_data="arch:start_a")],
+                [InlineKeyboardButton("📥 افزودن منبع B", callback_data="arch:start_b")],
+                [InlineKeyboardButton("🎧 Audio Scanner", callback_data="ascan:menu")],
+                [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+            ])
+            try:
+                await safe_edit_message_text(query.message, text, reply_markup=kb)
+            except Exception:
+                await query.message.reply_text(text, reply_markup=kb)
+            return
+        if data == "arch:health":
+            sources = (a or {}).get("sources") or {}
+            sa = list(sources.get("source_a") or [])
+            sb = list(sources.get("source_b") or [])
+            # normalize shape: source items may use title/name/artist differently
+            def _norm(items, prefix):
+                out = []
+                for i, it in enumerate(items):
+                    if not isinstance(it, dict):
+                        continue
+                    out.append({
+                        "title": it.get("title") or it.get("name") or "",
+                        "name": it.get("name") or "",
+                        "artist": it.get("artist") or "",
+                        "duration": it.get("duration"),
+                        "size": it.get("size") or 0,
+                        "file_id": it.get("file_id"),
+                        "number": i + 1,
+                    })
+                return out
+            stats_a = self_scan.health_check_tracks(_norm(sa, "A"))
+            stats_b = self_scan.health_check_tracks(_norm(sb, "B"))
+            text = (
+                self_scan.format_health_report(stats_a, "Source A")
+                + "\n\n"
+                + self_scan.format_health_report(stats_b, "Source B")
+            )
+            await query.message.reply_text(text[:4000], reply_markup=archive_keyboard())
             return
         if data == "arch:input_menu":
             context.user_data["waiting"] = "archive_manifest"
