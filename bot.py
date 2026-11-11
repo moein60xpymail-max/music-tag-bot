@@ -15,6 +15,7 @@ from audio_scanner import (
     analyze_local_file, similarity_between_analyses, content_hash_file,
 )
 from typing import Dict, List, Optional, Any
+import self_scan
 from io import BytesIO
 
 from PIL import Image
@@ -232,8 +233,9 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.0.4"
+VERSION = "v7.1.0"
 VERSION_CHANGES = [
+    "Archive Self-Scan: تشخیص تکراری داخل یک آرشیو واحد (بدون حذف خودکار)",
     "رفع مسدود شدن همه دکمه‌ها به‌خاطر شرط archive",
     "اصلاح callbackهای آرشیو که داخل ascan گیر کرده بودند",
     "Dockerfile با chromaprint-tools (fpcalc) برای EthioDeploy",
@@ -1448,7 +1450,8 @@ def export_source_txt(archive: dict, source_key: str) -> bytes:
 def archive_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 دریافت Source A / B", callback_data="arch:review_menu")],
-        [InlineKeyboardButton("🎧 Audio Scanner", callback_data="ascan:menu")],
+        [InlineKeyboardButton("🎧 Audio Scanner (A/B)", callback_data="ascan:menu")],
+        [InlineKeyboardButton("🔍 Archive Self-Scan", callback_data="sscan:menu")],
         [InlineKeyboardButton("📥 ورودی بررسی منابع", callback_data="arch:input_menu")],
         [InlineKeyboardButton("❌ بستن آرشیو", callback_data="arch:close")],
     ])
@@ -1462,6 +1465,131 @@ def audio_scanner_keyboard():
         [InlineKeyboardButton("📄 دریافت خروجی فهرست", callback_data="ascan:export")],
         [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
     ])
+
+
+def self_scan_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 دریافت / ادامه آهنگ‌های آرشیو", callback_data="sscan:intake")],
+        [InlineKeyboardButton("🔍 شروع اسکن آرشیو", callback_data="sscan:run")],
+        [InlineKeyboardButton("📊 مشاهده نتایج آخرین اسکن", callback_data="sscan:results")],
+        [InlineKeyboardButton("🔎 موارد نیازمند بررسی", callback_data="sscan:review")],
+        [InlineKeyboardButton("📄 دریافت گزارش", callback_data="sscan:export")],
+        [InlineKeyboardButton("🗑 پاک کردن نشست Self-Scan", callback_data="sscan:clear")],
+        [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+    ])
+
+
+def get_self_scan(context, user_id=None):
+    st = context.user_data.get("self_scan")
+    if not isinstance(st, dict):
+        if user_id is not None:
+            st = self_scan.load_state(DATA_DIR, int(user_id))
+        else:
+            st = self_scan.empty_state()
+        context.user_data["self_scan"] = st
+    return st
+
+
+async def self_scan_run_worker(context, user_id, chat_id, progress_message_id):
+    bot = context.application.bot
+    st = self_scan.load_state(DATA_DIR, user_id)
+    context.user_data["self_scan"] = st
+    tracks = st.get("tracks") or []
+    if not tracks:
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=progress_message_id,
+            text="آهنگی در Self-Scan نیست. اول آهنگ‌ها را بفرست.",
+            reply_markup=self_scan_keyboard(),
+        )
+        return
+    temp_root = Path(tempfile.mkdtemp(prefix="self_scan_", dir=str(DATA_DIR)))
+    try:
+        analyses = dict(st.get("analyses") or {})
+        total = len(tracks)
+        errors = 0
+        for i, tr in enumerate(tracks):
+            if context.user_data.get("self_scan_cancel"):
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=progress_message_id,
+                    text=f"⏹ اسکن متوقف شد. پیشرفت تحلیل: {i}/{total}",
+                    reply_markup=self_scan_keyboard(),
+                )
+                st["analyses"] = analyses
+                self_scan.save_state(DATA_DIR, user_id, st)
+                return
+            key = tr.get("cache_key") or ""
+            if key and analyses.get(key) and analyses[key].get("content_hash"):
+                continue
+            fid = tr.get("file_id")
+            if not fid or int(tr.get("size") or 0) > MAX_SIZE:
+                errors += 1
+                continue
+            tmp = temp_root / f"{i}.mp3"
+            try:
+                tg = await bot.get_file(fid)
+                await download_to_drive_retry(tg, str(tmp))
+                an = await asyncio.to_thread(analyze_local_file, tmp)
+                if key:
+                    analyses[key] = an
+                if an.get("error") and not an.get("content_hash"):
+                    errors += 1
+            except Exception as exc:
+                errors += 1
+                print("self_scan analyze error:", repr(exc))
+            finally:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            if i % 3 == 0 or i + 1 == total:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id, message_id=progress_message_id,
+                        text=f"🔍 Self-Scan — تحلیل: {i+1}/{total} | خطا: {errors}",
+                        reply_markup=InlineKeyboardMarkup(
+                            [[InlineKeyboardButton("⏹ لغو", callback_data="sscan:cancel")]]
+                        ),
+                    )
+                except Exception:
+                    pass
+        st["analyses"] = analyses
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=progress_message_id,
+                text=f"🔍 مقایسه جفت‌ها روی {total} آهنگ…",
+            )
+        except Exception:
+            pass
+        results = await asyncio.to_thread(self_scan.build_groups, tracks, analyses)
+        results["stats"]["errors"] = errors
+        st["results"] = results
+        st["phase"] = "done"
+        self_scan.save_state(DATA_DIR, user_id, st)
+        context.user_data["self_scan"] = st
+        text = (
+            self_scan.format_report(st)
+            + "\n\n"
+            + self_scan.format_groups(st, limit=8)
+        )
+        await bot.edit_message_text(
+            chat_id=chat_id, message_id=progress_message_id,
+            text=text[:4000],
+            reply_markup=self_scan_keyboard(),
+        )
+    except Exception as exc:
+        print("self_scan_run_worker error:", repr(exc))
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=progress_message_id,
+                text=f"❌ Self-Scan خطا: {type(exc).__name__}: {str(exc)[:250]}",
+                reply_markup=self_scan_keyboard(),
+            )
+        except Exception:
+            pass
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+        context.user_data.pop("self_scan_task", None)
+        context.user_data.pop("self_scan_cancel", None)
 
 
 def scanner_user_allowed(user_id):
@@ -2336,6 +2464,51 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Archive intake: keep Telegram file references; download only when a track is opened.
     archive = context.user_data.get("archive")
+
+    # Archive Self-Scan intake (independent of Source A/B)
+    st = context.user_data.get("self_scan")
+    if isinstance(st, dict) and st.get("phase") == "intake":
+        user = update.effective_user
+        audio_meta = message.audio
+        key = self_scan.track_cache_key(
+            getattr(document, "file_unique_id", None),
+            document.file_id,
+            document.file_size or 0,
+        )
+        # skip exact re-register of same unique id
+        existing_keys = {x.get("cache_key") for x in (st.get("tracks") or [])}
+        if key not in existing_keys:
+            item = {
+                "file_id": document.file_id,
+                "file_unique_id": getattr(document, "file_unique_id", None),
+                "name": name,
+                "title": (getattr(audio_meta, "title", None) or "").strip(),
+                "artist": (getattr(audio_meta, "performer", None) or "").strip(),
+                "duration": getattr(audio_meta, "duration", None),
+                "size": document.file_size or 0,
+                "message_id": message.message_id,
+                "cache_key": key,
+                "number": len(st.get("tracks") or []) + 1,
+            }
+            st.setdefault("tracks", []).append(item)
+            # renumber
+            for i, tr in enumerate(st["tracks"], 1):
+                tr["number"] = i
+            if user:
+                self_scan.save_state(DATA_DIR, user.id, st)
+            context.user_data["self_scan"] = st
+            await message.reply_text(
+                f"✅ به Self-Scan اضافه شد: #{item['number']} — {item.get('title') or Path(name).stem}\n"
+                f"جمع: {len(st['tracks'])} آهنگ. وقتی تمام شد «شروع اسکن آرشیو» را بزن.",
+                reply_markup=self_scan_keyboard(),
+            )
+        else:
+            await message.reply_text(
+                "این فایل قبلاً در Self-Scan ثبت شده است.",
+                reply_markup=self_scan_keyboard(),
+            )
+        return
+
     if archive and archive.get("phase") in {"source_a", "source_b"}:
         source = archive["phase"]
         bucket = archive["sources"][source]
@@ -3193,6 +3366,127 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kb = main_reply_keyboard() if i == len(chunks) - 1 else None
                 await query.message.reply_text(chunk, reply_markup=kb)
         return
+
+    if isinstance(data, str) and data.startswith("sscan:"):
+        user_id = query.from_user.id if query.from_user else None
+        st = get_self_scan(context, user_id)
+        if data == "sscan:menu":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            n = len(st.get("tracks") or [])
+            has_res = bool(st.get("results"))
+            await query.message.reply_text(
+                "🔍 Archive Self-Scan\n\n"
+                "آهنگ‌های یک آرشیو را بفرست؛ ربات همه را با هم مقایسه می‌کند.\n"
+                "حذف خودکار انجام نمی‌شود.\n\n"
+                f"آهنگ‌های ثبت‌شده: {n}\n"
+                f"نتیجه قبلی: {'بله' if has_res else 'خیر'}",
+                reply_markup=self_scan_keyboard(),
+            )
+            return
+        if data == "sscan:intake":
+            st["phase"] = "intake"
+            context.user_data["self_scan"] = st
+            if user_id:
+                self_scan.save_state(DATA_DIR, user_id, st)
+            await query.message.reply_text(
+                "📥 آهنگ‌های آرشیو را یکی‌یکی یا پشت‌سرهم بفرست.\n"
+                f"فعلی: {len(st.get('tracks') or [])} آهنگ.\n"
+                "پس از اتمام، «شروع اسکن آرشیو» را بزن.",
+                reply_markup=self_scan_keyboard(),
+            )
+            return
+        if data == "sscan:run":
+            if not user_id:
+                return
+            task = context.user_data.get("self_scan_task")
+            if task and not task.done():
+                await query.message.reply_text("یک Self-Scan در حال اجراست.")
+                return
+            st = self_scan.load_state(DATA_DIR, user_id)
+            context.user_data["self_scan"] = st
+            if not (st.get("tracks") or []):
+                await query.message.reply_text(
+                    "ابتدا آهنگ‌ها را بفرست (دریافت / ادامه آهنگ‌های آرشیو).",
+                    reply_markup=self_scan_keyboard(),
+                )
+                return
+            sent = await query.message.reply_text(
+                f"⏳ Self-Scan شروع شد برای {len(st['tracks'])} آهنگ…",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("⏹ لغو", callback_data="sscan:cancel")]]
+                ),
+            )
+            context.user_data["self_scan_cancel"] = False
+            task = asyncio.create_task(
+                self_scan_run_worker(context, user_id, query.message.chat_id, sent.message_id)
+            )
+            context.user_data["self_scan_task"] = task
+            return
+        if data == "sscan:cancel":
+            context.user_data["self_scan_cancel"] = True
+            await query.message.reply_text("درخواست توقف Self-Scan ثبت شد.")
+            return
+        if data == "sscan:results":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            if not st.get("results"):
+                await query.message.reply_text(
+                    "هنوز نتیجه‌ای نیست. اسکن را اجرا کن.",
+                    reply_markup=self_scan_keyboard(),
+                )
+                return
+            await query.message.reply_text(
+                self_scan.format_report(st),
+                reply_markup=self_scan_keyboard(),
+            )
+            await query.message.reply_text(
+                self_scan.format_groups(st, limit=12),
+                reply_markup=self_scan_keyboard(),
+            )
+            return
+        if data == "sscan:review":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            await query.message.reply_text(
+                self_scan.format_review(st),
+                reply_markup=self_scan_keyboard(),
+            )
+            return
+        if data == "sscan:export":
+            if user_id:
+                st = self_scan.load_state(DATA_DIR, user_id)
+                context.user_data["self_scan"] = st
+            if not st.get("results"):
+                await query.message.reply_text(
+                    "نتیجه‌ای برای خروجی نیست.",
+                    reply_markup=self_scan_keyboard(),
+                )
+                return
+            payload = self_scan.export_report_bytes(st)
+            buf = BytesIO(payload)
+            buf.name = "self_scan_report.txt"
+            await query.message.reply_document(
+                document=buf,
+                filename="self_scan_report.txt",
+                caption="گزارش Archive Self-Scan (بدون حذف خودکار)",
+            )
+            return
+        if data == "sscan:clear":
+            st = self_scan.empty_state()
+            context.user_data["self_scan"] = st
+            if user_id:
+                self_scan.save_state(DATA_DIR, user_id, st)
+            await query.message.reply_text(
+                "نشست Self-Scan پاک شد.",
+                reply_markup=self_scan_keyboard(),
+            )
+            return
+        return
+
     if data.startswith("ascan:"):
         user_id = query.from_user.id if query.from_user else None
         if not scanner_user_allowed(user_id):

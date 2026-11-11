@@ -1,3 +1,9 @@
+# Music Tag Bot v7.1.0
+
+## Archive Self-Scan
+مقایسه تکراری‌ها داخل یک آرشیو واحد با اثرانگشت صوتی. حذف خودکار ندارد.
+منو: آرشیو → Archive Self-Scan → دریافت آهنگ‌ها → شروع اسکن.
+
 # Music Tag Bot — v7.0.1
 
 رفع اساسی حذف Duplicate در Archive + ساده‌سازی Audio Scanner.
