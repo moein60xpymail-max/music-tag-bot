@@ -233,8 +233,10 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.2.1"
+VERSION = "v7.2.2"
 VERSION_CHANGES = [
+    "رفع Album Mode: دریافت فایل پس از نام آلبوم + اولویت‌بندی هندلرها",
+    "بازخورد صریح برای هر ترک آلبوم و دکمه Finish از ابتدا",
     "رفع دکمه بستن آرشیو + پاک‌سازی پیام/نشست منوهای اضافه",
     "مدیریت نتایج Self-Scan: انتخاب Keep/Drop بدون حذف تلگرام",
     "گزارش سلامت آرشیو (Health Check) روی متادیتا",
@@ -883,6 +885,14 @@ def album_exit_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("❌ لغو / خروج از آلبوم", callback_data="album:exit")]])
 
 
+def album_uploading_keyboard() -> InlineKeyboardMarkup:
+    """Shown while collecting album tracks — Finish is always available."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Finish Uploading", callback_data="album:finish")],
+        [InlineKeyboardButton("❌ لغو / خروج از آلبوم", callback_data="album:exit")],
+    ])
+
+
 def album_track_pick_keyboard(tracks, page: int = 0, per_page: int = 8) -> InlineKeyboardMarkup:
     total = len(tracks)
     start = page * per_page
@@ -1368,6 +1378,8 @@ async def album_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["album_mode"] = True
     context.user_data["album_folder"] = folder
     context.user_data["album_tracks"] = []
+    context.user_data["album_seen_message_ids"] = set()
+    context.user_data["album_receive_attempt"] = 0
     context.user_data["main_artists"] = []
     context.user_data.pop("album_summary_draft", None)
     context.user_data.pop("album_summary_confirmed", None)
@@ -2405,6 +2417,144 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             shutil.rmtree(temp_dir, ignore_errors=True)
         return
 
+    # ---------- Album Mode track intake (priority over archive/self-scan) ----------
+    # Must run before self_scan intake / archive source buckets so album files are not stolen.
+    if (
+        context.user_data.get("album_mode")
+        and context.user_data.get("album_name")
+        and context.user_data.get("waiting") not in ("album_main_artists", "album_name")
+    ):
+        # Resolve media if missing (should already be resolved)
+        if not document:
+            await message.reply_text(
+                "برای آلبوم باید فایل صوتی یا MP3 بفرستی.",
+                reply_markup=album_uploading_keyboard(),
+            )
+            return
+        mime_chk = (getattr(document, "mime_type", None) or "")
+        if mime_chk.startswith("image/"):
+            return
+        name_al = resolved_name or getattr(document, "file_name", None) or "music.mp3"
+        # Accept only audio-like payloads for album tracks
+        is_audio_msg = message.audio is not None
+        fname_l = (name_al or "").lower()
+        if not is_audio_msg and not (
+            fname_l.endswith(".mp3")
+            or is_audio_mime(mime_chk)
+        ):
+            await message.reply_text(
+                "فقط فایل صوتی / MP3 برای ترک‌های آلبوم پذیرفته می‌شود.",
+                reply_markup=album_uploading_keyboard(),
+            )
+            return
+        # Deduplicate same Telegram message
+        seen = context.user_data.setdefault("album_seen_message_ids", set())
+        mid = getattr(message, "message_id", None)
+        if mid is not None and mid in seen:
+            return
+        if mid is not None:
+            seen.add(mid)
+            # keep set bounded
+            if len(seen) > 2000:
+                context.user_data["album_seen_message_ids"] = set(list(seen)[-1000:])
+
+        folder = context.user_data.get("album_folder")
+        if not folder or not os.path.isdir(folder):
+            folder = tempfile.mkdtemp(prefix="album_")
+            context.user_data["album_folder"] = folder
+
+        attempt = context.user_data.get("album_receive_attempt", 0) + 1
+        context.user_data["album_receive_attempt"] = attempt
+        idx = len(context.user_data.get("album_tracks") or []) + 1
+        audio_meta = message.audio
+        file_size = int(getattr(document, "file_size", 0) or 0)
+
+        if file_size and file_size > MAX_SIZE:
+            title = (getattr(audio_meta, "title", None) or "").strip() or Path(name_al).stem
+            artist = (getattr(audio_meta, "performer", None) or "").strip() or "—"
+            duration = getattr(audio_meta, "duration", None)
+            context.user_data.setdefault("album_tracks", []).append({
+                "path": None, "original_name": name_al, "index": idx,
+                "original_cover": None, "original_duration": duration,
+                "summary_title": title, "summary_artist": artist,
+                "summary_album": (getattr(audio_meta, "album", None) or "—").strip(),
+                "summary_duration": duration, "downloaded": False,
+                "file_size": file_size, "file_id": document.file_id,
+            })
+            await message.reply_text(
+                f"⚠️ ترک {idx} رد شد (حجم بیش از ۲۰MB): {Path(name_al).name}",
+                reply_markup=album_uploading_keyboard(),
+            )
+            try:
+                await update_progress_dashboard(message, context, "album", outcome="skipped", track_name=name_al)
+            except Exception as dash_exc:
+                print("album progress dashboard error:", repr(dash_exc))
+            return
+
+        path = os.path.join(folder, f"track_{attempt:02d}_{idx:03d}.mp3")
+        stage = "download"
+        try:
+            tg_file = await context.bot.get_file(document.file_id)
+            await download_to_drive_retry(tg_file, path)
+            stage = "read"
+            mt_load(path)
+            MP3(path)
+        except Exception as e:
+            print("Album download/read error:", repr(e))
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+            label = name_al or f"فایل ارسالی شماره {attempt}"
+            try:
+                await message.reply_text(
+                    failed_media_message(label, e, stage),
+                    reply_markup=album_uploading_keyboard(),
+                )
+            except Exception:
+                await message.reply_text(
+                    f"❌ دریافت ترک ناموفق بود: {label}",
+                    reply_markup=album_uploading_keyboard(),
+                )
+            try:
+                await update_progress_dashboard(message, context, "album", outcome="failed", track_name=label)
+            except Exception as dash_exc:
+                print("album progress dashboard error:", repr(dash_exc))
+            return
+
+        try:
+            track_cover = get_cover(path)
+        except Exception:
+            track_cover = None
+        try:
+            track_duration = int(MP3(path).info.length)
+        except Exception:
+            track_duration = getattr(audio_meta, "duration", None)
+
+        context.user_data.setdefault("album_tracks", []).append({
+            "path": path,
+            "original_name": name_al,
+            "index": idx,
+            "original_cover": track_cover,
+            "original_duration": track_duration,
+            "downloaded": True,
+            "file_id": document.file_id,
+            "media_group_id": getattr(message, "media_group_id", None),
+        })
+        count = len(context.user_data["album_tracks"])
+        await message.reply_text(
+            f"✅ ترک {idx} دریافت شد: {Path(name_al).stem}\n"
+            f"📦 تعداد ترک‌های آلبوم تا الان: {count}\n"
+            "ادامه بده یا Finish Uploading را بزن.",
+            reply_markup=album_uploading_keyboard(),
+        )
+        try:
+            await update_progress_dashboard(message, context, "album", outcome="success", track_name=name_al)
+        except Exception as dash_exc:
+            print("album progress dashboard error:", repr(dash_exc))
+        return
+
     # In archive track mode, also accept a text reply to a previously sent
     # audio/document message. The replied-to media is what gets edited.
     if not document and context.user_data.get("waiting") == "archive_track":
@@ -2474,8 +2624,17 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     archive = context.user_data.get("archive")
 
     # Archive Self-Scan intake (independent of Source A/B)
+    # Do not steal files while Album Mode is actively collecting tracks.
     st = context.user_data.get("self_scan")
-    if isinstance(st, dict) and st.get("phase") == "intake":
+    if (
+        isinstance(st, dict)
+        and st.get("phase") == "intake"
+        and not (
+            context.user_data.get("album_mode")
+            and context.user_data.get("album_name")
+            and context.user_data.get("waiting") not in ("album_main_artists", "album_name")
+        )
+    ):
         user = update.effective_user
         audio_meta = message.audio
         key = self_scan.track_cache_key(
@@ -2517,7 +2676,15 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if archive and archive.get("phase") in {"source_a", "source_b"}:
+    if (
+        archive
+        and archive.get("phase") in {"source_a", "source_b"}
+        and not (
+            context.user_data.get("album_mode")
+            and context.user_data.get("album_name")
+            and context.user_data.get("waiting") not in ("album_main_artists", "album_name")
+        )
+    ):
         source = archive["phase"]
         bucket = archive["sources"][source]
         audio_meta = message.audio
@@ -2554,7 +2721,7 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("حجم فایل نباید بیشتر از ۲۰ مگابایت باشه.")
         return
 
-    # حالت آلبوم
+    # حالت آلبوم — فقط وقتی هنوز نام هنرمند/آلبوم کامل نشده
     if context.user_data.get("album_mode"):
         if context.user_data.get("waiting") in ("album_main_artists", "album_name") or not context.user_data.get("album_name"):
             await message.reply_text(
@@ -2562,63 +2729,11 @@ async def receive_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=album_exit_keyboard(),
             )
             return
-        folder = context.user_data["album_folder"]
-        attempt = context.user_data.get("album_receive_attempt", 0) + 1
-        context.user_data["album_receive_attempt"] = attempt
-        idx = len(context.user_data["album_tracks"]) + 1
-        audio_meta = message.audio
-        if document.file_size and document.file_size > MAX_SIZE:
-            title = (getattr(audio_meta, "title", None) or "").strip() or Path(name).stem
-            artist = (getattr(audio_meta, "performer", None) or "").strip() or "—"
-            duration = getattr(audio_meta, "duration", None)
-            context.user_data["album_tracks"].append({
-                "path": None, "original_name": name, "index": idx,
-                "original_cover": None, "original_duration": duration,
-                "summary_title": title, "summary_artist": artist,
-                "summary_album": (getattr(audio_meta, "album", None) or "—").strip(),
-                "summary_duration": duration, "downloaded": False,
-                "file_size": document.file_size, "file_id": document.file_id,
-            })
-            await update_progress_dashboard(message, context, "album", outcome="skipped", track_name=name)
-            return
-        path = os.path.join(folder, f"track_{attempt:02d}.mp3")
-        stage = "download"
-        try:
-            tg_file = await context.bot.get_file(document.file_id)
-            await download_to_drive_retry(tg_file, path)
-            stage = "read"
-            mt_load(path)  # فقط برای اطمینان از معتبر بودن فایل
-            MP3(path)
-        except Exception as e:
-            print("Album download/read error:", repr(e))
-            try:
-                if os.path.exists(path): os.remove(path)
-            except OSError:
-                pass
-            label = name or f"فایل ارسالی شماره {attempt}"
-            await update_progress_dashboard(message, context, "album", outcome="failed", track_name=label)
-            return
-
-        # کاور و زمان اصلی این ترک رو ذخیره کن
-        try:
-            track_cover = get_cover(path)
-        except Exception:
-            track_cover = None
-        try:
-            track_duration = int(MP3(path).info.length)
-        except Exception:
-            track_duration = None
-
-        context.user_data["album_tracks"].append(
-            {
-                "path": path,
-                "original_name": name,
-                "index": idx,
-                "original_cover": track_cover,
-                "original_duration": track_duration,
-            }
+        # Ready state should have been handled by the early album intake above.
+        await message.reply_text(
+            "در حالت آلبوم هستی. فایل را دوباره بفرست یا Finish Uploading را بزن.",
+            reply_markup=album_uploading_keyboard(),
         )
-        await update_progress_dashboard(message, context, "album", outcome="success", track_name=name)
         return
 
     # حالت تک آهنگ
@@ -3201,12 +3316,19 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_temporary_prompt(update.message, context, "نام آلبوم نمی‌تواند خالی باشد. دوباره بفرست.")
             return
         context.user_data["album_name"] = album_name
-        context.user_data["waiting"] = None
+        context.user_data["waiting"] = "album_tracks"
+        context.user_data.setdefault("album_seen_message_ids", set())
+        # Ensure folder still exists (restart / cleanup safety)
+        folder = context.user_data.get("album_folder")
+        if not folder or not os.path.isdir(folder):
+            folder = tempfile.mkdtemp(prefix="album_")
+            context.user_data["album_folder"] = folder
         await update.message.reply_text(
             f"✅ نام آلبوم: {album_name}\n\n"
-            "🎵 حالا فایل‌های MP3 آلبوم را یکی‌یکی بفرست.\n"
+            "🎵 حالا فایل‌های MP3 آلبوم را یکی‌یکی یا به‌صورت media group بفرست.\n"
+            "پس از هر فایل، تأیید دریافت می‌بینی.\n"
             "وقتی تمام شد دکمه **Finish Uploading** را بزن.",
-            reply_markup=album_exit_keyboard(),
+            reply_markup=album_uploading_keyboard(),
         )
         return
 
