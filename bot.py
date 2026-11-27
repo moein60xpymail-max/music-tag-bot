@@ -233,8 +233,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.2.2"
+VERSION = "v7.2.3"
 VERSION_CHANGES = [
+    "پنل مالک /admin با افزودن و حذف ادمین Auto Forward از طریق یوزرنیم",
+    "نمایش وضعیت ربات، کانال‌ها، فضای ذخیره‌سازی، خطاها و فعالیت‌های مدیریتی",
+    "ذخیره پایدار فهرست ادمین‌ها و محدودسازی پنل مدیریت به مالک اصلی",
     "رفع Album Mode: دریافت فایل پس از نام آلبوم + اولویت‌بندی هندلرها",
     "بازخورد صریح برای هر ترک آلبوم و دکمه Finish از ابتدا",
     "رفع دکمه بستن آرشیو + پاک‌سازی پیام/نشست منوهای اضافه",
@@ -252,6 +255,10 @@ VERSION_CHANGES = [
     "اصلاح متن راهنمای منوی آرشیو",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
+ADMIN_REGISTRY_FILE = DATA_DIR / "admin_registry.json"
+ADMIN_ACTIVITY_FILE = DATA_DIR / "admin_activity.log"
+ADMIN_ERROR_FILE = DATA_DIR / "recent_errors.log"
+BOT_STARTED_AT = time.time()
 
 FIELDS = {
     "filename": "File Name",
@@ -1222,6 +1229,184 @@ async def show_editor(
     )
 
 
+# ==================== مالک و مدیریت ادمین‌ها ====================
+def load_admin_registry() -> dict:
+    ensure_data_dir()
+    try:
+        data = json.loads(ADMIN_REGISTRY_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"admins": {}, "seen_users": {}}
+    except Exception:
+        return {"admins": {}, "seen_users": {}}
+
+
+def save_admin_registry(data: dict) -> None:
+    ensure_data_dir()
+    tmp = ADMIN_REGISTRY_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, ADMIN_REGISTRY_FILE)
+
+
+def remember_seen_user(user) -> None:
+    if not user:
+        return
+    registry = load_admin_registry()
+    record = {
+        "username": (user.username or "").lower(),
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+    }
+    seen = registry.setdefault("seen_users", {})
+    previous = seen.get(str(user.id), {})
+    now = int(time.time())
+    changed = any(previous.get(key) != value for key, value in record.items())
+    refresh_due = now - int(previous.get("seen_at", 0) or 0) > 6 * 60 * 60
+    if changed or refresh_due:
+        record["seen_at"] = now
+        seen[str(user.id)] = record
+        save_admin_registry(registry)
+
+
+def managed_admin_ids() -> set:
+    registry = load_admin_registry()
+    result = set()
+    for raw in registry.get("admins", {}):
+        try:
+            result.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def add_admin_by_username(username: str):
+    clean = username.strip().lstrip("@").lower()
+    if not clean or not re.fullmatch(r"[a-zA-Z0-9_]{5,32}", clean):
+        return None, "نام کاربری معتبر نیست. آن را با @ یا بدون @ بفرست."
+    registry = load_admin_registry()
+    matches = [(uid, info) for uid, info in registry.get("seen_users", {}).items()
+               if (info.get("username") or "").lower() == clean]
+    if not matches:
+        return None, "این کاربر هنوز توسط ربات شناسایی نشده است. ابتدا باید کاربر یک‌بار ربات را باز کند و /start بزند؛ سپس دوباره تلاش کن."
+    uid, info = matches[-1]
+    if int(time.time()) - int(info.get("seen_at", 0) or 0) > 7 * 24 * 60 * 60:
+        return None, "اطلاعات این یوزرنیم قدیمی است. از کاربر بخواه دوباره /start بزند و سپس مجدداً اضافه‌اش کن."
+    if OWNER_ID and int(uid) == int(OWNER_ID):
+        return None, "مالک اصلی از قبل بالاترین دسترسی را دارد."
+    registry.setdefault("admins", {})[str(uid)] = {
+        "username": clean, "first_name": info.get("first_name", ""),
+        "added_at": int(time.time()), "added_by": int(OWNER_ID),
+    }
+    save_admin_registry(registry)
+    log_admin_activity(f"ADD_ADMIN id={uid} username=@{clean}")
+    return int(uid), None
+
+
+def remove_managed_admin(user_id: int):
+    registry = load_admin_registry()
+    entry = registry.setdefault("admins", {}).pop(str(int(user_id)), None)
+    if entry is None:
+        return False
+    save_admin_registry(registry)
+    log_admin_activity(f"REMOVE_ADMIN id={user_id} username=@{entry.get('username','')}")
+    return True
+
+
+def log_admin_activity(message: str) -> None:
+    ensure_data_dir()
+    with ADMIN_ACTIVITY_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+
+
+def log_admin_error(message: str) -> None:
+    ensure_data_dir()
+    with ADMIN_ERROR_FILE.open("a", encoding="utf-8") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+    # Keep the file bounded.
+    try:
+        lines = ADMIN_ERROR_FILE.read_text(encoding="utf-8").splitlines()[-100:]
+        ADMIN_ERROR_FILE.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def admin_panel_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ تعیین ادمین با یوزرنیم", callback_data="admin:add")],
+        [InlineKeyboardButton("➖ حذف ادمین", callback_data="admin:remove_list"),
+         InlineKeyboardButton("👥 فهرست ادمین‌ها", callback_data="admin:list")],
+        [InlineKeyboardButton("🤖 وضعیت ربات", callback_data="admin:bot"),
+         InlineKeyboardButton("📢 کانال‌ها", callback_data="admin:channels")],
+        [InlineKeyboardButton("💾 فضای ذخیره‌سازی", callback_data="admin:storage"),
+         InlineKeyboardButton("⚠️ خطاهای اخیر", callback_data="admin:errors")],
+        [InlineKeyboardButton("🧾 فعالیت‌های مدیریتی", callback_data="admin:activity")],
+    ])
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_owner(user.id if user else None):
+        await update.effective_message.reply_text("🔒 این بخش فقط برای مالک اصلی ربات فعال است.")
+        return
+    log_admin_activity("OPEN_PANEL")
+    await update.effective_message.reply_text(
+        "🛡 پنل مدیریت مالک\n\nاز این بخش می‌توانی ادمین‌های Auto Forward را مدیریت کنی و وضعیت ربات را ببینی.",
+        reply_markup=admin_panel_keyboard(),
+    )
+
+
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(query.from_user.id if query.from_user else None):
+        await query.answer("فقط مالک اصلی اجازه استفاده از این پنل را دارد.", show_alert=True)
+        return
+    await query.answer()
+    data = query.data or ""
+    if data == "admin:add":
+        context.user_data["waiting"] = "admin_add_username"
+        await query.message.reply_text("نام کاربری تلگرام کاربر را بفرست (مثلاً @username).\n\nکاربر باید قبلاً حداقل یک‌بار /start را در ربات زده باشد.")
+    elif data == "admin:remove_list":
+        registry = load_admin_registry().get("admins", {})
+        rows = [[InlineKeyboardButton(f"@{v.get('username') or 'بدون‌نام'} · {uid}", callback_data=f"admin:remove:{uid}")] for uid, v in registry.items()]
+        if not rows:
+            await query.message.reply_text("ادمین مدیریتی ثبت‌شده‌ای وجود ندارد.")
+        else:
+            rows.append([InlineKeyboardButton("بازگشت", callback_data="admin:back")])
+            await query.message.reply_text("برای لغو دسترسی، ادمین موردنظر را انتخاب کن:", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("admin:remove:"):
+        uid = int(data.rsplit(":", 1)[1])
+        if remove_managed_admin(uid):
+            await query.message.reply_text(f"✅ دسترسی ادمین {uid} لغو شد.")
+        else:
+            await query.message.reply_text("این ادمین در فهرست قابل مدیریت پیدا نشد. ادمین‌هایی که فقط در ADMIN_IDS محیط هاست هستند باید از همان متغیر حذف شوند.")
+    elif data == "admin:list":
+        registry = load_admin_registry().get("admins", {})
+        lines = ["👥 ادمین‌های ثبت‌شده از طریق پنل:"]
+        lines += [f"• @{v.get('username') or 'بدون‌نام'} — {uid}" for uid, v in registry.items()]
+        lines.append(f"\nادمین‌های قدیمی ADMIN_IDS: {len(ADMIN_IDS)}")
+        await query.message.reply_text("\n".join(lines))
+    elif data == "admin:bot":
+        uptime = max(0, int(time.time() - BOT_STARTED_AT))
+        await query.message.reply_text(f"🤖 وضعیت اجرا: فعال\n📦 نسخه: {VERSION}\n⏱ زمان فعالیت این اجرا: {uptime // 3600} ساعت و {(uptime % 3600) // 60} دقیقه\n👥 ادمین‌های پنل: {len(managed_admin_ids())}")
+    elif data == "admin:channels":
+        ch1 = get_af_channel(context, "1")
+        ch2 = get_af_channel(context, "2")
+        def fmt(ch):
+            return f"تنظیم‌شده: {ch.get('title') or ch.get('chat_id')} ({ch.get('chat_id')})" if ch else "تنظیم نشده"
+        await query.message.reply_text("📢 وضعیت کانال‌ها\n\nMain: " + fmt(ch1) + "\nFull Archive: " + fmt(ch2) + "\n\nبرای تغییر: /setchannel1 و /setchannel2")
+    elif data == "admin:storage":
+        ensure_data_dir()
+        usage = shutil.disk_usage(str(DATA_DIR))
+        used = (usage.total - usage.free) / (1024 ** 3)
+        await query.message.reply_text(f"💾 فضای فایل‌سیستم\nکل: {usage.total / (1024**3):.2f} GB\nاستفاده‌شده: {used:.2f} GB\nآزاد: {usage.free / (1024**3):.2f} GB\n\nاین آمار مربوط به فایل‌سیستم قابل مشاهده برای ربات است و ممکن است با سهمیه اختصاصی هاست متفاوت باشد.")
+    elif data == "admin:errors":
+        recent = ADMIN_ERROR_FILE.read_text(encoding="utf-8").splitlines()[-10:] if ADMIN_ERROR_FILE.exists() else []
+        await query.message.reply_text("⚠️ خطاهای ثبت‌شده اخیر:\n\n" + ("\n".join(recent) if recent else "خطایی در فایل گزارش ثبت نشده است."))
+    elif data == "admin:activity":
+        recent = ADMIN_ACTIVITY_FILE.read_text(encoding="utf-8").splitlines()[-15:] if ADMIN_ACTIVITY_FILE.exists() else []
+        await query.message.reply_text("🧾 آخرین فعالیت‌های مدیریتی:\n\n" + ("\n".join(recent) if recent else "هنوز فعالیتی ثبت نشده است."))
+    elif data == "admin:back":
+        await query.message.reply_text("🛡 پنل مدیریت مالک", reply_markup=admin_panel_keyboard())
+
+
 # ==================== دستورات ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # مطمئن شو که از حالت آلبوم خارج شده
@@ -1304,8 +1489,8 @@ async def setchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def setchannel1_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_owner(user.id if user else None):
-        await update.message.reply_text("🔒 فقط مالک ربات می‌تواند کانال مقصد Auto Forward را تنظیم کند.")
+    if not can_auto_forward(user.id if user else None):
+        await update.message.reply_text("🔒 فقط مالک یا ادمین Auto Forward می‌تواند کانال مقصد را تنظیم کند.")
         return
     context.user_data["waiting"] = "set_auto_forward_channel:1"
     await update.message.reply_text(
@@ -1318,8 +1503,8 @@ async def setchannel1_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def setchannel2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not is_owner(user.id if user else None):
-        await update.message.reply_text("🔒 فقط مالک ربات می‌تواند کانال مقصد Auto Forward را تنظیم کند.")
+    if not can_auto_forward(user.id if user else None):
+        await update.message.reply_text("🔒 فقط مالک یا ادمین Auto Forward می‌تواند کانال مقصد را تنظیم کند.")
         return
     context.user_data["waiting"] = "set_auto_forward_channel:2"
     await update.message.reply_text(
@@ -2909,16 +3094,28 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cancel(update, context)
         return
 
+    waiting = context.user_data.get("waiting")
+    if waiting == "admin_add_username":
+        context.user_data["waiting"] = None
+        if not is_owner(update.effective_user.id if update.effective_user else None):
+            await update.message.reply_text("🔒 فقط مالک اصلی اجازه افزودن ادمین را دارد.")
+            return
+        uid, error = add_admin_by_username(text)
+        if error:
+            await update.message.reply_text("❌ " + error)
+        else:
+            await update.message.reply_text(f"✅ @{text.strip().lstrip('@')} با شناسه {uid} به ادمین‌های Auto Forward اضافه شد.\nاکنون می‌تواند /setchannel1 و /setchannel2 را اجرا کند.")
+        return
+
     await clear_active_prompt(update, context)
     value = text
-    waiting = context.user_data.get("waiting")
 
-    # ---------- Auto Forward: set destination channel (owner only) ----------
+    # ---------- Auto Forward: set destination channel (owner or managed admin) ----------
     if isinstance(waiting, str) and waiting.startswith("set_auto_forward_channel"):
         user = update.effective_user
-        if not is_owner(user.id if user else None):
+        if not can_auto_forward(user.id if user else None):
             context.user_data["waiting"] = None
-            await update.message.reply_text("🔒 فقط مالک ربات می‌تواند کانال مقصد را تنظیم کند.")
+            await update.message.reply_text("🔒 فقط مالک یا ادمین Auto Forward می‌تواند کانال مقصد را تنظیم کند.")
             return
         slot = "1"
         if ":" in waiting:
@@ -2959,6 +3156,8 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         title = getattr(chat, "title", None) or getattr(chat, "username", "") or str(chat.id)
         set_af_channel(context, slot, chat.id, title)
+        actor = update.effective_user.id if update.effective_user else "unknown"
+        log_admin_activity(f"SET_CHANNEL slot={slot} chat_id={chat.id} actor={actor}")
         if slot == "1":
             set_af_destination(context, chat.id, title)
         context.user_data["waiting"] = None
@@ -5631,7 +5830,7 @@ def can_auto_forward(user_id: Optional[int]) -> bool:
     uid = int(user_id)
     if OWNER_ID and uid == int(OWNER_ID):
         return True
-    return uid in ADMIN_IDS
+    return uid in ADMIN_IDS or uid in managed_admin_ids()
 
 
 def _af_channels(context: ContextTypes.DEFAULT_TYPE) -> dict:
@@ -5902,6 +6101,7 @@ async def membership_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if user is None:
         return
+    remember_seen_user(user)
 
     query = update.callback_query
     is_member = False
@@ -5962,10 +6162,13 @@ async def error_handler(update, context):
     import traceback
     err = context.error
     # Temporary network/gateway failures are retried by the updater; log briefly.
+    safe_error = str(err).replace(TOKEN or "__NO_TOKEN__", "[REDACTED]")
     if isinstance(err, (NetworkError, TimedOut)):
-        print(f"BOT TRANSIENT NETWORK ERROR (will retry): {err!r}")
+        print(f"BOT TRANSIENT NETWORK ERROR (will retry): {safe_error}")
+        log_admin_error(f"TRANSIENT_NETWORK: {safe_error}")
         return
-    print("BOT ERROR:", repr(err))
+    print("BOT ERROR:", safe_error)
+    log_admin_error(safe_error)
     traceback.print_exception(type(err), err, err.__traceback__)
 
 
@@ -6021,12 +6224,14 @@ def main():
     app.add_handler(CommandHandler("tag", tag_command))
     app.add_handler(CommandHandler("album", album_command))
     app.add_handler(CommandHandler("version", version_command))
+    app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("unreleasedcover", unreleased_cover_command))
     app.add_handler(CommandHandler("setchannel", setchannel_command))
     app.add_handler(CommandHandler("setchannel1", setchannel1_command))
     app.add_handler(CommandHandler("setchannel2", setchannel2_command))
     app.add_handler(CommandHandler("channelstatus", channelstatus_command))
 
+    app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(button_handler))
 
     app.add_handler(

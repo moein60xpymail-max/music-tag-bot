@@ -214,3 +214,8 @@ Built on v6.2.7.
 - Every newly processed file restarts the 6-second inactivity timer.
 - The final dashboard refresh bypasses the normal 3-second throttle.
 - The 6-second quiet detection does not close Album, Summary, or Archive mode; a late file can still arrive and resume the dashboard.
+
+
+## v7.2.3 Owner Admin Panel
+
+Use `/admin` from the owner account to manage Auto Forward admins. Add by `@username`; the user must have interacted with the bot at least once before the bot can resolve that username to a numeric Telegram ID. Managed admins can use `/setchannel1` and `/setchannel2`, but cannot access `/admin` or owner-only features. The registry is saved in `DATA_DIR/admin_registry.json`. For persistence across redeploys, point `DATA_DIR` at a persistent directory provided by your host. Existing `ADMIN_IDS` entries remain active until removed from the host environment.
