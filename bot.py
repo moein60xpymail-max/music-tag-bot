@@ -27,7 +27,6 @@ from telegram import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     KeyboardButtonRequestChat,
-    ChatAdministratorRights,
     ReplyKeyboardRemove,
     BotCommand,
     CopyTextButton,
@@ -235,8 +234,10 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.2.4"
+VERSION = "v7.2.5"
 VERSION_CHANGES = [
+    "اصلاح دستورهای تنظیم کانال و نمایش مطمئن دکمه انتخاب کانال در صفحه‌کلید پایین تلگرام",
+    "انتخاب‌گر رسمی کانال تلگرام بدون ساخت ChatAdministratorRights ناقص و خطاساز",
     "پنل مالک /admin با افزودن و حذف ادمین Auto Forward از طریق یوزرنیم",
     "ذخیره مستقل و پایدار کانال‌های Auto Forward برای هر کاربر",
     "انتخاب کانال از فهرست رسمی تلگرام به‌جای ورود اجباری آیدی",
@@ -1493,34 +1494,44 @@ async def setchannel_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await setchannel1_command(update, context)
 
 
-async def setchannel1_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _start_channel_setup(update: Update, context: ContextTypes.DEFAULT_TYPE, slot: str):
+    """Start channel setup and always give the user a visible response."""
+    message = update.effective_message
     user = update.effective_user
-    if not can_auto_forward(user.id if user else None):
-        await update.message.reply_text("🔒 فقط مالک یا ادمین Auto Forward می‌تواند کانال مقصد را تنظیم کند.")
+    if message is None:
         return
-    context.user_data["waiting"] = "set_auto_forward_channel:1"
-    await update.message.reply_text(
-        "📢 تنظیم کانال اصلی (Main Channel)\n\n"
-        "برای انتخاب راحت، دکمه زیر را بزن و کانالت را از فهرست تلگرام انتخاب کن.\n"
-        "اگر خواستی، هنوز هم می‌توانی آیدی عددی یا یوزرنیم را دستی بفرستی.\n"
-        "ربات باید در کانال ادمین و دارای مجوز Post Messages باشد.",
-        reply_markup=channel_picker_keyboard("1"),
-    )
+    if not can_auto_forward(user.id if user else None):
+        await message.reply_text("🔒 فقط مالک یا ادمین Auto Forward می‌تواند کانال مقصد را تنظیم کند.")
+        return
+    context.user_data["waiting"] = f"set_auto_forward_channel:{slot}"
+    slot_name = "کانال اصلی (Main Channel)" if slot == "1" else "کانال Full Archive"
+    try:
+        markup = channel_picker_keyboard(slot)
+        await message.reply_text(
+            f"📢 تنظیم {slot_name}\n\n"
+            "برای باز کردن فهرست کانال‌ها، دکمه «➕ افزودن کانال» را که پایین صفحه ظاهر می‌شود لمس کن.\n"
+            "اگر دکمه انتخاب کانال در نسخه تلگرام تو پشتیبانی نشد، می‌توانی آیدی عددی یا یوزرنیم را همین‌جا بفرستی.\n"
+            "ربات باید در کانال ادمین و دارای مجوز ارسال پیام باشد.",
+            reply_markup=markup,
+        )
+    except Exception as exc:
+        # Do not silently fail: leave manual setup available and record the cause.
+        print(f"CHANNEL_PICKER_SETUP_ERROR slot={slot}: {exc!r}")
+        log_admin_error(f"CHANNEL_PICKER_SETUP_ERROR slot={slot}: {exc!r}")
+        await message.reply_text(
+            f"📢 تنظیم {slot_name}\n\n"
+            "دکمه انتخاب کانال در این لحظه قابل نمایش نیست. آیدی عددی یا یوزرنیم کانال را همین‌جا بفرست.\n"
+            "برای لغو /cancel را بزن.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+
+async def setchannel1_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _start_channel_setup(update, context, "1")
 
 
 async def setchannel2_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not can_auto_forward(user.id if user else None):
-        await update.message.reply_text("🔒 فقط مالک یا ادمین Auto Forward می‌تواند کانال مقصد را تنظیم کند.")
-        return
-    context.user_data["waiting"] = "set_auto_forward_channel:2"
-    await update.message.reply_text(
-        "📢 تنظیم کانال Full Archive\n\n"
-        "برای انتخاب راحت، دکمه زیر را بزن و کانالت را از فهرست تلگرام انتخاب کن.\n"
-        "اگر خواستی، هنوز هم می‌توانی آیدی عددی یا یوزرنیم را دستی بفرستی.\n"
-        "ربات باید در کانال ادمین و دارای مجوز Post Messages باشد.",
-        reply_markup=channel_picker_keyboard("2"),
-    )
+    await _start_channel_setup(update, context, "2")
 
 
 async def channelstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5900,19 +5911,25 @@ def af_channel_label(context: ContextTypes.DEFAULT_TYPE, slot: str, user_id: Opt
 
 
 def channel_picker_keyboard(slot: str) -> ReplyKeyboardMarkup:
-    """Show Telegram's native channel picker, with manual ID as a fallback."""
+    """Show a persistent bottom button that opens Telegram's native channel picker.
+
+    Do not pass a partially initialized ChatAdministratorRights object here:
+    python-telegram-bot 21.10 requires the full rights structure, and that
+    constructor error previously prevented /setchannel1 and /setchannel2
+    from sending any reply at all. The picker only needs the channel filter.
+    """
     request = KeyboardButtonRequestChat(
         request_id=int(slot),
         chat_is_channel=True,
-        user_administrator_rights=ChatAdministratorRights(can_post_messages=True),
         request_title=True,
         request_username=True,
     )
     return ReplyKeyboardMarkup(
-        [[KeyboardButton("📂 انتخاب کانال از تلگرام", request_chat=request)],
+        [[KeyboardButton("➕ افزودن کانال", request_chat=request)],
          [KeyboardButton("❌ لغو")]],
         resize_keyboard=True,
-        one_time_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True,
     )
 
 

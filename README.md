@@ -221,7 +221,7 @@ Built on v6.2.7.
 Use `/admin` from the owner account to manage Auto Forward admins. Add by `@username`; the user must have interacted with the bot at least once before the bot can resolve that username to a numeric Telegram ID. Managed admins can use `/setchannel1` and `/setchannel2`, but cannot access `/admin` or owner-only features. The registry is saved in `DATA_DIR/admin_registry.json`. For persistence across redeploys, point `DATA_DIR` at a persistent directory provided by your host. Existing `ADMIN_IDS` entries remain active until removed from the host environment.
 
 
-## v7.2.4 — Per-user Auto Forward destinations
+## v7.2.5 — Per-user Auto Forward destinations
 
 - Each authorized Telegram account has its own Main and Full Archive channel pair.
 - Destinations persist in `DATA_DIR/auto_forward_channels.json`; configure a persistent `DATA_DIR` on EthioDeploy to keep them across redeploys.
