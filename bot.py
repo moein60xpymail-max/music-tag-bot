@@ -236,9 +236,9 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v8.0.1"
+VERSION = "v8.0.2"
 VERSION_CHANGES = [
-    "دکمه ✏️ Edit زیر پیام آهنگ مخزن؛ ورود مستقیم به ویرایشگر بدون ارسال دوباره فایل",
+    "رفع خطای دکمه Edit مخزن؛ اکنون پس از دریافت آهنگ، منوی اصلی ویرایشگر باز می‌شود",
     "سیستم مخزن کانال‌ها: Source A، Source B و Destination با انتخاب‌گر رسمی تلگرام",
     "ذخیره متادیتای آهنگ‌های کانال در SQLite بدون دانلود دائمی روی هاست",
     "تطبیق فهرست TXT با مخزن کانال و کپی مستقیم از کانال برای ادیت",
@@ -4236,6 +4236,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 effective_user=query.from_user,
                 effective_chat=query.message.chat,
                 message=query.message,
+                callback_query=None,  # show_editor expects this Update attribute
             )
             await receive_audio(synthetic_update, context)
             return

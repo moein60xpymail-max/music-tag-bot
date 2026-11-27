@@ -1,4 +1,4 @@
-# Music Tag Bot v8.0.1\n\n# Music Tag Bot v7.1.0
+# Music Tag Bot v8.0.2\n\n# Music Tag Bot v7.1.0
 
 ## Archive Self-Scan
 مقایسه تکراری‌ها داخل یک آرشیو واحد با اثرانگشت صوتی. حذف خودکار ندارد.
