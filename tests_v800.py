@@ -10,7 +10,7 @@ import channel_repo
 
 def test_version_string():
     src = Path("bot.py").read_text(encoding="utf-8")
-    assert 'VERSION = "v8.0.0"' in src
+    assert 'VERSION = "v8.0.1"' in src
     # Old multi-version changelog items should not dominate VERSION_CHANGES
     assert "سیستم مخزن کانال‌ها" in src
 
@@ -76,6 +76,9 @@ def test_archive_keyboard_has_repo():
     assert "مخزن کانال‌ها" in src
     assert "repo:fetch_current" in src
     assert "دریافت آهنگ برای ادیت" in src
+    assert "repo:edit_copy:" in src
+    assert "✏️ Edit" in src
+    assert "await receive_audio(synthetic_update, context)" in src
 
 
 if __name__ == "__main__":

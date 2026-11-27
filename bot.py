@@ -5,6 +5,7 @@ import re
 import json
 import shutil
 import tempfile
+from types import SimpleNamespace
 import html as html_module
 from pathlib import Path
 from collections import Counter
@@ -235,8 +236,9 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v8.0.0"
+VERSION = "v8.0.1"
 VERSION_CHANGES = [
+    "دکمه ✏️ Edit زیر پیام آهنگ مخزن؛ ورود مستقیم به ویرایشگر بدون ارسال دوباره فایل",
     "سیستم مخزن کانال‌ها: Source A، Source B و Destination با انتخاب‌گر رسمی تلگرام",
     "ذخیره متادیتای آهنگ‌های کانال در SQLite بدون دانلود دائمی روی هاست",
     "تطبیق فهرست TXT با مخزن کانال و کپی مستقیم از کانال برای ادیت",
@@ -4201,6 +4203,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=repo_menu_keyboard(uid),
             )
             return
+        if data.startswith("repo:edit_copy:"):
+            # Only the active repository copy for this user's current archive may launch the editor.
+            try:
+                copied_message_id = int(data.rsplit(":", 1)[1])
+            except (TypeError, ValueError):
+                await query.answer("شناسه پیام نامعتبر است", show_alert=True)
+                return
+            if (
+                not query.message
+                or query.message.message_id != copied_message_id
+                or context.user_data.get("repo_edit_message_id") != copied_message_id
+            ):
+                await query.answer("این دکمه به پیام فعال آهنگ مربوط نیست", show_alert=True)
+                return
+            if not query.message.audio and not query.message.document:
+                await query.answer("پیام، فایل صوتی قابل ویرایش ندارد", show_alert=True)
+                return
+            a = context.user_data.get("archive") or {}
+            queue = a.get("queue") or []
+            idx = context.user_data.get("archive_current")
+            if not isinstance(idx, int) or not (0 <= idx < len(queue)):
+                await query.answer("ترک فعلی آرشیو مشخص نیست", show_alert=True)
+                return
+            await query.answer("در حال باز کردن ویرایشگر…")
+            context.user_data["waiting"] = "archive_track"
+            # Reuse the normal receive_audio pipeline with the already copied
+            # Telegram message. This downloads the audio once for tag editing
+            # and opens the existing editor UI without sending the audio again.
+            synthetic_update = SimpleNamespace(
+                effective_message=query.message,
+                effective_user=query.from_user,
+                effective_chat=query.message.chat,
+                message=query.message,
+            )
+            await receive_audio(synthetic_update, context)
+            return
         if data == "repo:fetch_current":
             # Copy current queue track from repository channel to user for editing
             a = context.user_data.get("archive") or {}
@@ -4236,19 +4274,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     return
             try:
-                await context.bot.copy_message(
+                copied = await context.bot.copy_message(
                     chat_id=query.message.chat_id,
                     from_chat_id=repo_ref["chat_id"],
                     message_id=repo_ref["message_id"],
                 )
                 item["status"] = "in_progress"
                 context.user_data["waiting"] = "archive_track"
-                await query.answer("آهنگ از مخزن ارسال شد")
-                await query.message.reply_text(
-                    "✅ فایل از مخزن کانال کپی شد.\n"
-                    "اگر نیاز به ادیت تگ داری، همین فایل را دوباره به ربات بفرست یا از حالت ادیت استفاده کن.\n"
-                    "پس از اتمام ادیت، خروجی به کانال Destination ارسال می‌شود."
+                context.user_data["repo_edit_message_id"] = copied.message_id
+                # Put Edit directly under the single copied audio message. The
+                # callback will pass this exact message into the existing editor
+                # intake, avoiding a second copy/forward from the user.
+                await context.bot.edit_message_reply_markup(
+                    chat_id=query.message.chat_id,
+                    message_id=copied.message_id,
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton(
+                            "✏️ Edit",
+                            callback_data=f"repo:edit_copy:{copied.message_id}",
+                        )
+                    ]]),
                 )
+                await query.answer("آهنگ ارسال شد؛ برای باز کردن ویرایشگر Edit را بزن")
             except TelegramError as exc:
                 await query.answer(f"خطا در کپی: {exc}", show_alert=True)
             return
