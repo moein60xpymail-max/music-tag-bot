@@ -144,12 +144,12 @@ Built on v6.2.7.
 - Default Tags: three modes per field — Apply / Keep / Remove; expanded fields (title, artist, albumartist, album, genre, year, composer, publisher, comment, lyrics, disc, track).
 - Remove deletes the actual tag frame (not just empty value) without touching cover art or other tags.
 - Auto Forward restricted to bot owner and `ADMIN_IDS` (comma-separated Telegram user IDs). Unauthorized users cannot send even via raw callbacks.
-- Dual destination channels: `/setchannel1` (Main), `/setchannel2` (Full Archive), independent send status per channel; `/channelstatus` shows both.
+- Dual destination channels: `/setchannel1` (Main), `/setchannel2` (Full Archive), independent per-user settings and send status per channel; `/channelstatus` shows the current user’s destinations.
 - Channel config remains owner-only and RAM-only.
 
 ## v5.0.0 changes
 - Adds Auto Forward to a destination channel for Single Track, Album, and Archive modes.
-- Destination channel is configured only by the bot owner (`OWNER_ID`) via `/setchannel` and stored in RAM only (`application.bot_data`); it does not survive a restart.
+- Auto Forward destinations are configured separately by each authorized Telegram account via `/setchannel1` and `/setchannel2`; settings are persisted in `DATA_DIR/auto_forward_channels.json`.
 - `/channelstatus` shows the current destination (if any).
 - Sends processed audio with `send_audio` (no original sender attribution, no original caption). Falls back to `send_document` only on clear audio-media errors; network/timeout/permission errors do not auto-fallback (avoids possible duplicates) and may be marked `unknown`.
 - Per-track status: `pending` / `sending` / `sent` / `failed` / `unknown`. Successful tracks are never re-sent. Failed tracks can be retried.
@@ -219,3 +219,12 @@ Built on v6.2.7.
 ## v7.2.3 Owner Admin Panel
 
 Use `/admin` from the owner account to manage Auto Forward admins. Add by `@username`; the user must have interacted with the bot at least once before the bot can resolve that username to a numeric Telegram ID. Managed admins can use `/setchannel1` and `/setchannel2`, but cannot access `/admin` or owner-only features. The registry is saved in `DATA_DIR/admin_registry.json`. For persistence across redeploys, point `DATA_DIR` at a persistent directory provided by your host. Existing `ADMIN_IDS` entries remain active until removed from the host environment.
+
+
+## v7.2.4 — Per-user Auto Forward destinations
+
+- Each authorized Telegram account has its own Main and Full Archive channel pair.
+- Destinations persist in `DATA_DIR/auto_forward_channels.json`; configure a persistent `DATA_DIR` on EthioDeploy to keep them across redeploys.
+- `/setchannel1` and `/setchannel2` open Telegram's native channel picker. Manual channel ID or username entry remains available as a fallback.
+- A selected channel is accepted only after the bot's administrator status and `Post Messages` permission are verified.
+- The picker requires the selecting user to have permission to post in the channel and works in the private bot chat.

@@ -1,4 +1,4 @@
-"""Tests for Music Tag Bot v7.2.3 — Album Mode receive path."""
+"""Tests for Music Tag Bot v7.2.4 — Album Mode receive path."""
 from __future__ import annotations
 
 import os
@@ -32,7 +32,7 @@ class AlbumModeUnitTests(unittest.TestCase):
     def test_version_is_723(self):
         import bot
 
-        self.assertEqual(bot.VERSION, "v7.2.3")
+        self.assertEqual(bot.VERSION, "v7.2.4")
 
     def test_album_uploading_keyboard_has_finish(self):
         import bot

@@ -26,6 +26,8 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    KeyboardButtonRequestChat,
+    ChatAdministratorRights,
     ReplyKeyboardRemove,
     BotCommand,
     CopyTextButton,
@@ -233,9 +235,11 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.2.3"
+VERSION = "v7.2.4"
 VERSION_CHANGES = [
     "پنل مالک /admin با افزودن و حذف ادمین Auto Forward از طریق یوزرنیم",
+    "ذخیره مستقل و پایدار کانال‌های Auto Forward برای هر کاربر",
+    "انتخاب کانال از فهرست رسمی تلگرام به‌جای ورود اجباری آیدی",
     "نمایش وضعیت ربات، کانال‌ها، فضای ذخیره‌سازی، خطاها و فعالیت‌های مدیریتی",
     "ذخیره پایدار فهرست ادمین‌ها و محدودسازی پنل مدیریت به مالک اصلی",
     "رفع Album Mode: دریافت فایل پس از نام آلبوم + اولویت‌بندی هندلرها",
@@ -258,6 +262,7 @@ UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 ADMIN_REGISTRY_FILE = DATA_DIR / "admin_registry.json"
 ADMIN_ACTIVITY_FILE = DATA_DIR / "admin_activity.log"
 ADMIN_ERROR_FILE = DATA_DIR / "recent_errors.log"
+AF_CHANNELS_FILE = DATA_DIR / "auto_forward_channels.json"
 BOT_STARTED_AT = time.time()
 
 FIELDS = {
@@ -1387,8 +1392,9 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
         uptime = max(0, int(time.time() - BOT_STARTED_AT))
         await query.message.reply_text(f"🤖 وضعیت اجرا: فعال\n📦 نسخه: {VERSION}\n⏱ زمان فعالیت این اجرا: {uptime // 3600} ساعت و {(uptime % 3600) // 60} دقیقه\n👥 ادمین‌های پنل: {len(managed_admin_ids())}")
     elif data == "admin:channels":
-        ch1 = get_af_channel(context, "1")
-        ch2 = get_af_channel(context, "2")
+        uid = query.from_user.id if query.from_user else None
+        ch1 = get_af_channel(context, "1", uid)
+        ch2 = get_af_channel(context, "2", uid)
         def fmt(ch):
             return f"تنظیم‌شده: {ch.get('title') or ch.get('chat_id')} ({ch.get('chat_id')})" if ch else "تنظیم نشده"
         await query.message.reply_text("📢 وضعیت کانال‌ها\n\nMain: " + fmt(ch1) + "\nFull Archive: " + fmt(ch2) + "\n\nبرای تغییر: /setchannel1 و /setchannel2")
@@ -1495,9 +1501,10 @@ async def setchannel1_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["waiting"] = "set_auto_forward_channel:1"
     await update.message.reply_text(
         "📢 تنظیم کانال اصلی (Main Channel)\n\n"
-        "آیدی عددی یا یوزرنیم کانال را بفرست (مثلاً `@MyChannel` یا `-100xxxxxxxxxx`).\n"
-        "ربات باید ادمین کانال باشد و اجازه ارسال پیام داشته باشد.\n"
-        "هیچ پیام آزمایشی در کانال ارسال نمی‌شود."
+        "برای انتخاب راحت، دکمه زیر را بزن و کانالت را از فهرست تلگرام انتخاب کن.\n"
+        "اگر خواستی، هنوز هم می‌توانی آیدی عددی یا یوزرنیم را دستی بفرستی.\n"
+        "ربات باید در کانال ادمین و دارای مجوز Post Messages باشد.",
+        reply_markup=channel_picker_keyboard("1"),
     )
 
 
@@ -1509,15 +1516,17 @@ async def setchannel2_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["waiting"] = "set_auto_forward_channel:2"
     await update.message.reply_text(
         "📢 تنظیم کانال Full Archive\n\n"
-        "آیدی عددی یا یوزرنیم کانال را بفرست (مثلاً `@MyChannel` یا `-100xxxxxxxxxx`).\n"
-        "ربات باید ادمین کانال باشد و اجازه ارسال پیام داشته باشد.\n"
-        "هیچ پیام آزمایشی در کانال ارسال نمی‌شود."
+        "برای انتخاب راحت، دکمه زیر را بزن و کانالت را از فهرست تلگرام انتخاب کن.\n"
+        "اگر خواستی، هنوز هم می‌توانی آیدی عددی یا یوزرنیم را دستی بفرستی.\n"
+        "ربات باید در کانال ادمین و دارای مجوز Post Messages باشد.",
+        reply_markup=channel_picker_keyboard("2"),
     )
 
 
 async def channelstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ch1 = get_af_channel(context, "1")
-    ch2 = get_af_channel(context, "2")
+    uid = update.effective_user.id if update.effective_user else None
+    ch1 = get_af_channel(context, "1", uid)
+    ch2 = get_af_channel(context, "2", uid)
     lines = ["📢 وضعیت کانال‌های Auto Forward\n"]
     if ch1:
         lines.append(f"۱) Main: `{ch1['chat_id']}` — {escape_md(ch1.get('title') or '—')}")
@@ -1527,7 +1536,7 @@ async def channelstatus_command(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append(f"۲) Full Archive: `{ch2['chat_id']}` — {escape_md(ch2.get('title') or '—')}")
     else:
         lines.append("۲) Full Archive: تنظیم نشده (/setchannel2)")
-    lines.append("\nاین تنظیمات فقط در حافظه‌اند و با ریستارت پاک می‌شوند.")
+    lines.append("\nتنظیمات هر کاربر جداگانه و در فایل پایدار ذخیره می‌شوند.")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -3090,6 +3099,10 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان و ساخت خلاصه", callback_data="summary:finish")]])
         )
         return
+    if text == "❌ لغو" and isinstance(context.user_data.get("waiting"), str) and context.user_data.get("waiting", "").startswith("set_auto_forward_channel"):
+        context.user_data["waiting"] = None
+        await update.message.reply_text("عملیات انتخاب کانال لغو شد.", reply_markup=ReplyKeyboardRemove())
+        return
     if text == "❌ لغو / خروج از آلبوم":
         await cancel(update, context)
         return
@@ -3155,19 +3168,19 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         title = getattr(chat, "title", None) or getattr(chat, "username", "") or str(chat.id)
-        set_af_channel(context, slot, chat.id, title)
-        actor = update.effective_user.id if update.effective_user else "unknown"
+        uid = update.effective_user.id if update.effective_user else None
+        set_af_channel(context, slot, chat.id, title, uid)
+        actor = uid if uid is not None else "unknown"
         log_admin_activity(f"SET_CHANNEL slot={slot} chat_id={chat.id} actor={actor}")
-        if slot == "1":
-            set_af_destination(context, chat.id, title)
         context.user_data["waiting"] = None
         slot_name = "Main Channel" if slot == "1" else "Full Archive"
         await update.message.reply_text(
             f"✅ کانال {slot_name} تنظیم شد.\n"
             f"• عنوان: {title}\n"
             f"• شناسه: `{chat.id}`\n\n"
-            "این تنظیم فقط در حافظه است و با ریستارت ربات پاک می‌شود.",
+            "این تنظیم فقط برای حساب تلگرامی خودت ذخیره شد و پس از ری‌استارت هم باقی می‌ماند.",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove(),
         )
         return
 
@@ -4996,7 +5009,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith("autofw:single") or data.startswith("autofw:archive"):
             parts = data.split(":")
             slot = parts[2] if len(parts) >= 3 else "1"
-            ch = get_af_channel(context, slot)
+            ch = get_af_channel(context, slot, uid)
             if not ch:
                 await query.message.reply_text(
                     f"کانال مقصد {slot} تنظیم نشده است.\nمالک ربات باید با /setchannel{slot} آن را تنظیم کند."
@@ -5025,7 +5038,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cover=info.get("cover"),
             )
             _set_status_for_slot(info, slot, status)
-            label = af_channel_label(context, slot)
+            label = af_channel_label(context, slot, uid)
             if status == "sent":
                 extra = " (به‌صورت Document)" if detail == "document" else ""
                 await query.message.reply_text(f"✅ با موفقیت به «{label}» ارسال شد{extra}.")
@@ -5087,7 +5100,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("autofw:album_slot:"):
             slot = data.split(":")[2]
-            if not get_af_channel(context, slot):
+            if not get_af_channel(context, slot, uid):
                 await query.message.reply_text(
                     f"کانال {slot} تنظیم نشده. مالک ربات باید /setchannel{slot} را اجرا کند."
                 )
@@ -5096,7 +5109,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["af_album_slot"] = slot
             try:
                 await safe_edit_message_text(query.message, 
-                    f"انتخاب ترک برای ارسال به «{af_channel_label(context, slot)}»:",
+                    f"انتخاب ترک برای ارسال به «{af_channel_label(context, slot, uid)}»:",
                     reply_markup=af_album_keyboard(tracks, slot),
                 )
             except TelegramError:
@@ -5119,7 +5132,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if data.startswith("autofw:album_send:") or data.startswith("autofw:album_retry:"):
             slot = data.split(":")[2]
-            ch = get_af_channel(context, slot)
+            ch = get_af_channel(context, slot, uid)
             if not ch:
                 await query.message.reply_text(
                     f"کانال مقصد {slot} تنظیم نشده است.\nمالک ربات باید با /setchannel{slot} آن را تنظیم کند."
@@ -5182,7 +5195,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.message.edit_reply_markup(reply_markup=af_album_keyboard(tracks, slot))
             except TelegramError:
                 pass
-            label = af_channel_label(context, slot)
+            label = af_channel_label(context, slot, uid)
             parts = [f"✅ موفق: {sent_n}", f"❌ ناموفق: {failed_n}"]
             if unknown_n:
                 parts.append(f"❓ نامشخص: {unknown_n}")
@@ -5787,11 +5800,11 @@ async def _save_album_all_body(query, context, tracks, main_artists):
     context.user_data["editing_album_track"] = False
     uid = query.from_user.id if query.from_user else None
     if af_tracks and can_auto_forward(uid):
-        slot = "1" if get_af_channel(context, "1") else ("2" if get_af_channel(context, "2") else None)
+        slot = "1" if get_af_channel(context, "1", uid) else ("2" if get_af_channel(context, "2", uid) else None)
         if slot:
             await query.message.reply_text(
                 f"✅ همه ترک‌های آلبوم ارسال شدند ({len(af_tracks)} ترک).\n"
-                f"ترک‌های موردنظر را برای «{af_channel_label(context, slot)}» انتخاب کن:",
+                f"ترک‌های موردنظر را برای «{af_channel_label(context, slot, uid)}» انتخاب کن:",
                 reply_markup=af_album_keyboard(af_tracks, slot),
             )
         else:
@@ -5833,46 +5846,133 @@ def can_auto_forward(user_id: Optional[int]) -> bool:
     return uid in ADMIN_IDS or uid in managed_admin_ids()
 
 
-def _af_channels(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    return context.application.bot_data.setdefault("auto_forward_channels", {})
+def load_af_channels_data() -> dict:
+    """Load per-Telegram-user Auto Forward destinations from persistent JSON."""
+    ensure_data_dir()
+    try:
+        data = json.loads(AF_CHANNELS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
 
 
-def get_af_channel(context: ContextTypes.DEFAULT_TYPE, slot: str):
-    """slot is '1' (main) or '2' (full archive). Returns dict or None."""
-    ch = _af_channels(context).get(str(slot))
+def save_af_channels_data(data: dict):
+    """Atomically persist all users' Auto Forward channel settings."""
+    ensure_data_dir()
+    tmp = AF_CHANNELS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, AF_CHANNELS_FILE)
+
+
+def _af_channels(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int]) -> dict:
+    if not user_id:
+        return {}
+    all_channels = context.application.bot_data.setdefault("auto_forward_channels_cache", None)
+    if all_channels is None:
+        all_channels = load_af_channels_data()
+        context.application.bot_data["auto_forward_channels_cache"] = all_channels
+    return all_channels.setdefault(str(int(user_id)), {})
+
+
+def get_af_channel(context: ContextTypes.DEFAULT_TYPE, slot: str, user_id: Optional[int] = None):
+    """Return this Telegram user's configured channel for slot 1 or 2."""
+    ch = _af_channels(context, user_id).get(str(slot))
     return ch if ch and ch.get("chat_id") else None
 
 
-def set_af_channel(context: ContextTypes.DEFAULT_TYPE, slot: str, chat_id, title: str = ""):
-    channels = _af_channels(context)
-    channels[str(slot)] = {"chat_id": chat_id, "title": title or str(chat_id)}
+def set_af_channel(context: ContextTypes.DEFAULT_TYPE, slot: str, chat_id, title: str = "", user_id: Optional[int] = None):
+    if not user_id:
+        raise ValueError("user_id is required for per-user Auto Forward settings")
+    all_channels = context.application.bot_data.setdefault("auto_forward_channels_cache", None)
+    if all_channels is None:
+        all_channels = load_af_channels_data()
+        context.application.bot_data["auto_forward_channels_cache"] = all_channels
+    user_channels = all_channels.setdefault(str(int(user_id)), {})
+    user_channels[str(slot)] = {"chat_id": int(chat_id), "title": title or str(chat_id)}
+    save_af_channels_data(all_channels)
 
 
-def af_channel_label(context: ContextTypes.DEFAULT_TYPE, slot: str) -> str:
-    ch = get_af_channel(context, slot)
+def af_channel_label(context: ContextTypes.DEFAULT_TYPE, slot: str, user_id: Optional[int] = None) -> str:
+    ch = get_af_channel(context, slot, user_id)
     if not ch:
         return "Main Channel" if str(slot) == "1" else "Full Archive"
     return ch.get("title") or ("Main Channel" if str(slot) == "1" else "Full Archive")
 
 
-# Backward-compat helpers used by older call sites
-def get_af_chat_id(context: ContextTypes.DEFAULT_TYPE):
-    ch = get_af_channel(context, "1")
-    return ch["chat_id"] if ch else context.application.bot_data.get("auto_forward_chat_id")
+def channel_picker_keyboard(slot: str) -> ReplyKeyboardMarkup:
+    """Show Telegram's native channel picker, with manual ID as a fallback."""
+    request = KeyboardButtonRequestChat(
+        request_id=int(slot),
+        chat_is_channel=True,
+        user_administrator_rights=ChatAdministratorRights(can_post_messages=True),
+        request_title=True,
+        request_username=True,
+    )
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📂 انتخاب کانال از تلگرام", request_chat=request)],
+         [KeyboardButton("❌ لغو")]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 
-def get_af_chat_title(context: ContextTypes.DEFAULT_TYPE) -> str:
-    ch = get_af_channel(context, "1")
-    if ch:
-        return ch.get("title") or ""
-    return context.application.bot_data.get("auto_forward_chat_title") or ""
+async def receive_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    shared = message.chat_shared if message else None
+    if not shared or not user:
+        return
+    waiting = context.user_data.get("waiting")
+    if not (isinstance(waiting, str) and waiting.startswith("set_auto_forward_channel:")):
+        return
+    if not can_auto_forward(user.id):
+        context.user_data["waiting"] = None
+        await message.reply_text("🔒 اجازه تنظیم کانال Auto Forward را نداری.", reply_markup=ReplyKeyboardRemove())
+        return
+    try:
+        slot = waiting.rsplit(":", 1)[1]
+        if str(shared.request_id) != str(int(slot)):
+            await message.reply_text("درخواست انتخاب کانال با مرحله فعلی هماهنگ نیست. دوباره دستور تنظیم کانال را اجرا کن.")
+            return
+        chat = await context.bot.get_chat(shared.chat_id)
+        me = await context.bot.get_me()
+        member = await context.bot.get_chat_member(chat.id, me.id)
+        status = getattr(member, "status", None)
+        if status not in ("administrator", "creator"):
+            await message.reply_text("❌ ربات در این کانال ادمین نیست. ابتدا ربات را ادمین کن و دوباره کانال را انتخاب کن.")
+            return
+        if status == "administrator" and not bool(getattr(member, "can_post_messages", False)):
+            await message.reply_text("❌ مجوز Post Messages برای ربات فعال نیست. این مجوز را فعال کن و دوباره انتخاب کن.")
+            return
+        title = getattr(shared, "title", None) or getattr(chat, "title", None) or str(chat.id)
+        set_af_channel(context, slot, chat.id, title, user.id)
+        context.user_data["waiting"] = None
+        log_admin_activity(f"SET_CHANNEL slot={slot} chat_id={chat.id} actor={user.id} via=chat_picker")
+        slot_name = "Main Channel" if slot == "1" else "Full Archive"
+        await message.reply_text(
+            f"✅ کانال {slot_name} تنظیم شد.\n• عنوان: {title}\n• شناسه: `{chat.id}`\n\nاین تنظیم فقط برای حساب خودت ذخیره شد و پس از ری‌استارت باقی می‌ماند.",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    except TelegramError as exc:
+        await message.reply_text(
+            f"❌ نتوانستم کانال انتخاب‌شده را تأیید کنم.\n{exc}\n\nمطمئن شو ربات ادمین کانال و دارای مجوز Post Messages است.",
+        )
 
 
-def set_af_destination(context: ContextTypes.DEFAULT_TYPE, chat_id, title: str = ""):
-    set_af_channel(context, "1", chat_id, title)
-    context.application.bot_data["auto_forward_chat_id"] = chat_id
-    context.application.bot_data["auto_forward_chat_title"] = title or str(chat_id)
+# Backward-compat helpers now remain user-scoped.
+def get_af_chat_id(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None):
+    ch = get_af_channel(context, "1", user_id)
+    return ch["chat_id"] if ch else None
 
+
+def get_af_chat_title(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None) -> str:
+    ch = get_af_channel(context, "1", user_id)
+    return ch.get("title") or "" if ch else ""
+
+
+def set_af_destination(context: ContextTypes.DEFAULT_TYPE, chat_id, title: str = "", user_id: Optional[int] = None):
+    set_af_channel(context, "1", chat_id, title, user_id)
 
 def _is_audio_media_error(exc: BaseException) -> bool:
     """True only for errors that clearly relate to sending as Telegram Audio."""
@@ -6006,16 +6106,16 @@ def af_single_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int
     if user_id is not None and not can_auto_forward(user_id):
         return None
     rows = []
-    ch1 = get_af_channel(context, "1")
-    ch2 = get_af_channel(context, "2")
+    ch1 = get_af_channel(context, "1", user_id)
+    ch2 = get_af_channel(context, "2", user_id)
     if ch1:
         rows.append([InlineKeyboardButton(
-            f"🚀 AF — {af_channel_label(context, '1')[:40]}",
+            f"🚀 AF — {af_channel_label(context, '1', user_id)[:40]}",
             callback_data="autofw:single:1",
         )])
     if ch2:
         rows.append([InlineKeyboardButton(
-            f"🚀 AF — {af_channel_label(context, '2')[:40]}",
+            f"🚀 AF — {af_channel_label(context, '2', user_id)[:40]}",
             callback_data="autofw:single:2",
         )])
     if not rows:
@@ -6026,16 +6126,16 @@ def af_single_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int
 def af_archive_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     rows = []
     if user_id is None or can_auto_forward(user_id):
-        ch1 = get_af_channel(context, "1")
-        ch2 = get_af_channel(context, "2")
+        ch1 = get_af_channel(context, "1", user_id)
+        ch2 = get_af_channel(context, "2", user_id)
         if ch1:
             rows.append([InlineKeyboardButton(
-                f"🚀 AF — {af_channel_label(context, '1')[:40]}",
+                f"🚀 AF — {af_channel_label(context, '1', user_id)[:40]}",
                 callback_data="autofw:archive:1",
             )])
         if ch2:
             rows.append([InlineKeyboardButton(
-                f"🚀 AF — {af_channel_label(context, '2')[:40]}",
+                f"🚀 AF — {af_channel_label(context, '2', user_id)[:40]}",
                 callback_data="autofw:archive:2",
             )])
     rows.extend([
@@ -6188,8 +6288,8 @@ def main():
             BotCommand("tag", "⚙️ تنظیم تگ‌های پیش‌فرض"),
             BotCommand("version", "ℹ️ نمایش نسخهٔ ربات"),
             BotCommand("unreleasedcover", "🖼️ مدیریت کاور Unreleased Track"),
-            BotCommand("setchannel1", "📢 تنظیم کانال اصلی AF (فقط مالک)"),
-            BotCommand("setchannel2", "📢 تنظیم کانال Full Archive AF (فقط مالک)"),
+            BotCommand("setchannel1", "📢 تنظیم کانال اصلی AF"),
+            BotCommand("setchannel2", "📢 تنظیم کانال Full Archive AF"),
             BotCommand("channelstatus", "ℹ️ وضعیت کانال‌های Auto Forward"),
             BotCommand("cancel", "❌ لغو عملیات فعلی"),
         ])
@@ -6233,6 +6333,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED, receive_chat_shared))
 
     app.add_handler(
         MessageHandler(

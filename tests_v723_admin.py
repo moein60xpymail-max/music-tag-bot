@@ -1,10 +1,10 @@
-"""Static regression checks for v7.2.3 owner/admin panel."""
+"""Static regression checks for v7.2.4 owner/admin panel."""
 from pathlib import Path
 
 SOURCE = Path(__file__).with_name("bot.py").read_text(encoding="utf-8")
 
 def test_version_and_owner_panel():
-    assert 'VERSION = "v7.2.3"' in SOURCE
+    assert 'VERSION = "v7.2.4"' in SOURCE
     assert 'CommandHandler("admin", admin_command)' in SOURCE
     assert 'if not is_owner(user.id if user else None)' in SOURCE
 
