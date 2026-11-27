@@ -16,6 +16,7 @@ from audio_scanner import (
 )
 from typing import Dict, List, Optional, Any
 import self_scan
+import channel_repo
 from io import BytesIO
 
 from PIL import Image
@@ -234,30 +235,16 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v7.2.5"
+VERSION = "v8.0.0"
 VERSION_CHANGES = [
-    "اصلاح دستورهای تنظیم کانال و نمایش مطمئن دکمه انتخاب کانال در صفحه‌کلید پایین تلگرام",
-    "انتخاب‌گر رسمی کانال تلگرام بدون ساخت ChatAdministratorRights ناقص و خطاساز",
-    "پنل مالک /admin با افزودن و حذف ادمین Auto Forward از طریق یوزرنیم",
-    "ذخیره مستقل و پایدار کانال‌های Auto Forward برای هر کاربر",
-    "انتخاب کانال از فهرست رسمی تلگرام به‌جای ورود اجباری آیدی",
-    "نمایش وضعیت ربات، کانال‌ها، فضای ذخیره‌سازی، خطاها و فعالیت‌های مدیریتی",
-    "ذخیره پایدار فهرست ادمین‌ها و محدودسازی پنل مدیریت به مالک اصلی",
-    "رفع Album Mode: دریافت فایل پس از نام آلبوم + اولویت‌بندی هندلرها",
-    "بازخورد صریح برای هر ترک آلبوم و دکمه Finish از ابتدا",
-    "رفع دکمه بستن آرشیو + پاک‌سازی پیام/نشست منوهای اضافه",
-    "مدیریت نتایج Self-Scan: انتخاب Keep/Drop بدون حذف تلگرام",
-    "گزارش سلامت آرشیو (Health Check) روی متادیتا",
-    "خروجی فهرست تمیز پس از تصمیم‌گیری Self-Scan",
-    "Archive Self-Scan: تشخیص تکراری داخل یک آرشیو واحد (بدون حذف خودکار)",
-    "رفع مسدود شدن همه دکمه‌ها به‌خاطر شرط archive",
-    "اصلاح callbackهای آرشیو که داخل ascan گیر کرده بودند",
-    "Dockerfile با chromaprint-tools (fpcalc) برای EthioDeploy",
-    "حذف خودکار Duplicate قطعی با اولویت Source A بر B",
-    "Audio Scanner مرکز واحد تحلیل؛ حذف دکمه «تحلیل و ساخت فهرست»",
-    "UI ساده‌شده Scanner: اسکن، نیازمند بررسی، خروجی فهرست",
-    "خروجی archive-v1 سازگار با ورودی بررسی منابع",
-    "اصلاح متن راهنمای منوی آرشیو",
+    "سیستم مخزن کانال‌ها: Source A، Source B و Destination با انتخاب‌گر رسمی تلگرام",
+    "ذخیره متادیتای آهنگ‌های کانال در SQLite بدون دانلود دائمی روی هاست",
+    "تطبیق فهرست TXT با مخزن کانال و کپی مستقیم از کانال برای ادیت",
+    "دکمه «🎧 دریافت آهنگ برای ادیت» به‌جای فوروارد دستی از کاربر",
+    "ارسال خروجی ادیت‌شده به کانال Destination با وضعیت completed",
+    "پایداری صف پردازش پس از Restart ربات",
+    "حفظ کامل Single/Album/Archive Mode و Audio Scanner و Auto Forward",
+    "اصلاح /version برای نمایش فقط تغییرات نسخه فعلی",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 ADMIN_REGISTRY_FILE = DATA_DIR / "admin_registry.json"
@@ -338,6 +325,10 @@ DEFAULT_FIELD_ORDER = [
 # ==================== ذخیره پیش‌فرض‌ها ====================
 def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        channel_repo.init_db(DATA_DIR)
+    except Exception as exc:
+        print(f"channel_repo init error: {exc!r}")
 
 
 _AUDIO_SCANNER_STORE = None
@@ -1671,6 +1662,7 @@ def export_source_txt(archive: dict, source_key: str) -> bytes:
 def archive_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📥 دریافت Source A / B", callback_data="arch:review_menu")],
+        [InlineKeyboardButton("🗂 مخزن کانال‌ها", callback_data="repo:menu")],
         [InlineKeyboardButton("🎧 Audio Scanner (A/B)", callback_data="ascan:menu")],
         [InlineKeyboardButton("🔍 Archive Self-Scan", callback_data="sscan:menu")],
         [InlineKeyboardButton("🩺 سلامت منابع A/B", callback_data="arch:health")],
@@ -2250,13 +2242,52 @@ def archive_source_keyboard(source):
     label = "A" if source == "source_a" else "B"
     return InlineKeyboardMarkup([[InlineKeyboardButton(f"پایان منبع {label}", callback_data=f"arch:finish_{label.lower()}")]])
 
-def archive_track_keyboard():
-    return InlineKeyboardMarkup([
+def archive_track_keyboard(item: Optional[dict] = None):
+    """Keyboard shown while a queue track is active.
+
+    Includes repository fetch button when a repo match is available or possible.
+    """
+    rows = [
+        [InlineKeyboardButton("🎧 دریافت آهنگ برای ادیت", callback_data="repo:fetch_current")],
+    ]
+    title = ""
+    if item:
+        title = (item.get("title") or Path(item.get("name") or "").stem or "")[:55]
+    if title:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"📋 {title}" if title else "📋 کپی عنوان آهنگ",
+                copy_text=CopyTextButton(text=title or ""),
+            )
+        ])
+    rows.extend([
         [InlineKeyboardButton("✅ این آهنگ تموم شد", callback_data="arch:finish_current")],
         [InlineKeyboardButton("⏭ آهنگ بعدی", callback_data="arch:next")],
         [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
         [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
     ])
+    return InlineKeyboardMarkup(rows)
+
+
+def archive_track_prompt_text(idx: int, queue: list, item: dict) -> str:
+    title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
+    artist = (item.get("artist") or "هنرمند نامشخص").strip()
+    warning = format_review_warning(item, queue) if "format_review_warning" in globals() else ""
+    progress = ((idx + 1) / len(queue) * 100) if queue else 0
+    conf = (item.get("repo_ref") or {}).get("confidence") or item.get("match_confidence") or ""
+    repo_line = ""
+    if conf in ("exact", "high"):
+        repo_line = "\n✅ تطبیق با مخزن کانال پیدا شد — از دکمه دریافت استفاده کن."
+    elif conf == "ambiguous":
+        repo_line = "\n⚠️ چند نتیجه مشابه در مخزن؛ انتخاب خودکار انجام نشد."
+    elif conf == "none":
+        repo_line = "\nℹ️ در مخزن پیدا نشد؛ در صورت نیاز فایل را دستی فوروارد کن."
+    return (
+        f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\n"
+        f"عنوان: {title}\nهنرمند: {artist}{warning}{repo_line}\n\n"
+        "با دکمه «🎧 دریافت آهنگ برای ادیت» فایل را از مخزن بگیر، "
+        "یا فایل را دستی فوروارد کن."
+    )
 
 
 def archive_report_text(queue):
@@ -3110,7 +3141,10 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ پایان و ساخت خلاصه", callback_data="summary:finish")]])
         )
         return
-    if text == "❌ لغو" and isinstance(context.user_data.get("waiting"), str) and context.user_data.get("waiting", "").startswith("set_auto_forward_channel"):
+    if text == "❌ لغو" and isinstance(context.user_data.get("waiting"), str) and (
+        context.user_data.get("waiting", "").startswith("set_auto_forward_channel")
+        or context.user_data.get("waiting", "").startswith("set_repo_channel")
+    ):
         context.user_data["waiting"] = None
         await update.message.reply_text("عملیات انتخاب کانال لغو شد.", reply_markup=ReplyKeyboardRemove())
         return
@@ -3133,6 +3167,40 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await clear_active_prompt(update, context)
     value = text
+
+    # ---------- Repo channel manual ID fallback ----------
+    if isinstance(waiting, str) and waiting.startswith("set_repo_channel:"):
+        user = update.effective_user
+        slot = waiting.rsplit(":", 1)[1]
+        raw = value.strip()
+        if not raw:
+            await send_temporary_prompt(update.message, context, "آیدی یا یوزرنیم کانال را بفرست.")
+            return
+        target = raw if raw.startswith("@") or raw.lstrip("-").isdigit() else f"@{raw}"
+        try:
+            chat = await context.bot.get_chat(target)
+            me = await context.bot.get_me()
+            member = await context.bot.get_chat_member(chat.id, me.id)
+            status = getattr(member, "status", None)
+            if status not in ("administrator", "creator"):
+                await update.message.reply_text("❌ ربات در این کانال ادمین نیست.")
+                return
+            title = getattr(chat, "title", None) or str(chat.id)
+            username = getattr(chat, "username", None) or ""
+            channel_repo.set_repo_channel(DATA_DIR, user.id, slot, chat.id, title, username)
+            context.user_data["waiting"] = None
+            names = {"source_a": "Source A", "source_b": "Source B", "dest": "Destination"}
+            await update.message.reply_text(
+                f"✅ کانال {names.get(slot, slot)} تنظیم شد.\n• عنوان: {title}\n• شناسه: `{chat.id}`",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await update.message.reply_text("🗂 منوی مخزن کانال‌ها", reply_markup=repo_menu_keyboard(user.id))
+        except TelegramError as e:
+            await update.message.reply_text(
+                f"❌ کانال پیدا نشد یا ربات به آن دسترسی ندارد.\n{e}\n\nدوباره بفرست یا /cancel بزن."
+            )
+        return
 
     # ---------- Auto Forward: set destination channel (owner or managed admin) ----------
     if isinstance(waiting, str) and waiting.startswith("set_auto_forward_channel"):
@@ -3223,22 +3291,37 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         item = queue[idx]
         item["status"] = "in_progress"
+        # Try match against channel repository
+        try:
+            uid = update.effective_user.id if update.effective_user else 0
+            match, conf = channel_repo.match_track(
+                DATA_DIR, uid,
+                title=item.get("title") or "",
+                artist=item.get("artist") or "",
+                file_name=item.get("name") or item.get("file_name") or "",
+                duration=int(item.get("duration") or 0),
+            )
+            item["match_confidence"] = conf
+            if match and conf in ("exact", "high"):
+                item["repo_ref"] = {
+                    "chat_id": match["chat_id"],
+                    "message_id": match["message_id"],
+                    "file_id": match.get("file_id"),
+                    "repo_id": match.get("id"),
+                    "confidence": conf,
+                }
+        except Exception as exc:
+            print(f"repo match error: {exc!r}")
         context.user_data.update({"archive_current": idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
-        title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
-        artist = (item.get("artist") or "هنرمند نامشخص").strip()
-        warning = format_review_warning(item, queue)
-        progress = ((idx + 1) / len(queue) * 100) if queue else 0
-        title_button = InlineKeyboardButton(
-            text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),
-            copy_text=CopyTextButton(text=title or ""),
-        )
+        try:
+            channel_repo.save_queue_state(DATA_DIR, uid, {
+                "queue": queue, "cursor": idx, "archive_current": idx,
+            })
+        except Exception:
+            pass
         await update.message.reply_text(
-            f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
-            reply_markup=InlineKeyboardMarkup([
-                [title_button],
-                [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
-                [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
-            ]),
+            archive_track_prompt_text(idx, queue, item),
+            reply_markup=archive_track_keyboard(item),
         )
         return
 
@@ -4067,6 +4150,110 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         return  # end ascan:* handlers
+
+    # ---------- Channel Repository (repo:*) ----------
+    if isinstance(data, str) and data.startswith("repo:"):
+        user = query.from_user
+        uid = user.id if user else 0
+        if data == "repo:menu":
+            text = (
+                "🗂 مخزن کانال‌ها\n\n"
+                "کانال‌های Source A و Source B نقش مخزن فایل صوتی را دارند.\n"
+                "آهنگ‌ها را به آن کانال‌ها بفرست؛ ربات فقط متادیتا و شناسه پیام را ذخیره می‌کند.\n"
+                "خروجی ادیت‌شده به کانال Destination ارسال می‌شود.\n"
+                "این تنظیمات جدا از Auto Forward هستند."
+            )
+            try:
+                await safe_edit_message_text(query.message, text, reply_markup=repo_menu_keyboard(uid))
+            except Exception:
+                await query.message.reply_text(text, reply_markup=repo_menu_keyboard(uid))
+            return
+        if data.startswith("repo:set:"):
+            slot = data.split(":", 2)[2]
+            if slot not in ("source_a", "source_b", "dest"):
+                await query.answer("اسلات نامعتبر")
+                return
+            await query.answer()
+            await _start_repo_channel_setup(update, context, slot)
+            return
+        if data == "repo:check_access":
+            lines = ["🔍 بررسی دسترسی ربات به کانال‌های مخزن:\n"]
+            for slot, name in (("source_a", "Source A"), ("source_b", "Source B"), ("dest", "Destination")):
+                ch = channel_repo.get_repo_channel(DATA_DIR, uid, slot)
+                if not ch:
+                    lines.append(f"• {name}: تنظیم نشده")
+                    continue
+                try:
+                    me = await context.bot.get_me()
+                    member = await context.bot.get_chat_member(ch["chat_id"], me.id)
+                    st = getattr(member, "status", "?")
+                    can_post = bool(getattr(member, "can_post_messages", st == "creator"))
+                    lines.append(f"• {name}: {ch.get('title') or ch['chat_id']} — وضعیت={st} post={can_post}")
+                except Exception as exc:
+                    lines.append(f"• {name}: خطا — {exc}")
+            await query.message.reply_text("\n".join(lines), reply_markup=repo_menu_keyboard(uid))
+            return
+        if data == "repo:stats":
+            na = channel_repo.count_tracks(DATA_DIR, uid, "source_a")
+            nb = channel_repo.count_tracks(DATA_DIR, uid, "source_b")
+            await query.message.reply_text(
+                f"📊 آمار مخزن\n• Source A: {na} آهنگ\n• Source B: {nb} آهنگ\n• مجموع: {na + nb}",
+                reply_markup=repo_menu_keyboard(uid),
+            )
+            return
+        if data == "repo:fetch_current":
+            # Copy current queue track from repository channel to user for editing
+            a = context.user_data.get("archive") or {}
+            queue = a.get("queue") or []
+            idx = context.user_data.get("archive_current")
+            if not isinstance(idx, int) or not (0 <= idx < len(queue)):
+                await query.answer("ترک فعلی مشخص نیست", show_alert=True)
+                return
+            item = queue[idx]
+            repo_ref = item.get("repo_ref")
+            if not repo_ref:
+                # Try live match
+                match, conf = channel_repo.match_track(
+                    DATA_DIR, uid,
+                    title=item.get("title") or "",
+                    artist=item.get("artist") or "",
+                    file_name=item.get("name") or item.get("file_name") or "",
+                    duration=int(item.get("duration") or 0),
+                )
+                if match and conf in ("exact", "high"):
+                    repo_ref = {
+                        "chat_id": match["chat_id"],
+                        "message_id": match["message_id"],
+                        "file_id": match.get("file_id"),
+                        "repo_id": match.get("id"),
+                        "confidence": conf,
+                    }
+                    item["repo_ref"] = repo_ref
+                else:
+                    await query.answer(
+                        "آهنگ در مخزن پیدا نشد یا چند نتیجه مشابه وجود دارد. فایل را دستی فوروارد کن.",
+                        show_alert=True,
+                    )
+                    return
+            try:
+                await context.bot.copy_message(
+                    chat_id=query.message.chat_id,
+                    from_chat_id=repo_ref["chat_id"],
+                    message_id=repo_ref["message_id"],
+                )
+                item["status"] = "in_progress"
+                context.user_data["waiting"] = "archive_track"
+                await query.answer("آهنگ از مخزن ارسال شد")
+                await query.message.reply_text(
+                    "✅ فایل از مخزن کانال کپی شد.\n"
+                    "اگر نیاز به ادیت تگ داری، همین فایل را دوباره به ربات بفرست یا از حالت ادیت استفاده کن.\n"
+                    "پس از اتمام ادیت، خروجی به کانال Destination ارسال می‌شود."
+                )
+            except TelegramError as exc:
+                await query.answer(f"خطا در کپی: {exc}", show_alert=True)
+            return
+        return  # end repo:*
+
     # ---------- Archive Mode callbacks (only for arch:* data) ----------
     if isinstance(data, str) and data.startswith("arch:"):
         a = context.user_data.get("archive")
@@ -4304,18 +4491,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 queue[idx]["status"] = "pending"
             item["status"] = "in_progress"
             context.user_data.update({"archive_current": prev_idx, "waiting": "archive_track", "album_mode": False, "editing_album_track": False})
-            title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
-            artist = (item.get("artist") or "هنرمند نامشخص").strip()
-            warning = format_review_warning(item, queue)
-            progress = ((prev_idx + 1) / len(queue) * 100) if queue else 0
-            title_button = InlineKeyboardButton(text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"), copy_text=CopyTextButton(text=title or ""))
             await query.message.reply_text(
-                f"🎵 ترک {prev_idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
-                reply_markup=InlineKeyboardMarkup([
-                    [title_button],
-                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
-                    [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
-                ])
+                archive_track_prompt_text(prev_idx, queue, item),
+                reply_markup=archive_track_keyboard(item),
             )
             await query.message.reply_text("به آهنگ قبلی برگشتی.")
             return
@@ -4369,22 +4547,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             item = queue[idx]
             item["status"] = "in_progress"
+            # Match against repository
+            try:
+                uid = query.from_user.id if query.from_user else 0
+                match, conf = channel_repo.match_track(
+                    DATA_DIR, uid,
+                    title=item.get("title") or "",
+                    artist=item.get("artist") or "",
+                    file_name=item.get("name") or item.get("file_name") or "",
+                    duration=int(item.get("duration") or 0),
+                )
+                item["match_confidence"] = conf
+                if match and conf in ("exact", "high"):
+                    item["repo_ref"] = {
+                        "chat_id": match["chat_id"],
+                        "message_id": match["message_id"],
+                        "file_id": match.get("file_id"),
+                        "repo_id": match.get("id"),
+                        "confidence": conf,
+                    }
+                channel_repo.save_queue_state(DATA_DIR, uid, {
+                    "queue": queue, "cursor": idx, "archive_current": idx,
+                })
+            except Exception as exc:
+                print(f"repo match/open_next: {exc!r}")
             context.user_data.update({"archive_current":idx,"waiting":"archive_track","album_mode":False,"editing_album_track":False})
-            title = (item.get("title") or Path(item.get("name") or "بدون نام").stem).strip()
-            artist = (item.get("artist") or "هنرمند نامشخص").strip()
-            warning = format_review_warning(item, queue)
-            progress = ((idx + 1) / len(queue) * 100) if queue else 0
-            title_button = InlineKeyboardButton(
-                text=(f"📋 {title[:55]}" if title else "📋 کپی عنوان آهنگ"),
-                copy_text=CopyTextButton(text=title or ""),
-            )
             await query.message.reply_text(
-                f"🎵 ترک {idx+1:03d} از {len(queue)}  |  پیشرفت: {progress:.1f}%\nعنوان: {title}\nهنرمند: {artist}{warning}\n\nلطفاً فایل همین آهنگ را از منبع خودت فوروارد کن.",
-                reply_markup=InlineKeyboardMarkup([
-                    [title_button],
-                    [InlineKeyboardButton("⏮ آهنگ قبلی", callback_data="arch:previous")],
-                    [InlineKeyboardButton("⏩ رد کردن این آهنگ بدون ارسال فایل", callback_data="arch:skip_current")],
-                ]),
+                archive_track_prompt_text(idx, queue, item),
+                reply_markup=archive_track_keyboard(item),
             )
             return
         return
@@ -5910,6 +6100,11 @@ def af_channel_label(context: ContextTypes.DEFAULT_TYPE, slot: str, user_id: Opt
     return ch.get("title") or ("Main Channel" if str(slot) == "1" else "Full Archive")
 
 
+# request_id mapping for repo channel picker (avoids clash with AF 1/2)
+REPO_SLOT_REQUEST_IDS = {"source_a": 10, "source_b": 11, "dest": 12}
+REPO_REQUEST_ID_TO_SLOT = {v: k for k, v in REPO_SLOT_REQUEST_IDS.items()}
+
+
 def channel_picker_keyboard(slot: str) -> ReplyKeyboardMarkup:
     """Show a persistent bottom button that opens Telegram's native channel picker.
 
@@ -5918,8 +6113,13 @@ def channel_picker_keyboard(slot: str) -> ReplyKeyboardMarkup:
     constructor error previously prevented /setchannel1 and /setchannel2
     from sending any reply at all. The picker only needs the channel filter.
     """
+    # AF slots are "1"/"2"; repo slots use fixed request_ids 10/11/12
+    if slot in REPO_SLOT_REQUEST_IDS:
+        req_id = REPO_SLOT_REQUEST_IDS[slot]
+    else:
+        req_id = int(slot)
     request = KeyboardButtonRequestChat(
-        request_id=int(slot),
+        request_id=req_id,
         chat_is_channel=True,
         request_title=True,
         request_username=True,
@@ -5933,6 +6133,57 @@ def channel_picker_keyboard(slot: str) -> ReplyKeyboardMarkup:
     )
 
 
+def repo_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    a = channel_repo.get_repo_channel(DATA_DIR, user_id, "source_a")
+    b = channel_repo.get_repo_channel(DATA_DIR, user_id, "source_b")
+    d = channel_repo.get_repo_channel(DATA_DIR, user_id, "dest")
+    na = channel_repo.count_tracks(DATA_DIR, user_id, "source_a")
+    nb = channel_repo.count_tracks(DATA_DIR, user_id, "source_b")
+
+    def label(ch, name, count=None):
+        if ch:
+            t = (ch.get("title") or str(ch.get("chat_id")))[:28]
+            extra = f" ({count})" if count is not None else ""
+            return f"✅ {name}: {t}{extra}"
+        return f"➕ انتخاب {name}"
+
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label(a, "Source A", na), callback_data="repo:set:source_a")],
+        [InlineKeyboardButton(label(b, "Source B", nb), callback_data="repo:set:source_b")],
+        [InlineKeyboardButton(label(d, "Destination"), callback_data="repo:set:dest")],
+        [InlineKeyboardButton("🔄 بررسی دسترسی ربات", callback_data="repo:check_access")],
+        [InlineKeyboardButton("📊 آمار مخزن", callback_data="repo:stats")],
+        [InlineKeyboardButton("🔙 منوی آرشیو", callback_data="arch:menu")],
+    ])
+
+
+async def _start_repo_channel_setup(update, context, slot: str):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+    context.user_data["waiting"] = f"set_repo_channel:{slot}"
+    names = {"source_a": "Source A", "source_b": "Source B", "dest": "Destination Channel"}
+    slot_name = names.get(slot, slot)
+    try:
+        markup = channel_picker_keyboard(slot)
+        await message.reply_text(
+            f"📢 تنظیم {slot_name} (مخزن کانال‌ها)\n\n"
+            "دکمه «➕ افزودن کانال» پایین صفحه را لمس کن و کانال را از فهرست رسمی تلگرام انتخاب کن.\n"
+            "ربات باید در کانال ادمین باشد.\n"
+            "برای لغو ❌ لغو یا /cancel را بزن.",
+            reply_markup=markup,
+        )
+    except Exception as exc:
+        print(f"REPO_CHANNEL_PICKER_ERROR slot={slot}: {exc!r}")
+        await message.reply_text(
+            f"📢 تنظیم {slot_name}\n\n"
+            "دکمه انتخاب کانال قابل نمایش نیست. آیدی عددی کانال را همین‌جا بفرست.\n"
+            "برای لغو /cancel را بزن.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+
 async def receive_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
@@ -5940,6 +6191,42 @@ async def receive_chat_shared(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not shared or not user:
         return
     waiting = context.user_data.get("waiting")
+
+    # --- Repo channel picker ---
+    if isinstance(waiting, str) and waiting.startswith("set_repo_channel:"):
+        try:
+            slot = waiting.rsplit(":", 1)[1]
+            expected_rid = REPO_SLOT_REQUEST_IDS.get(slot)
+            if expected_rid is not None and int(shared.request_id) != int(expected_rid):
+                await message.reply_text("درخواست انتخاب کانال با مرحله فعلی هماهنگ نیست. دوباره از منوی مخزن انتخاب کن.")
+                return
+            chat = await context.bot.get_chat(shared.chat_id)
+            me = await context.bot.get_me()
+            member = await context.bot.get_chat_member(chat.id, me.id)
+            status = getattr(member, "status", None)
+            if status not in ("administrator", "creator"):
+                await message.reply_text("❌ ربات در این کانال ادمین نیست. ابتدا ربات را ادمین کن و دوباره انتخاب کن.")
+                return
+            title = getattr(shared, "title", None) or getattr(chat, "title", None) or str(chat.id)
+            username = getattr(chat, "username", None) or ""
+            channel_repo.set_repo_channel(DATA_DIR, user.id, slot, chat.id, title, username)
+            context.user_data["waiting"] = None
+            names = {"source_a": "Source A", "source_b": "Source B", "dest": "Destination"}
+            await message.reply_text(
+                f"✅ کانال {names.get(slot, slot)} تنظیم شد.\n"
+                f"• عنوان: {title}\n• شناسه: `{chat.id}`\n\n"
+                "تنظیمات مخزن جدا از Auto Forward ذخیره می‌شوند و پس از Restart باقی می‌مانند.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await message.reply_text("🗂 منوی مخزن کانال‌ها", reply_markup=repo_menu_keyboard(user.id))
+        except TelegramError as exc:
+            await message.reply_text(
+                f"❌ تأیید کانال ناموفق بود.\n{exc}\nمطمئن شو ربات ادمین کانال است."
+            )
+        return
+
+    # --- Auto Forward channel picker (unchanged behavior) ---
     if not (isinstance(waiting, str) and waiting.startswith("set_auto_forward_channel:")):
         return
     if not can_auto_forward(user.id):
@@ -6275,6 +6562,59 @@ async def membership_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raise ApplicationHandlerStop
 
 
+async def receive_channel_repo_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ingest audio posts from configured Source A / Source B repository channels.
+
+    Stores only Telegram references + metadata. Does not download audio to host.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    if not message or not chat or chat.type != "channel":
+        return
+    audio = message.audio or (message.document if message.document and is_audio_mime(getattr(message.document, "mime_type", None) or "") else None)
+    if not audio:
+        return
+    chat_id = chat.id
+    # Find which owners have this channel as source_a or source_b
+    all_ch = channel_repo.load_repo_channels(DATA_DIR)
+    matched_owners = []
+    for owner_str, slots in all_ch.items():
+        for slot_name in ("source_a", "source_b"):
+            ch = (slots or {}).get(slot_name)
+            if ch and int(ch.get("chat_id") or 0) == int(chat_id):
+                try:
+                    matched_owners.append((int(owner_str), slot_name))
+                except ValueError:
+                    pass
+    if not matched_owners:
+        return
+    file_id = getattr(audio, "file_id", "") or ""
+    file_unique_id = getattr(audio, "file_unique_id", "") or ""
+    file_name = getattr(audio, "file_name", None) or getattr(audio, "title", None) or ""
+    title = getattr(audio, "title", None) or ""
+    performer = getattr(audio, "performer", None) or ""
+    duration = int(getattr(audio, "duration", 0) or 0)
+    file_size = int(getattr(audio, "file_size", 0) or 0)
+    mime_type = getattr(audio, "mime_type", None) or ""
+    for owner_id, source in matched_owners:
+        try:
+            channel_repo.upsert_track(
+                DATA_DIR, owner_id, source, chat_id, message.message_id,
+                file_id=file_id,
+                file_unique_id=file_unique_id,
+                file_name=file_name or "",
+                title=title or "",
+                performer=performer or "",
+                duration=duration,
+                file_size=file_size,
+                mime_type=mime_type or "",
+                status="received",
+            )
+            print(f"REPO_TRACK owner={owner_id} source={source} msg={message.message_id} title={title!r}")
+        except Exception as exc:
+            print(f"REPO_TRACK upsert error: {exc!r}")
+
+
 async def error_handler(update, context):
     import traceback
     err = context.error
@@ -6351,6 +6691,13 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r"^admin:"))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.StatusUpdate.CHAT_SHARED, receive_chat_shared))
+    # Channel repository intake (Source A / B posts) — must see channel updates
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.CHANNEL & (filters.AUDIO | filters.Document.ALL),
+            receive_channel_repo_audio,
+        )
+    )
 
     app.add_handler(
         MessageHandler(
