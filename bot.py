@@ -18,6 +18,7 @@ from audio_scanner import (
 from typing import Dict, List, Optional, Any
 import self_scan
 import channel_repo
+import internet_lookup
 from io import BytesIO
 
 from PIL import Image
@@ -236,17 +237,13 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v8.0.2"
+VERSION = "v8.1.0"
 VERSION_CHANGES = [
-    "رفع خطای دکمه Edit مخزن؛ اکنون پس از دریافت آهنگ، منوی اصلی ویرایشگر باز می‌شود",
-    "سیستم مخزن کانال‌ها: Source A، Source B و Destination با انتخاب‌گر رسمی تلگرام",
-    "ذخیره متادیتای آهنگ‌های کانال در SQLite بدون دانلود دائمی روی هاست",
-    "تطبیق فهرست TXT با مخزن کانال و کپی مستقیم از کانال برای ادیت",
-    "دکمه «🎧 دریافت آهنگ برای ادیت» به‌جای فوروارد دستی از کاربر",
-    "ارسال خروجی ادیت‌شده به کانال Destination با وضعیت completed",
-    "پایداری صف پردازش پس از Restart ربات",
-    "حفظ کامل Single/Album/Archive Mode و Audio Scanner و Auto Forward",
-    "اصلاح /version برای نمایش فقط تغییرات نسخه فعلی",
+    "افزودن گزینه Other Album با حفظ آلبوم، شماره ترک و Album Artist و نادیده گرفتن Disc Number",
+    "افزودن اتصال به اینترنت برای جست‌وجوی آهنگ در Genius و نمایش کاور و اطلاعات شناسایی",
+    "دریافت سال انتشار از Genius و تلاش برای یافتن ژانر دقیق از MusicBrainz",
+    "پیش‌نمایش اطلاعات و انتخاب جداگانه موارد قابل اعمال پیش از تغییر تگ‌ها",
+    "حفظ سیستم مخزن کانال‌ها و تمام قابلیت‌های قبلی آرشیو، ویرایشگر و Auto Forward",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 ADMIN_REGISTRY_FILE = DATA_DIR / "admin_registry.json"
@@ -941,6 +938,57 @@ def main_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
+def generate_other_album_filename(artist: str, title: str, album_artist: str) -> str:
+    """Name a guest track as Album Artist Ft. guest artist - title."""
+    title = title if title and title != "—" else "Unknown Title"
+    owner_names = split_artists(album_artist)
+    track_artists = split_artists(artist)
+    if not owner_names:
+        return generate_filename(artist, title)
+    owner_norm = {normalize_name(x) for x in owner_names}
+    guests = [x for x in track_artists if normalize_name(x) not in owner_norm]
+    owner_part = " , ".join(owner_names)
+    if guests:
+        artist_part = owner_part + " Ft. " + " , ".join(guests)
+    else:
+        artist_part = owner_part
+    return sanitize_filename(f"{artist_part} - {title}")
+
+
+def apply_other_album_defaults(path: str, defaults: Dict[str, Any]) -> None:
+    """Apply album defaults without touching Album, Track, Disc or Album Artist."""
+    protected = {"album", "track", "disc", "albumartist"}
+    for key in DEFAULT_FIELD_ORDER:
+        if key in protected:
+            continue
+        modes = defaults.get("_modes") or {}
+        if key not in defaults and key not in modes:
+            continue
+        mode = _default_mode(defaults, key)
+        if mode == "keep":
+            continue
+        if mode == "remove":
+            delete_tag(path, key)
+            continue
+        value = defaults.get(key, "")
+        if value not in (None, ""):
+            set_tag(path, key, value)
+
+
+def internet_review_keyboard(pending: Dict[str, Any]) -> InlineKeyboardMarkup:
+    selected = set(pending.get("selected") or [])
+    buttons = []
+    for key, label in (("year", "📅 Year"), ("genre", "🎼 Genre")):
+        value = pending.get(key)
+        if value:
+            mark = "☑️" if key in selected else "⬜"
+            buttons.append([InlineKeyboardButton(f"{mark} {label}: {value}", callback_data=f"internet:toggle:{key}")])
+    buttons.append([InlineKeyboardButton("✅ اعمال موارد انتخاب‌شده", callback_data="internet:apply")])
+    buttons.append([InlineKeyboardButton("📥 اعمال همه موارد موجود", callback_data="internet:all")])
+    buttons.append([InlineKeyboardButton("❌ لغو", callback_data="internet:cancel")])
+    return InlineKeyboardMarkup(buttons)
+
+
 def main_editor_keyboard(is_album: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [
@@ -974,6 +1022,10 @@ def main_editor_keyboard(is_album: bool = False) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("🎤 Show Lyrics", callback_data="action:showlyrics"),
             InlineKeyboardButton("❌ Remove All", callback_data="action:remove"),
+        ],
+        [
+            InlineKeyboardButton("🌐 اتصال به اینترنت", callback_data="internet:start"),
+            InlineKeyboardButton("💿 Other Album", callback_data="action:other_album"),
         ],
         [
             InlineKeyboardButton(
@@ -3682,6 +3734,189 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print("Callback acknowledgement warning:", repr(callback_error))
     data = query.data
     path = context.user_data.get("path")
+
+    # ---------- Internet metadata lookup (Genius + MusicBrainz) ----------
+    if data == "internet:start":
+        if not path or not os.path.isfile(path):
+            await query.message.reply_text("فایل آهنگ در دسترس نیست.")
+            return
+        tags = get_tags(path)
+        title = tags.get("title", "")
+        artist = tags.get("artist", "")
+        if title == "—" or not title:
+            title = Path(context.user_data.get("filename", "")).stem
+        if artist == "—":
+            artist = ""
+        token = os.getenv("GENIUS_ACCESS_TOKEN", "").strip()
+        if not token:
+            await query.message.reply_text(
+                "برای اتصال به Genius ابتدا متغیر محیطی GENIUS_ACCESS_TOKEN را در تنظیمات هاست اضافه کن و ربات را Restart کن.\n"
+                "توکن را داخل پیام تلگرام یا کد ربات قرار نده."
+            )
+            return
+        search_query = " ".join(x for x in (title, artist) if x).strip()
+        if not search_query:
+            await query.message.reply_text("عنوان و هنرمند آهنگ برای جست‌وجو مشخص نیست.")
+            return
+        status = await query.message.reply_text("🔎 در حال جست‌وجوی آهنگ در Genius…")
+        try:
+            results = await asyncio.to_thread(internet_lookup.search_genius, search_query, token, 5)
+        except Exception as exc:
+            print("Genius search error:", repr(exc))
+            await status.edit_text("جست‌وجوی Genius ناموفق بود. توکن و اتصال اینترنت هاست را بررسی کن.")
+            return
+        if not results:
+            await status.edit_text("نتیجه‌ای در Genius پیدا نشد؛ هیچ تگی تغییر نکرد.")
+            return
+        context.user_data["internet_candidates"] = results
+        rows = []
+        for item in results:
+            label = f"{item.get('title') or 'بدون عنوان'} — {item.get('artist') or 'هنرمند نامشخص'}"
+            rows.append([InlineKeyboardButton(label[:60], callback_data=f"internet:select:{item['id']}")])
+        keyboard = InlineKeyboardMarkup(rows + [[InlineKeyboardButton("❌ لغو", callback_data="internet:cancel")]])
+        first = results[0]
+        caption = (
+            "🔎 نتیجه‌های پیدا شده در Genius\n\n"
+            f"🎵 {first.get('title') or '—'}\n"
+            f"👤 {first.get('artist') or '—'}\n"
+            f"💿 {first.get('album') or '—'}\n\n"
+            "اگر نتیجهٔ درست در فهرست است، همان را انتخاب کن."
+        )
+        try:
+            if first.get("image"):
+                await query.message.reply_photo(photo=first["image"], caption=caption[:1024], reply_markup=keyboard)
+                await status.delete()
+            else:
+                await status.edit_text(caption, reply_markup=keyboard)
+        except Exception:
+            try:
+                await status.edit_text(caption, reply_markup=keyboard)
+            except Exception:
+                await query.message.reply_text(caption, reply_markup=keyboard)
+        return
+
+    if data.startswith("internet:select:"):
+        try:
+            song_id = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            await query.answer("شناسه نتیجه نامعتبر است", show_alert=True)
+            return
+        token = os.getenv("GENIUS_ACCESS_TOKEN", "").strip()
+        await query.answer("در حال بررسی اطلاعات آهنگ…")
+        status = await query.message.reply_text("⏳ در حال دریافت اطلاعات و بررسی ژانر…")
+        try:
+            song = await asyncio.to_thread(internet_lookup.get_genius_song, song_id, token)
+        except Exception as exc:
+            print("Genius song detail error:", repr(exc))
+            await status.edit_text("دریافت اطلاعات آهنگ از Genius ناموفق بود. هیچ تگی تغییر نکرد.")
+            return
+        try:
+            genre = await asyncio.to_thread(internet_lookup.lookup_musicbrainz_genre, song.get("title", ""), song.get("artist", ""))
+        except Exception as exc:
+            print("MusicBrainz genre lookup warning:", repr(exc))
+            genre = ""
+        pending = {
+            **song,
+            "genre": genre,
+            "selected": [key for key, value in (("year", song.get("year")), ("genre", genre)) if value],
+        }
+        context.user_data["internet_pending"] = pending
+        text = (
+            "📋 اطلاعات پیدا شده\n\n"
+            f"🎵 عنوان: {song.get('title') or '—'}\n"
+            f"👤 هنرمندان: {song.get('artist') or '—'}\n"
+            f"💿 آلبوم: {song.get('album') or '—'}\n"
+            f"📅 سال: {song.get('year') or 'پیدا نشد'}\n"
+            f"🎼 ژانر: {genre or 'پیدا نشد'}\n"
+            "✍️ متن ترانه: از طریق این اتصال دریافت نمی‌شود؛ فیلد Lyrics فعلی بدون تغییر می‌ماند.\n\n"
+            "مواردی را که می‌خواهی اعمال شوند انتخاب کن:"
+        )
+        try:
+            await status.delete()
+        except Exception:
+            pass
+        try:
+            if song.get("image"):
+                await query.message.reply_photo(photo=song["image"], caption=text[:1024], reply_markup=internet_review_keyboard(pending))
+            else:
+                await query.message.reply_text(text, reply_markup=internet_review_keyboard(pending))
+        except Exception:
+            await query.message.reply_text(text, reply_markup=internet_review_keyboard(pending))
+        return
+
+    if data.startswith("internet:toggle:"):
+        pending = context.user_data.get("internet_pending") or {}
+        key = data.rsplit(":", 1)[1]
+        if key not in ("year", "genre") or not pending.get(key):
+            await query.answer("این مقدار در نتیجه موجود نیست.", show_alert=True)
+            return
+        selected = set(pending.get("selected") or [])
+        if key in selected:
+            selected.remove(key)
+        else:
+            selected.add(key)
+        pending["selected"] = list(selected)
+        context.user_data["internet_pending"] = pending
+        await query.message.edit_reply_markup(reply_markup=internet_review_keyboard(pending))
+        return
+
+    if data in ("internet:apply", "internet:all"):
+        if not path or not os.path.isfile(path):
+            await query.message.reply_text("فایل آهنگ در دسترس نیست.")
+            return
+        pending = context.user_data.get("internet_pending") or {}
+        selected = [key for key in ("year", "genre") if pending.get(key)] if data == "internet:all" else (pending.get("selected") or [])
+        if not selected:
+            await query.answer("هیچ موردی برای اعمال انتخاب نشده است.", show_alert=True)
+            return
+        applied = []
+        for key in selected:
+            value = str(pending.get(key) or "").strip()
+            if value:
+                set_tag(path, key, value)
+                applied.append(f"{key}: {value}")
+        if context.user_data.get("original_cover"):
+            restore_cover_from_backup(path, context.user_data["original_cover"])
+        context.user_data.pop("internet_pending", None)
+        await query.message.reply_text("✅ اطلاعات انتخاب‌شده اعمال شد:\n" + "\n".join(applied))
+        await show_editor(update, context, is_album=context.user_data.get("editing_album_track", False))
+        return
+
+    if data == "internet:cancel":
+        context.user_data.pop("internet_pending", None)
+        context.user_data.pop("internet_candidates", None)
+        await query.message.reply_text("جست‌وجوی اینترنت لغو شد؛ هیچ تگی تغییر نکرد.")
+        return
+
+    # ---------- Other Album ----------
+    if data == "action:other_album":
+        if not path or not os.path.isfile(path):
+            await query.message.reply_text("فایل آهنگ در دسترس نیست.")
+            return
+        tags_before = get_tags(path)
+        album_owner = tags_before.get("albumartist", "")
+        if album_owner == "—":
+            album_owner = ""
+        user_id = query.from_user.id
+        defaults = get_user_defaults(user_id).get("album", {})
+        cover_backup = context.user_data.get("original_cover")
+        apply_other_album_defaults(path, defaults)
+        if cover_backup:
+            restore_cover_from_backup(path, cover_backup)
+        tags_after = get_tags(path)
+        new_filename = generate_other_album_filename(
+            tags_after.get("artist", ""), tags_after.get("title", ""), album_owner
+        )
+        context.user_data["filename"] = new_filename
+        context.user_data["other_album_mode"] = True
+        note = "Album Artist شناسایی شد؛ نام فایل با Ft. ساخته شد." if album_owner else "Album Artist خالی است؛ نام فایل بر اساس Artist ساخته شد."
+        await query.message.reply_text(
+            "✅ تگ‌های پیش‌فرض آلبوم اعمال شدند.\n"
+            "Album، Track Number، Disc Number و Album Artist بدون تغییر ماندند.\n"
+            f"{note}\n\n📁 نام فایل: {new_filename}"
+        )
+        await show_editor(update, context, is_album=context.user_data.get("editing_album_track", False))
+        return
 
     if data == "unrel:upload":
         context.user_data["waiting"] = "unreleased_default_cover"
