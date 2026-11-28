@@ -237,13 +237,15 @@ ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 MAX_SIZE = 20 * 1024 * 1024
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DEFAULTS_FILE = DATA_DIR / "user_defaults.json"
-VERSION = "v8.1.0"
+VERSION = "v8.1.1"
 VERSION_CHANGES = [
-    "افزودن گزینه Other Album با حفظ آلبوم، شماره ترک و Album Artist و نادیده گرفتن Disc Number",
-    "افزودن اتصال به اینترنت برای جست‌وجوی آهنگ در Genius و نمایش کاور و اطلاعات شناسایی",
-    "دریافت سال انتشار از Genius و تلاش برای یافتن ژانر دقیق از MusicBrainz",
-    "پیش‌نمایش اطلاعات و انتخاب جداگانه موارد قابل اعمال پیش از تغییر تگ‌ها",
-    "حفظ سیستم مخزن کانال‌ها و تمام قابلیت‌های قبلی آرشیو، ویرایشگر و Auto Forward",
+    "اصلاح Other Album: سال آهنگ بدون تغییر می‌ماند و سال پیش‌فرض 2026 اعمال نمی‌شود",
+    "تغییر نام دکمه به Connect to Internet",
+    "جست‌وجوی Album، Album Artist، Genre و Track Number از MusicBrainz",
+    "دریافت کاور و امکان انتخاب مستقل Cover Art",
+    "انتخاب مستقل Title، Artist، Album، Album Artist، Year، Genre، Track Number و Cover Art",
+    "حفظ اطلاعات قبلی فیلدهایی که در جست‌وجو پیدا نمی‌شوند",
+    "حفظ سیستم مخزن کانال‌ها و قابلیت‌های قبلی آرشیو، ویرایشگر و Auto Forward",
 ]
 UNRELEASED_COVER_FILE = DATA_DIR / "unreleased_track_cover.jpg"
 ADMIN_REGISTRY_FILE = DATA_DIR / "admin_registry.json"
@@ -956,8 +958,8 @@ def generate_other_album_filename(artist: str, title: str, album_artist: str) ->
 
 
 def apply_other_album_defaults(path: str, defaults: Dict[str, Any]) -> None:
-    """Apply album defaults without touching Album, Track, Disc or Album Artist."""
-    protected = {"album", "track", "disc", "albumartist"}
+    """Apply album defaults without touching Album, Track, Disc, Album Artist or Year."""
+    protected = {"album", "track", "disc", "albumartist", "year"}
     for key in DEFAULT_FIELD_ORDER:
         if key in protected:
             continue
@@ -977,15 +979,22 @@ def apply_other_album_defaults(path: str, defaults: Dict[str, Any]) -> None:
 
 def internet_review_keyboard(pending: Dict[str, Any]) -> InlineKeyboardMarkup:
     selected = set(pending.get("selected") or [])
+    labels = (
+        ("cover", "🖼️ Cover Art"), ("title", "🎵 Title"),
+        ("artist", "👤 Artist"), ("album", "💿 Album"),
+        ("albumartist", "🎙️ Album Artist"), ("year", "📅 Year"),
+        ("genre", "🎼 Genre"), ("track", "🔢 Track Number"),
+    )
     buttons = []
-    for key, label in (("year", "📅 Year"), ("genre", "🎼 Genre")):
+    for key, label in labels:
         value = pending.get(key)
         if value:
             mark = "☑️" if key in selected else "⬜"
-            buttons.append([InlineKeyboardButton(f"{mark} {label}: {value}", callback_data=f"internet:toggle:{key}")])
-    buttons.append([InlineKeyboardButton("✅ اعمال موارد انتخاب‌شده", callback_data="internet:apply")])
-    buttons.append([InlineKeyboardButton("📥 اعمال همه موارد موجود", callback_data="internet:all")])
-    buttons.append([InlineKeyboardButton("❌ لغو", callback_data="internet:cancel")])
+            shown = "Available" if key == "cover" else str(value)
+            buttons.append([InlineKeyboardButton(f"{mark} {label}: {shown}"[:60], callback_data=f"internet:toggle:{key}")])
+    buttons.append([InlineKeyboardButton("✅ Apply Selected", callback_data="internet:apply")])
+    buttons.append([InlineKeyboardButton("📥 Apply All Available", callback_data="internet:all")])
+    buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="internet:cancel")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -1024,7 +1033,7 @@ def main_editor_keyboard(is_album: bool = False) -> InlineKeyboardMarkup:
             InlineKeyboardButton("❌ Remove All", callback_data="action:remove"),
         ],
         [
-            InlineKeyboardButton("🌐 اتصال به اینترنت", callback_data="internet:start"),
+            InlineKeyboardButton("🌐 Connect to Internet", callback_data="internet:start"),
             InlineKeyboardButton("💿 Other Album", callback_data="action:other_album"),
         ],
         [
@@ -3811,25 +3820,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status.edit_text("دریافت اطلاعات آهنگ از Genius ناموفق بود. هیچ تگی تغییر نکرد.")
             return
         try:
-            genre = await asyncio.to_thread(internet_lookup.lookup_musicbrainz_genre, song.get("title", ""), song.get("artist", ""))
+            mb = await asyncio.to_thread(
+                internet_lookup.lookup_musicbrainz_metadata,
+                song.get("title", ""), song.get("artist", ""), song.get("album", "")
+            )
         except Exception as exc:
-            print("MusicBrainz genre lookup warning:", repr(exc))
-            genre = ""
+            print("MusicBrainz metadata lookup warning:", repr(exc))
+            mb = {}
+        # Prefer exact Genius identity; enrich missing album/release fields from MusicBrainz.
+        for key in ("album", "albumartist", "track", "genre"):
+            if mb.get(key):
+                song[key] = mb[key]
+        if not song.get("year") and mb.get("year"):
+            song["year"] = mb["year"]
+        song["cover_url"] = mb.get("cover_url") or song.get("image", "")
         pending = {
             **song,
-            "genre": genre,
-            "selected": [key for key, value in (("year", song.get("year")), ("genre", genre)) if value],
+            "cover": song.get("cover_url", ""),
+            "selected": [key for key in ("cover", "album", "albumartist", "year", "genre", "track", "title", "artist") if song.get(key)],
         }
         context.user_data["internet_pending"] = pending
         text = (
-            "📋 اطلاعات پیدا شده\n\n"
-            f"🎵 عنوان: {song.get('title') or '—'}\n"
-            f"👤 هنرمندان: {song.get('artist') or '—'}\n"
-            f"💿 آلبوم: {song.get('album') or '—'}\n"
-            f"📅 سال: {song.get('year') or 'پیدا نشد'}\n"
-            f"🎼 ژانر: {genre or 'پیدا نشد'}\n"
-            "✍️ متن ترانه: از طریق این اتصال دریافت نمی‌شود؛ فیلد Lyrics فعلی بدون تغییر می‌ماند.\n\n"
-            "مواردی را که می‌خواهی اعمال شوند انتخاب کن:"
+            "📋 Found metadata / اطلاعات پیدا شده\\n\\n"
+            f"🎵 Title: {song.get('title') or '—'}\\n"
+            f"👤 Artist: {song.get('artist') or '—'}\\n"
+            f"💿 Album: {song.get('album') or 'Not found'}\\n"
+            f"🎙️ Album Artist: {song.get('albumartist') or 'Not found'}\\n"
+            f"📅 Year: {song.get('year') or 'Not found'}\\n"
+            f"🎼 Genre: {song.get('genre') or 'Not found'}\\n"
+            f"🔢 Track Number: {song.get('track') or 'Not found'}\\n"
+            f"🖼️ Cover Art: {'Available' if song.get('cover') else 'Not found'}\\n"
+            "✍️ Lyrics: not fetched; existing Lyrics tag will remain unchanged.\\n\\n"
+            "Select the fields you want to apply:"
         )
         try:
             await status.delete()
@@ -3847,7 +3869,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("internet:toggle:"):
         pending = context.user_data.get("internet_pending") or {}
         key = data.rsplit(":", 1)[1]
-        if key not in ("year", "genre") or not pending.get(key):
+        if key not in ("cover", "title", "artist", "album", "albumartist", "year", "genre", "track") or not pending.get(key):
             await query.answer("این مقدار در نتیجه موجود نیست.", show_alert=True)
             return
         selected = set(pending.get("selected") or [])
@@ -3865,17 +3887,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("فایل آهنگ در دسترس نیست.")
             return
         pending = context.user_data.get("internet_pending") or {}
-        selected = [key for key in ("year", "genre") if pending.get(key)] if data == "internet:all" else (pending.get("selected") or [])
+        available = ("cover", "title", "artist", "album", "albumartist", "year", "genre", "track")
+        selected = [key for key in available if pending.get(key)] if data == "internet:all" else (pending.get("selected") or [])
         if not selected:
-            await query.answer("هیچ موردی برای اعمال انتخاب نشده است.", show_alert=True)
+            await query.answer("No available fields selected.", show_alert=True)
             return
         applied = []
         for key in selected:
             value = str(pending.get(key) or "").strip()
-            if value:
-                set_tag(path, key, value)
-                applied.append(f"{key}: {value}")
-        if context.user_data.get("original_cover"):
+            if not value:
+                continue
+            if key == "cover":
+                try:
+                    image_data = await asyncio.to_thread(internet_lookup.download_cover, value)
+                    set_cover(path, image_data)
+                    context.user_data["original_cover"] = image_data
+                    applied.append("Cover Art")
+                except Exception as exc:
+                    print("Cover download/apply warning:", repr(exc))
+                continue
+            set_tag(path, key, value)
+            applied.append(f"{key}: {value}")
+        if "cover" not in selected and context.user_data.get("original_cover"):
             restore_cover_from_backup(path, context.user_data["original_cover"])
         context.user_data.pop("internet_pending", None)
         await query.message.reply_text("✅ اطلاعات انتخاب‌شده اعمال شد:\n" + "\n".join(applied))
@@ -3912,7 +3945,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         note = "Album Artist شناسایی شد؛ نام فایل با Ft. ساخته شد." if album_owner else "Album Artist خالی است؛ نام فایل بر اساس Artist ساخته شد."
         await query.message.reply_text(
             "✅ تگ‌های پیش‌فرض آلبوم اعمال شدند.\n"
-            "Album، Track Number، Disc Number و Album Artist بدون تغییر ماندند.\n"
+            "Album، Track Number، Year و Album Artist بدون تغییر ماندند.\n"
             f"{note}\n\n📁 نام فایل: {new_filename}"
         )
         await show_editor(update, context, is_album=context.user_data.get("editing_album_track", False))

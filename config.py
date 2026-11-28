@@ -1,7 +1,7 @@
-"""Shared configuration for Music Tag Bot v8.1.0."""
+"""Shared configuration for Music Tag Bot v8.1.1."""
 import os
 from pathlib import Path
-VERSION = "8.1.0"
+VERSION = "8.1.1"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))

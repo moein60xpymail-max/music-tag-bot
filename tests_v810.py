@@ -1,4 +1,4 @@
-"""Regression tests for v8.1.0 internet metadata and Other Album helpers."""
+"""Regression tests for v8.1.1 internet metadata and Other Album helpers."""
 from __future__ import annotations
 import ast
 from pathlib import Path
@@ -14,7 +14,7 @@ def _bot_function(name, namespace):
 
 def test_release_and_buttons():
     src = Path("bot.py").read_text(encoding="utf-8")
-    assert 'VERSION = "v8.1.0"' in src
+    assert 'VERSION = "v8.1.1"' in src
     assert 'callback_data="internet:start"' in src
     assert 'callback_data="action:other_album"' in src
     assert 'GENIUS_ACCESS_TOKEN' in src
@@ -38,12 +38,12 @@ def test_other_album_protected_fields():
     tree = ast.parse(Path("bot.py").read_text(encoding="utf-8"))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "apply_other_album_defaults")
     source = ast.get_source_segment(Path("bot.py").read_text(encoding="utf-8"), node)
-    for field in ('"album"', '"track"', '"disc"', '"albumartist"'):
+    for field in ('"album"', '"track"', '"disc"', '"albumartist"', '"year"'):
         assert field in source
 
 
 
-def test_other_album_defaults_leave_album_track_disc_and_albumartist_untouched():
+def test_other_album_defaults_leave_album_track_disc_albumartist_and_year_untouched():
     tree = ast.parse(Path("bot.py").read_text(encoding="utf-8"))
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "apply_other_album_defaults")
     calls = []
@@ -62,7 +62,7 @@ def test_other_album_defaults_leave_album_track_disc_and_albumartist_untouched()
     })
     keys = {entry[1] for entry in calls}
     assert "album" not in keys and "track" not in keys and "disc" not in keys and "albumartist" not in keys
-    assert "year" in keys and "genre" in keys and "artist" in keys
+    assert "year" not in keys and "genre" in keys and "artist" in keys
 
 def test_genius_song_metadata_parsing(monkeypatch):
     def fake_get_json(url, headers=None, timeout=15):
@@ -90,3 +90,38 @@ def test_search_genius(monkeypatch):
     assert len(results) == 1 and results[0]["id"] == 42
 
 
+
+
+def test_internet_fields_and_english_button():
+    src = Path("bot.py").read_text(encoding="utf-8")
+    assert 'Connect to Internet' in src
+    assert '("albumartist", "🎙️ Album Artist")' in src
+    assert '("track", "🔢 Track Number")' in src
+    assert '("cover", "🖼️ Cover Art")' in src
+
+
+def test_musicbrainz_release_metadata(monkeypatch):
+    calls = {"n": 0}
+    def fake_get_json(url, headers=None, timeout=15):
+        calls["n"] += 1
+        if "/recording/?" in url:
+            return {"recordings": [{
+                "id": "rec-1", "title": "Track",
+                "artist-credit": [{"name": "Guest"}],
+                "releases": [{"id": "rel-1", "title": "Album"}],
+            }]}
+        if "/recording/rec-1?" in url:
+            return {"id": "rec-1", "genres": [{"name": "Rap", "count": 5}],
+                    "releases": [{"id": "rel-1", "title": "Album", "date": "2019-01-01",
+                                  "artist-credit": [{"name": "Main Artist"}]}]}
+        return {"artist-credit": [{"name": "Main Artist"}],
+                "media": [{"tracks": [{"position": 7, "recording": {"id": "rec-1"}}]}]}
+    monkeypatch.setattr(internet_lookup, "_get_json", fake_get_json)
+    monkeypatch.setattr(internet_lookup.time, "sleep", lambda _: None)
+    data = internet_lookup.lookup_musicbrainz_metadata("Track", "Guest", "Album")
+    assert data["album"] == "Album"
+    assert data["albumartist"] == "Main Artist"
+    assert data["track"] == "7"
+    assert data["genre"] == "Rap"
+    assert data["year"] == "2019"
+    assert data["cover_url"].endswith("/rel-1/front-500")

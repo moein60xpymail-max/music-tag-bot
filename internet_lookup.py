@@ -96,7 +96,7 @@ def lookup_musicbrainz_genre(title: str, artist: str) -> str:
     if not title or not artist:
         return ""
     query = f'recording:"{title}" AND artist:"{artist}"'
-    search_url = f"{MUSICBRAINZ_API}/recording/?{urlencode({'query': query, 'fmt': 'json', 'limit': 5})}"
+    url = MUSICBRAINZ_API + "/recording/?" + urlencode({"query": query, "fmt": "json", "limit": 10, "inc": "releases"})
     payload = _get_json(search_url, timeout=20)
     records = payload.get("recordings") or []
     if not records:
@@ -117,8 +117,88 @@ def lookup_musicbrainz_genre(title: str, artist: str) -> str:
     if not best or best_score < 0.72 or not best.get("id"):
         return ""
     time.sleep(1.05)  # MusicBrainz asks clients to stay around one request/second.
-    detail_url = f"{MUSICBRAINZ_API}/recording/{best['id']}?{urlencode({'inc': 'genres', 'fmt': 'json'})}"
+    detail_url = MUSICBRAINZ_API + f'/recording/{best["id"]}?' + urlencode({"inc": "releases+genres", "fmt": "json"})
     detail = _get_json(detail_url, timeout=20)
     genres = detail.get("genres") or []
     genres = sorted(genres, key=lambda item: int(item.get("count") or 0), reverse=True)
     return str(genres[0].get("name") or "").strip() if genres else ""
+
+
+def lookup_musicbrainz_metadata(title: str, artist: str, album_hint: str = "") -> dict:
+    """Find a close MusicBrainz recording and enrich it with release/track metadata."""
+    empty = {"album": "", "albumartist": "", "track": "", "genre": "", "cover_url": "", "year": ""}
+    if not title or not artist:
+        return empty
+    query = f'recording:"{title}" AND artist:"{artist}"'
+    url = MUSICBRAINZ_API + "/recording/?" + urlencode({"query": query, "fmt": "json", "limit": 10, "inc": "releases"})
+    payload = _get_json(url, timeout=20)
+    records = payload.get("recordings") or []
+    best, best_score = None, 0.0
+    for record in records:
+        rec_artists = " ".join(
+            entry.get("name") or (entry.get("artist") or {}).get("name", "")
+            for entry in (record.get("artist-credit") or []) if isinstance(entry, dict)
+        )
+        score = _similarity(title, record.get("title", "")) * .65 + _similarity(artist, rec_artists) * .35
+        if album_hint:
+            releases = record.get("releases") or []
+            if any(_similarity(album_hint, rel.get("title", "")) > .8 for rel in releases):
+                score += .08
+        if score > best_score:
+            best, best_score = record, score
+    if not best or best_score < .72:
+        return empty
+    time.sleep(1.05)
+    detail_url = MUSICBRAINZ_API + f'/recording/{best["id"]}?' + urlencode({"inc": "releases+genres", "fmt": "json"})
+    detail = _get_json(detail_url, timeout=20)
+    genres = sorted(detail.get("genres") or [], key=lambda x: int(x.get("count") or 0), reverse=True)
+    result = dict(empty)
+    result["genre"] = (genres[0].get("name") or "") if genres else ""
+    releases = detail.get("releases") or []
+    if not releases:
+        return result
+    if album_hint:
+        releases.sort(key=lambda r: _similarity(album_hint, r.get("title", "")), reverse=True)
+    else:
+        releases.sort(key=lambda r: bool(r.get("date")), reverse=True)
+    release = releases[0]
+    release_id = release.get("id")
+    result["album"] = release.get("title") or ""
+    result["year"] = (release.get("date") or "")[:4]
+    credit = release.get("artist-credit") or []
+    result["albumartist"] = "".join(
+        (x.get("name") or (x.get("artist") or {}).get("name", "")) + (x.get("joinphrase") or "")
+        for x in credit if isinstance(x, dict)
+    ).strip()
+    if release_id:
+        time.sleep(1.05)
+        rel_url = MUSICBRAINZ_API + f'/release/{release_id}?' + urlencode({"inc": "recordings+artists", "fmt": "json"})
+        rel_detail = _get_json(rel_url, timeout=20)
+        if not result["albumartist"]:
+            credit = rel_detail.get("artist-credit") or []
+            result["albumartist"] = "".join(
+                (x.get("name") or (x.get("artist") or {}).get("name", "")) + (x.get("joinphrase") or "")
+                for x in credit if isinstance(x, dict)
+            ).strip()
+        wanted_id = best.get("id")
+        for medium in rel_detail.get("media") or []:
+            for position, track in enumerate(medium.get("tracks") or [], 1):
+                recording = track.get("recording") or {}
+                if recording.get("id") == wanted_id:
+                    result["track"] = str(track.get("position") or track.get("number") or position)
+                    break
+            if result["track"]:
+                break
+        result["cover_url"] = f"https://coverartarchive.org/release/{release_id}/front-500"
+    return result
+
+
+def download_cover(url: str) -> bytes:
+    if not url or not url.startswith(("https://coverartarchive.org/", "https://images.genius.com/", "https://assets.genius.com/")):
+        raise ValueError("Unsupported artwork host")
+    req = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(req, timeout=20) as response:
+        data = response.read(8 * 1024 * 1024 + 1)
+    if len(data) > 8 * 1024 * 1024:
+        raise ValueError("Cover image is too large")
+    return data
